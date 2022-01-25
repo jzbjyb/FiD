@@ -41,12 +41,13 @@ def get_checkpoint_path(opt):
     return checkpoint_path, checkpoint_exists
 
 def symlink_force(target, link_name):
+    target_last = os.path.basename(os.path.normpath(target))
     try:
-        os.symlink(target, link_name)
+        os.symlink(target_last, link_name)
     except OSError as e:
         if e.errno == errno.EEXIST:
             os.remove(link_name)
-            os.symlink(target, link_name)
+            os.symlink(target_last, link_name)
         else:
             raise e
 

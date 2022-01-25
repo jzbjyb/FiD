@@ -254,8 +254,8 @@ def cross_attention_forward(
     return output
 
 class RetrieverConfig(transformers.BertConfig):
-
     def __init__(self,
+                 model_name,
                  indexing_dimension=768,
                  apply_question_mask=False,
                  apply_passage_mask=False,
@@ -264,7 +264,8 @@ class RetrieverConfig(transformers.BertConfig):
                  question_maxlength=40,
                  projection=True,
                  **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(**transformers.BertConfig.from_pretrained(model_name).to_dict())
+        self.model_name = model_name
         self.indexing_dimension = indexing_dimension
         self.apply_question_mask = apply_question_mask
         self.apply_passage_mask = apply_passage_mask
@@ -273,27 +274,37 @@ class RetrieverConfig(transformers.BertConfig):
         self.question_maxlength = question_maxlength
         self.projection = projection
 
-class Retriever(transformers.PreTrainedModel):
 
-    config_class = RetrieverConfig
-    base_model_prefix = "retriever"
+class T5RetrieverConfig(transformers.T5Config):
+    def __init__(self,
+                 model_name,
+                 indexing_dimension=768,
+                 apply_question_mask=False,
+                 apply_passage_mask=False,
+                 extract_cls=False,
+                 passage_maxlength=200,
+                 question_maxlength=40,
+                 projection=True,
+                 **kwargs):
+        super().__init__(**transformers.T5Config.from_pretrained(model_name).to_dict())
+        self.model_name = model_name
+        self.indexing_dimension = indexing_dimension
+        self.apply_question_mask = apply_question_mask
+        self.apply_passage_mask = apply_passage_mask
+        self.extract_cls = extract_cls
+        self.passage_maxlength = passage_maxlength
+        self.question_maxlength = question_maxlength
+        self.projection = projection
 
-    def __init__(self, config, initialize_wBERT=False):
-        super().__init__(config)
-        assert config.projection or config.indexing_dimension == 768, \
-            'If no projection then indexing dimension must be equal to 768'
-        self.config = config
-        if initialize_wBERT:
-            self.model = transformers.BertModel.from_pretrained('bert-base-uncased')
-        else:
-            self.model = transformers.BertModel(config)
-        if self.config.projection:
-            self.proj = nn.Linear(
-                self.model.config.hidden_size,
-                self.config.indexing_dimension
-            )
-            self.norm = nn.LayerNorm(self.config.indexing_dimension)
-        self.loss_fct = torch.nn.KLDivLoss()
+class RetrieverMixin:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def get_retriever_class(initialize_with: str):
+        if 'reader' in initialize_with or 't5' in initialize_with:
+            return T5Retriever
+        return Retriever
 
     def forward(self,
                 question_ids,
@@ -331,7 +342,7 @@ class Retriever(transformers.PreTrainedModel):
         return question_output, passage_output, score, loss
 
     def embed_text(self, text_ids, text_mask, apply_mask=False, extract_cls=False):
-        text_output = self.model(
+        text_output = self.forward_func(
             input_ids=text_ids,
             attention_mask=text_mask if apply_mask else None
         )
@@ -356,3 +367,57 @@ class Retriever(transformers.PreTrainedModel):
         gold_score = torch.softmax(gold_score, dim=-1)
         score = torch.nn.functional.log_softmax(score, dim=-1)
         return self.loss_fct(score, gold_score)
+
+
+class Retriever(RetrieverMixin, transformers.PreTrainedModel):
+  config_class = RetrieverConfig
+  base_model_prefix = "retriever"
+
+  def __init__(self, config):
+    super().__init__(config)
+    self.config = config
+    initialize_with = config.model_name
+    if initialize_with:
+      self.model = transformers.BertModel.from_pretrained(initialize_with)
+    else:
+      self.model = transformers.BertModel(config)
+    if self.config.projection:
+      self.proj = nn.Linear(
+        self.model.config.hidden_size,
+        self.config.indexing_dimension
+      )
+      self.norm = nn.LayerNorm(self.config.indexing_dimension)
+    self.loss_fct = torch.nn.KLDivLoss()
+    self.forward_func = self.model.forward
+
+  def load_tokenizer(self):
+    return transformers.BertTokenizerFast.from_pretrained('bert-base-uncased')
+
+
+class T5Retriever(RetrieverMixin, transformers.PreTrainedModel):
+  config_class = T5RetrieverConfig
+  base_model_prefix = "t5retriever"
+
+  def __init__(self, config):
+    super().__init__(config)
+    self.config = config
+    initialize_with = config.model_name
+    if 'reader' in initialize_with:  # FiD
+      self.model = FiDT5.from_pretrained(initialize_with)
+      self.model.unwrap_encoder()  # convert back to T5
+    elif 't5' in initialize_with:
+      self.model = transformers.T5ForConditionalGeneration.from_pretrained(initialize_with)
+    else:  # use bert as default
+      raise NotImplementedError
+
+    if self.config.projection:
+      self.proj = nn.Linear(
+        self.model.config.hidden_size,
+        self.config.indexing_dimension
+      )
+      self.norm = nn.LayerNorm(self.config.indexing_dimension)
+    self.loss_fct = torch.nn.KLDivLoss()
+    self.forward_func = self.model.encoder.forward
+
+  def load_tokenizer(self):
+    return transformers.T5Tokenizer.from_pretrained('t5-base')

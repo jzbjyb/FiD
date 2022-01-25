@@ -15,12 +15,14 @@ class Dataset(torch.utils.data.Dataset):
                  n_context=None,
                  question_prefix='question:',
                  title_prefix='title:',
-                 passage_prefix='context:'):
+                 passage_prefix='context:',
+                 add_eos: bool = False):
         self.data = data
         self.n_context = n_context
         self.question_prefix = question_prefix
         self.title_prefix = title_prefix
         self.passage_prefix = passage_prefix
+        self.eos = (' </s>' if add_eos else '')
         self.sort_data()
 
     def __len__(self):
@@ -37,11 +39,11 @@ class Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         example = self.data[index]
-        question = self.question_prefix + " " + example['question']
+        question = self.question_prefix + " " + example['question'] + self.eos
         target = self.get_target(example)
 
         if 'ctxs' in example and self.n_context is not None:
-            f = self.title_prefix + " {} " + self.passage_prefix + " {}"
+            f = self.title_prefix + " {} " + self.passage_prefix + " {}" + self.eos
             contexts = example['ctxs'][:self.n_context]
             passages = [f.format(c['title'], c['text']) for c in contexts]
             scores = [float(c['score']) for c in contexts]
@@ -183,10 +185,12 @@ class TextDataset(torch.utils.data.Dataset):
     def __init__(self,
                  data,
                  title_prefix='title:',
-                 passage_prefix='context:'):
+                 passage_prefix='context:',
+                 add_eos: bool = False):
         self.data = data
         self.title_prefix = title_prefix
         self.passage_prefix = passage_prefix
+        self.eos = (' </s>' if add_eos else '')
 
     def __len__(self):
         return len(self.data)
@@ -194,7 +198,7 @@ class TextDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         example = self.data[index]
         text = self.title_prefix + " " + example[2] + " " + \
-            self.passage_prefix + " " + example[1]
+            self.passage_prefix + " " + example[1] + self.eos
         return example[0], text
 
 class TextCollator(object):

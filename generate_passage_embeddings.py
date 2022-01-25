@@ -56,10 +56,10 @@ def embed_passages(opt, passages, model, tokenizer):
 
 def main(opt):
     logger = src.util.init_logger(is_main=True)
-    tokenizer = transformers.BertTokenizerFast.from_pretrained('bert-base-uncased')
-    model_class = src.model.Retriever
+    model_class = src.model.RetrieverMixin.get_retriever_class(opt.model_path)
     #model, _, _, _, _, _ = src.util.load(model_class, opt.model_path, opt)
     model = model_class.from_pretrained(opt.model_path)
+    tokenizer = model.load_tokenizer()
     
     model.eval()
     model = model.to(opt.device)

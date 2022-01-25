@@ -8,6 +8,7 @@ import torch
 import transformers
 import numpy as np
 from pathlib import Path
+from tqdm import tqdm
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
 
@@ -33,7 +34,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
         write_path = Path(opt.checkpoint_dir) / opt.name / 'test_results'
         fw = open(write_path / ('%d.txt'%opt.global_rank), 'a')
     with torch.no_grad():
-        for i, batch in enumerate(dataloader):
+        for i, batch in tqdm(enumerate(dataloader)):
             (idx, _, _, context_ids, context_mask) = batch
 
             if opt.write_crossattention_scores:

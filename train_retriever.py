@@ -10,6 +10,8 @@ import torch
 import transformers
 from pathlib import Path
 import numpy as np
+from tqdm import tqdm
+import inspect
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
@@ -45,12 +47,15 @@ def train(model, optimizer, scheduler, global_step,
     loss, curr_loss = 0.0, 0.0
     epoch = 1
     model.train()
+
+    pbar = tqdm(total=opt.total_steps, disable=not opt.is_main)
     while global_step < opt.total_steps:
         if opt.is_distributed > 1:
             train_sampler.set_epoch(epoch)
         epoch += 1
         for i, batch in enumerate(train_dataloader):
             global_step += 1
+            pbar.update(1)
             (idx, question_ids, question_mask, passage_ids, passage_mask, gold_score) = batch
             _, _, _, train_loss = model(
                 question_ids=question_ids.cuda(),
@@ -99,6 +104,9 @@ def train(model, optimizer, scheduler, global_step,
                 src.util.save(model, optimizer, scheduler, global_step, best_eval_loss, opt, dir_path, f"step-{global_step}")
             if global_step > opt.total_steps:
                 break
+
+    if opt.total_steps == 0:  # save the original model
+        src.util.save(model, optimizer, scheduler, global_step, best_eval_loss, opt, dir_path, f"step-{global_step}")
 
 
 def evaluate(model, dataset, collator, opt):
@@ -163,12 +171,6 @@ if __name__ == "__main__":
     opt.train_batch_size = opt.per_gpu_batch_size * max(1, opt.world_size)
 
     #Load data
-    tokenizer = transformers.BertTokenizerFast.from_pretrained('bert-base-uncased')
-    collator_function = src.data.RetrieverCollator(
-        tokenizer, 
-        passage_maxlength=opt.passage_maxlength, 
-        question_maxlength=opt.question_maxlength
-    )
     train_examples = src.data.load_data(opt.train_data)
     train_dataset = src.data.Dataset(train_examples, opt.n_context)
     eval_examples = src.data.load_data(
@@ -180,20 +182,21 @@ if __name__ == "__main__":
 
     global_step = 0
     best_eval_loss = np.inf
-    config = src.model.RetrieverConfig(
+    model_class = src.model.RetrieverMixin.get_retriever_class(opt.init_with)
+    config = model_class.config_class(
+        model_name=opt.init_with,
         indexing_dimension=opt.indexing_dimension,
         apply_question_mask=not opt.no_question_mask,
         apply_passage_mask=not opt.no_passage_mask,
         extract_cls=opt.extract_cls,
         projection=not opt.no_projection,
     )
-    model_class = src.model.Retriever
     if not directory_exists and opt.model_path == "none":
-        model = model_class(config, initialize_wBERT=True)
+        model = model_class(config)
         src.util.set_dropout(model, opt.dropout)
         model = model.to(opt.device)
         optimizer, scheduler = src.util.set_optim(opt, model)
-    elif opt.model_path == "none":
+    elif opt.model_path == "none":  # continue train
         load_path = dir_path / 'checkpoint' / 'latest'
         model, optimizer, scheduler, opt_checkpoint, global_step, best_eval_loss = \
             src.util.load(model_class, load_path, opt, reset_params=False)
@@ -203,11 +206,12 @@ if __name__ == "__main__":
             src.util.load(model_class, opt.model_path, opt, reset_params=True)
         logger.info(f"Model loaded from {opt.model_path}")
 
-    model.proj = torch.nn.Linear(768, 256)
-    model.norm = torch.nn.LayerNorm(256)
-    model.config.indexing_dimension = 256
-    model = model.to(opt.device)
-    optimizer, scheduler = src.util.set_optim(opt, model)
+    tokenizer = model.load_tokenizer()
+    collator_function = src.data.RetrieverCollator(
+        tokenizer,
+        passage_maxlength=opt.passage_maxlength,
+        question_maxlength=opt.question_maxlength
+    )
 
     if opt.is_distributed:
         model = torch.nn.parallel.DistributedDataParallel(

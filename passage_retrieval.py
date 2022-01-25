@@ -118,10 +118,10 @@ def add_hasanswer(data, hasanswer):
 
 def main(opt):
     src.util.init_logger(is_main=True)
-    tokenizer = transformers.BertTokenizerFast.from_pretrained('bert-base-uncased')
     data = src.data.load_data(opt.data)
-    model_class = src.model.Retriever
+    model_class = src.model.RetrieverMixin.get_retriever_class(opt.model_path)
     model = model_class.from_pretrained(opt.model_path)
+    tokenizer = model.load_tokenizer()
 
     model.cuda()
     model.eval()
