@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 def embed_passages(opt, passages, model, tokenizer):
     batch_size = opt.per_gpu_batch_size * opt.world_size
     collator = src.data.TextCollator(tokenizer, model.config.passage_maxlength)
-    dataset = src.data.TextDataset(passages, title_prefix='title:', passage_prefix='context:')
+    dataset = src.data.TextDataset(passages)
     dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=10, collate_fn=collator)
     total = 0
     allids, allembeddings = [], []

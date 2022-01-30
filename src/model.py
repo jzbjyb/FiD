@@ -7,6 +7,7 @@
 import types
 import torch
 import transformers
+import inspect
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import CrossEntropyLoss
@@ -136,14 +137,17 @@ class EncoderWrapper(torch.nn.Module):
         self.encoder = encoder
         apply_checkpoint_wrapper(self.encoder, use_checkpoint)
 
-    def forward(self, input_ids=None, attention_mask=None, **kwargs,):
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
         # total_length = n_passages * passage_length
         bsz, total_length = input_ids.shape
         passage_length = total_length // self.n_passages
         input_ids = input_ids.view(bsz*self.n_passages, passage_length)
         attention_mask = attention_mask.view(bsz*self.n_passages, passage_length)
         outputs = self.encoder(input_ids, attention_mask, **kwargs)
-        outputs = (outputs[0].view(bsz, self.n_passages*passage_length, -1), ) + outputs[1:]
+        if kwargs['return_dict']:
+          outputs.last_hidden_state = outputs.last_hidden_state.view(bsz, self.n_passages*passage_length, -1)
+        else:
+          outputs = (outputs[0].view(bsz, self.n_passages*passage_length, -1), ) + outputs[1:]
         return outputs
 
 class CheckpointWrapper(torch.nn.Module):
@@ -255,7 +259,7 @@ def cross_attention_forward(
 
 class RetrieverConfig(transformers.BertConfig):
     def __init__(self,
-                 model_name,
+                 model_name='bert-base-uncased',
                  indexing_dimension=768,
                  apply_question_mask=False,
                  apply_passage_mask=False,
@@ -277,7 +281,7 @@ class RetrieverConfig(transformers.BertConfig):
 
 class T5RetrieverConfig(transformers.T5Config):
     def __init__(self,
-                 model_name,
+                 model_name='t5-base',
                  indexing_dimension=768,
                  apply_question_mask=False,
                  apply_passage_mask=False,
@@ -346,6 +350,12 @@ class RetrieverMixin:
             input_ids=text_ids,
             attention_mask=text_mask if apply_mask else None
         )
+        #print(text_output[0], len(text_output))
+        #print([hs.view(-1)[0] for hs in text_output[1]])
+        #print(text_output[0].size(), text_ids.size(), text_mask.size())
+        #print(apply_mask, text_ids[0], text_mask[0])
+        #input()
+
         if type(text_output) is not tuple:
             text_output.to_tuple()
         text_output = text_output[0]

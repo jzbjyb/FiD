@@ -29,11 +29,14 @@ class Dataset(torch.utils.data.Dataset):
         return len(self.data)
 
     def get_target(self, example):
+        # TODO: better way to control this?
+        import transformers
+        add_eos = transformers.__version__ == '3.0.2'
         if 'target' in example:
             target = example['target']
-            return target + ' </s>'
+            return target + (' </s>' if add_eos else '')
         elif 'answers' in example:
-            return random.choice(example['answers']) + ' </s>'
+            return random.choice(example['answers']) +  (' </s>' if add_eos else '')
         else:
             return None
 
@@ -121,7 +124,7 @@ class Collator(object):
 
         return (index, target_ids, target_mask, passage_ids, passage_masks)
 
-def load_data(data_path=None, global_rank=-1, world_size=-1):
+def load_data(data_path=None, global_rank=-1, world_size=-1, n_context=None):
     assert data_path
     if data_path.endswith('.jsonl'):
         data = open(data_path, 'r')
@@ -130,6 +133,8 @@ def load_data(data_path=None, global_rank=-1, world_size=-1):
             data = json.load(fin)
     examples = []
     for k, example in enumerate(data):
+        if n_context and len(example['ctxs']) != n_context:
+            continue
         if global_rank > -1 and not k%world_size==global_rank:
             continue
         if data_path is not None and data_path.endswith('.jsonl'):

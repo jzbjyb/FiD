@@ -9,6 +9,7 @@ import sys
 import torch
 import transformers
 import numpy as np
+from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
 from src.options import Options
@@ -43,10 +44,12 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
     loss, curr_loss = 0.0, 0.0
     epoch = 1
     model.train()
+    pbar = tqdm(total=opt.total_steps, disable=not opt.is_main)
     while step < opt.total_steps:
         epoch += 1
         for i, batch in enumerate(train_dataloader):
             step += 1
+            pbar.update(1)
             (idx, labels, _, context_ids, context_mask) = batch
 
             train_loss = model(
@@ -149,7 +152,10 @@ if __name__ == "__main__":
         checkpoint_path / 'run.log'
     )
 
-    model_name = 't5-' + opt.model_size
+    if opt.model_size in {'base', 'large'}:
+        model_name = 't5-' + opt.model_size
+    else:
+        model_name = opt.model_size  # 'google/t5-base-lm-adapt'
     model_class = src.model.FiDT5
 
     #load data
@@ -161,6 +167,7 @@ if __name__ == "__main__":
         opt.train_data, 
         global_rank=opt.global_rank, 
         world_size=opt.world_size,
+        n_context=opt.n_context,
     )
     train_dataset = src.data.Dataset(train_examples, opt.n_context)
     # use golbal rank and world size to split the eval set on multiple gpus
@@ -168,6 +175,7 @@ if __name__ == "__main__":
         opt.eval_data,
         global_rank=opt.global_rank,
         world_size=opt.world_size,
+        n_context=opt.n_context,
     )
     eval_dataset = src.data.Dataset(eval_examples, opt.n_context)
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-model=pretrained_models/nq_reader_base
-ckpt_dir=${model}.nq_train_10000
-data=open_domain_data/NQ/train.10000.json
+model=trained_reader/scifact_reader_base
+ckpt_dir=${model}.scifact_train
+data=open_domain_data/scifact/train.json
 
 python test_reader.py \
   --model_path ${model} \
