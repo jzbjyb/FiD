@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 
 model_root=trained_retriever
-name=scifact_reader_base_v11lm_raw
+name=sciq_reader_base_v11lm_sciq_step2k_noscale
 #data=open_domain_data/NQ/test.json
-data=open_domain_data/scifact/test.json
 #psgs_tsv_file=open_domain_data/NQ/train.1000/withtest.psgs_w100.tsv
-psgs_tsv_file=open_domain_data/scifact/psgs.tsv
+#data=open_domain_data/scifact/test.json
+#psgs_tsv_file=open_domain_data/scifact/psgs.tsv
+data=open_domain_data/SciQ/test.json
+psgs_tsv_file=open_domain_data/SciQ/psgs.tsv
 
 python passage_retrieval.py \
     --model_path ${model_root}/${name}/checkpoint/latest \

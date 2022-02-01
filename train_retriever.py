@@ -11,7 +11,7 @@ import transformers
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
-import inspect
+import wandb
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
@@ -27,13 +27,15 @@ from src.options import Options
 
 def train(model, optimizer, scheduler, global_step,
                     train_dataset, dev_dataset, opt, collator, best_eval_loss):
-
+    wandb_logger = tb_logger = None
     if opt.is_main:
-        try:
-            tb_logger = torch.utils.tensorboard.SummaryWriter(Path(opt.checkpoint_dir)/opt.name)
-        except:
-            tb_logger = None
-            logger.warning('Tensorboard is not available.')
+        if opt.wandb_entity:
+            wandb_logger = wandb.init(entity=opt.wandb_entity, project=opt.wandb_project, name=opt.wandb_name)
+        else:
+            try:
+                tb_logger = torch.utils.tensorboard.SummaryWriter(Path(opt.checkpoint_dir)/opt.name)
+            except:
+                logger.warning('Tensorboard is not available.')
     train_sampler = DistributedSampler(train_dataset) if opt.is_distributed else RandomSampler(train_dataset)
     train_dataloader = DataLoader(
         train_dataset, 
@@ -76,6 +78,9 @@ def train(model, optimizer, scheduler, global_step,
             train_loss = src.util.average_main(train_loss, opt)
             curr_loss += train_loss.item()
 
+            if global_step % opt.accumulation_steps == 0 and wandb_logger is not None:
+                wandb_logger.log({'train-loss': train_loss.item()}, step=global_step)
+
             if global_step % opt.eval_freq == 0:
                 eval_loss, inversions, avg_topk, idx_topk = evaluate(model, dev_dataset, collator, opt)
                 if eval_loss < best_eval_loss:
@@ -94,7 +99,12 @@ def train(model, optimizer, scheduler, global_step,
                     for k in idx_topk:    
                         log += f" | idx top{k}: {idx_topk[k]:.1f}"
                     logger.info(log)
-
+                    if wandb_logger is not None:
+                        wandb_logger.log({'dev-loss': eval_loss}, step=global_step)
+                        for k in avg_topk:
+                            wandb_logger.log({f'dev-avgtopk-{k}': avg_topk[k]}, step=global_step)
+                        for k in idx_topk:
+                            wandb_logger.log({f'dev-idxtopk-{k}': idx_topk[k]}, step=global_step)
                     if tb_logger is not None:
                         tb_logger.add_scalar("Evaluation", eval_loss, global_step)
                         tb_logger.add_scalar("Training", curr_loss / (opt.eval_freq), global_step)
@@ -176,8 +186,11 @@ if __name__ == "__main__":
     eval_examples = src.data.load_data(
         opt.eval_data, 
         global_rank=opt.global_rank, 
-        world_size=opt.world_size, 
+        world_size=opt.world_size,
+        n_context=opt.n_context,
     )
+    if opt.eval_num_examples:
+        eval_examples = eval_examples[:opt.eval_num_examples]
     eval_dataset = src.data.Dataset(eval_examples, opt.n_context)
 
     global_step = 0
@@ -190,11 +203,12 @@ if __name__ == "__main__":
         apply_passage_mask=not opt.no_passage_mask,
         extract_cls=opt.extract_cls,
         projection=not opt.no_projection,
+        scale_dot_product=opt.scale_dot_product,
     )
     if not directory_exists and opt.model_path == "none":
         model = model_class(config)
         src.util.set_dropout(model, opt.dropout)
-        model = model.to(opt.device)
+        model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
     elif opt.model_path == "none":  # continue train
         load_path = dir_path / 'checkpoint' / 'latest'
@@ -205,6 +219,8 @@ if __name__ == "__main__":
         model, optimizer, scheduler, opt_checkpoint, global_step, best_eval_loss = \
             src.util.load(model_class, opt.model_path, opt, reset_params=True)
         logger.info(f"Model loaded from {opt.model_path}")
+
+    model.set_checkpoint(opt.use_checkpoint)
 
     tokenizer = model.load_tokenizer()
     collator_function = src.data.RetrieverCollator(

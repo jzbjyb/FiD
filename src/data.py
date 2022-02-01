@@ -133,8 +133,10 @@ def load_data(data_path=None, global_rank=-1, world_size=-1, n_context=None):
             data = json.load(fin)
     examples = []
     for k, example in enumerate(data):
-        if n_context and len(example['ctxs']) != n_context:
+        if n_context:
+          if len(example['ctxs']) < n_context:
             continue
+          example['ctxs'] = example['ctxs'][:n_context]
         if global_rank > -1 and not k%world_size==global_rank:
             continue
         if data_path is not None and data_path.endswith('.jsonl'):

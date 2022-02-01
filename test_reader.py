@@ -34,7 +34,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
         write_path = Path(opt.checkpoint_dir) / opt.name / 'test_results'
         fw = open(write_path / ('%d.txt'%opt.global_rank), 'a')
     with torch.no_grad():
-        for i, batch in tqdm(enumerate(dataloader)):
+        for i, batch in tqdm(enumerate(dataloader), disable=not opt.is_main):
             (idx, _, _, context_ids, context_mask) = batch
 
             if opt.write_crossattention_scores:
@@ -105,8 +105,9 @@ if __name__ == "__main__":
     collator_function = src.data.Collator(opt.text_maxlength, tokenizer)
     eval_examples = src.data.load_data(
         opt.eval_data, 
-        global_rank=opt.global_rank, #use the global rank and world size attibutes to split the eval set on multiple gpus
-        world_size=opt.world_size
+        global_rank=opt.global_rank,  #use the global rank and world size attibutes to split the eval set on multiple gpus
+        world_size=opt.world_size,
+        n_context=opt.n_context,
     )
     eval_dataset = src.data.Dataset(
         eval_examples, 

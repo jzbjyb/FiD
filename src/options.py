@@ -65,7 +65,8 @@ class Options():
                         help='article titles not included in passages')
         self.parser.add_argument('--n_context', type=int, default=1)
         self.parser.add_argument('--init_with', type=str, default='bert-base-uncased')
-
+        self.parser.add_argument('--use_checkpoint', action='store_true', help='use checkpoint in the encoder')
+        self.parser.add_argument('--scale_dot_product', action='store_true', help='scale down the dot product')
 
     def initialize_parser(self):
         # basic parameters
@@ -86,10 +87,16 @@ class Options():
         # training parameters
         self.parser.add_argument('--eval_freq', type=int, default=500,
                         help='evaluate model every <eval_freq> steps during training')
+        self.parser.add_argument('--eval_num_examples', type=int, default=None,
+                                 help='number of examples used in evaluation during training')
         self.parser.add_argument('--save_freq', type=int, default=5000,
                         help='save model every <save_freq> steps during training')
         self.parser.add_argument('--eval_print_freq', type=int, default=1000,
                         help='print intermdiate results of evaluation every <eval_print_freq> steps')
+        # wandb
+        self.parser.add_argument('--wandb_entity', type=str, default='jzbjyb')
+        self.parser.add_argument('--wandb_project', type=str, default='adapt-knowledge')
+        self.parser.add_argument('--wandb_name', type=str, default='test')
 
 
     def print_options(self, opt):

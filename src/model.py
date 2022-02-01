@@ -8,6 +8,8 @@ import types
 import torch
 import transformers
 import inspect
+import time
+import functools
 import torch.nn.functional as F
 from torch import nn
 from torch.nn import CrossEntropyLoss
@@ -61,11 +63,13 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         """
         self.encoder = EncoderWrapper(self.encoder, use_checkpoint=use_checkpoint)
 
-    def unwrap_encoder(self):
+    def unwrap_encoder(self, keep_checkpoint: bool = False):
         """
         Unwrap Fusion-in-Decoder encoder, useful to load T5 weights.
         """
         self.encoder = self.encoder.encoder
+        if keep_checkpoint:
+            return
         block = []
         for mod in self.encoder.block:
             block.append(mod.module)
@@ -123,9 +127,12 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         Replace cross-attention forward function, only used to save
         cross-attention scores.
         """
+        import transformers
+        use_old = transformers.__version__ == '3.0.2'
+        forward_func = cross_attention_forward if use_old else cross_attention_forward_new
         for mod in self.decoder.block:
             attn = mod.layer[1].EncDecAttention
-            attn.forward = types.MethodType(cross_attention_forward, attn)
+            attn.forward = types.MethodType(forward_func, attn)
 
 class EncoderWrapper(torch.nn.Module):
     """
@@ -138,16 +145,20 @@ class EncoderWrapper(torch.nn.Module):
         apply_checkpoint_wrapper(self.encoder, use_checkpoint)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        if 'direct' in kwargs and kwargs['direct']:  # no reshaping, used in retrieval
+          del kwargs['direct']
+          return self.encoder(input_ids, attention_mask, **kwargs)
+        n_passages = kwargs['n_passages'] if 'n_passages' in kwargs else self.n_passages
         # total_length = n_passages * passage_length
         bsz, total_length = input_ids.shape
-        passage_length = total_length // self.n_passages
-        input_ids = input_ids.view(bsz*self.n_passages, passage_length)
-        attention_mask = attention_mask.view(bsz*self.n_passages, passage_length)
+        passage_length = total_length // n_passages
+        input_ids = input_ids.view(bsz*n_passages, passage_length)
+        attention_mask = attention_mask.view(bsz*n_passages, passage_length)
         outputs = self.encoder(input_ids, attention_mask, **kwargs)
         if kwargs['return_dict']:
-          outputs.last_hidden_state = outputs.last_hidden_state.view(bsz, self.n_passages*passage_length, -1)
+          outputs.last_hidden_state = outputs.last_hidden_state.view(bsz, n_passages*passage_length, -1)
         else:
-          outputs = (outputs[0].view(bsz, self.n_passages*passage_length, -1), ) + outputs[1:]
+          outputs = (outputs[0].view(bsz, n_passages*passage_length, -1), ) + outputs[1:]
         return outputs
 
 class CheckpointWrapper(torch.nn.Module):
@@ -194,6 +205,124 @@ def apply_checkpoint_wrapper(t5stack, use_checkpoint):
         block.append(wrapped_mod)
     block = nn.ModuleList(block)
     t5stack.block = block
+
+def cross_attention_forward_new(
+     self,
+     hidden_states,
+     mask=None,
+     key_value_states=None,
+     position_bias=None,
+     past_key_value=None,
+     layer_head_mask=None,
+     query_length=None,
+     use_cache=False,
+     output_attentions=False):
+  """
+  from: https://github.com/huggingface/transformers/blob/v4.15.0/src/transformers/models/t5/modeling_t5.py
+  Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
+  """
+  # Input is (batch_size, seq_length, dim)
+  # Mask is (batch_size, key_length) (non-causal) or (batch_size, key_length, key_length)
+  # past_key_value[0] is (batch_size, n_heads, q_len - 1, dim_per_head)
+  batch_size, seq_length = hidden_states.shape[:2]
+
+  real_seq_length = seq_length
+
+  if past_key_value is not None:
+    assert (
+         len(past_key_value) == 2
+    ), f"past_key_value should have 2 past states: keys and values. Got {len(past_key_value)} past states"
+    real_seq_length += past_key_value[0].shape[2] if query_length is None else query_length
+
+  key_length = real_seq_length if key_value_states is None else key_value_states.shape[1]
+
+  def shape(states):
+    """projection"""
+    return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
+
+  def unshape(states):
+    """reshape"""
+    return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
+
+  def project(hidden_states, proj_layer, key_value_states, past_key_value):
+    """projects hidden states correctly to key/query states"""
+    if key_value_states is None:
+      # self-attn
+      # (batch_size, n_heads, seq_length, dim_per_head)
+      hidden_states = shape(proj_layer(hidden_states))
+    elif past_key_value is None:
+      # cross-attn
+      # (batch_size, n_heads, seq_length, dim_per_head)
+      hidden_states = shape(proj_layer(key_value_states))
+
+    if past_key_value is not None:
+      if key_value_states is None:
+        # self-attn
+        # (batch_size, n_heads, key_length, dim_per_head)
+        hidden_states = torch.cat([past_key_value, hidden_states], dim=2)
+      else:
+        # cross-attn
+        hidden_states = past_key_value
+    return hidden_states
+
+  # get query states
+  query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
+
+  # get key/value states
+  key_states = project(
+    hidden_states, self.k, key_value_states, past_key_value[0] if past_key_value is not None else None
+  )
+  value_states = project(
+    hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
+  )
+
+  # compute scores
+  scores = torch.matmul(
+    query_states, key_states.transpose(3, 2)
+  )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
+
+  if position_bias is None:
+    if not self.has_relative_attention_bias:
+      position_bias = torch.zeros(
+        (1, self.n_heads, real_seq_length, key_length), device=scores.device, dtype=scores.dtype
+      )
+      if self.gradient_checkpointing and self.training:
+        position_bias.requires_grad = True
+    else:
+      position_bias = self.compute_bias(real_seq_length, key_length)
+
+    # if key and values are already calculated
+    # we want only the last query position bias
+    if past_key_value is not None:
+      position_bias = position_bias[:, :, -hidden_states.size(1):, :]
+
+    if mask is not None:
+      position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
+
+  scores += position_bias
+  if self.score_storage is None:
+    self.score_storage = scores
+
+  attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
+    scores
+  )  # (batch_size, n_heads, seq_length, key_length)
+  attn_weights = nn.functional.dropout(
+    attn_weights, p=self.dropout, training=self.training
+  )  # (batch_size, n_heads, seq_length, key_length)
+
+  # Mask heads if we want to
+  if layer_head_mask is not None:
+    attn_weights = attn_weights * layer_head_mask
+
+  attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
+  attn_output = self.o(attn_output)
+
+  present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
+  outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
+
+  if output_attentions:
+    outputs = outputs + (attn_weights,)
+  return outputs
 
 def cross_attention_forward(
         self,
@@ -267,6 +396,7 @@ class RetrieverConfig(transformers.BertConfig):
                  passage_maxlength=200,
                  question_maxlength=40,
                  projection=True,
+                 scale_dot_product=False,
                  **kwargs):
         super().__init__(**transformers.BertConfig.from_pretrained(model_name).to_dict())
         self.model_name = model_name
@@ -277,7 +407,7 @@ class RetrieverConfig(transformers.BertConfig):
         self.passage_maxlength = passage_maxlength
         self.question_maxlength = question_maxlength
         self.projection = projection
-
+        self.scale_dot_product = scale_dot_product
 
 class T5RetrieverConfig(transformers.T5Config):
     def __init__(self,
@@ -289,6 +419,7 @@ class T5RetrieverConfig(transformers.T5Config):
                  passage_maxlength=200,
                  question_maxlength=40,
                  projection=True,
+                 scale_dot_product=False,
                  **kwargs):
         super().__init__(**transformers.T5Config.from_pretrained(model_name).to_dict())
         self.model_name = model_name
@@ -299,6 +430,7 @@ class T5RetrieverConfig(transformers.T5Config):
         self.passage_maxlength = passage_maxlength
         self.question_maxlength = question_maxlength
         self.projection = projection
+        self.scale_dot_product = scale_dot_product
 
 class RetrieverMixin:
     def __init__(self, *args, **kwargs):
@@ -310,18 +442,15 @@ class RetrieverMixin:
             return T5Retriever
         return Retriever
 
+    def set_checkpoint(self, *args, **kwargs):
+        pass
+
     def forward(self,
                 question_ids,
                 question_mask,
                 passage_ids,
                 passage_mask,
                 gold_score=None):
-        question_output = self.embed_text(
-            text_ids=question_ids,
-            text_mask=question_mask,
-            apply_mask=self.config.apply_question_mask,
-            extract_cls=self.config.extract_cls,
-        )
         bsz, n_passages, plen = passage_ids.size()
         passage_ids = passage_ids.view(bsz * n_passages, plen)
         passage_mask = passage_mask.view(bsz * n_passages, plen)
@@ -331,13 +460,20 @@ class RetrieverMixin:
             apply_mask=self.config.apply_passage_mask,
             extract_cls=self.config.extract_cls,
         )
+        question_output = self.embed_text(
+            text_ids=question_ids,
+            text_mask=question_mask,
+            apply_mask=self.config.apply_question_mask,
+            extract_cls=self.config.extract_cls,
+        )
 
         score = torch.einsum(
             'bd,bid->bi',
             question_output,
             passage_output.view(bsz, n_passages, -1)
         )
-        score = score / np.sqrt(question_output.size(-1))
+        if self.config.scale_dot_product:
+            score = score / np.sqrt(question_output.size(-1))
         if gold_score is not None:
             loss = self.kldivloss(score, gold_score)
         else:
@@ -350,11 +486,6 @@ class RetrieverMixin:
             input_ids=text_ids,
             attention_mask=text_mask if apply_mask else None
         )
-        #print(text_output[0], len(text_output))
-        #print([hs.view(-1)[0] for hs in text_output[1]])
-        #print(text_output[0].size(), text_ids.size(), text_mask.size())
-        #print(apply_mask, text_ids[0], text_mask[0])
-        #input()
 
         if type(text_output) is not tuple:
             text_output.to_tuple()
@@ -414,9 +545,10 @@ class T5Retriever(RetrieverMixin, transformers.PreTrainedModel):
     initialize_with = config.model_name
     if 'reader' in initialize_with:  # FiD
       self.model = FiDT5.from_pretrained(initialize_with)
-      self.model.unwrap_encoder()  # convert back to T5
     elif 't5' in initialize_with:
-      self.model = transformers.T5ForConditionalGeneration.from_pretrained(initialize_with)
+      t5 = transformers.T5ForConditionalGeneration.from_pretrained(initialize_with)
+      self.model = FiDT5(t5.config)
+      self.model.load_t5(t5.state_dict())
     else:  # use bert as default
       raise NotImplementedError
 
@@ -427,7 +559,10 @@ class T5Retriever(RetrieverMixin, transformers.PreTrainedModel):
       )
       self.norm = nn.LayerNorm(self.config.indexing_dimension)
     self.loss_fct = torch.nn.KLDivLoss()
-    self.forward_func = self.model.encoder.forward
+    self.forward_func = functools.partial(self.model.encoder.forward, direct=True)
+
+  def set_checkpoint(self, use_checkpoint):
+    self.model.set_checkpoint(use_checkpoint)
 
   def load_tokenizer(self):
     return transformers.T5Tokenizer.from_pretrained('t5-base')

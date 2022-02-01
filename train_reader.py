@@ -11,6 +11,7 @@ import transformers
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
+import wandb
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
 from src.options import Options
 
@@ -22,13 +23,15 @@ import src.model
 
 
 def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_em, checkpoint_path):
-
+    wandb_logger = tb_logger = None
     if opt.is_main:
-        try:
-            tb_logger = torch.utils.tensorboard.SummaryWriter(Path(opt.checkpoint_dir)/opt.name)
-        except:
-            tb_logger = None
-            logger.warning('Tensorboard is not available.')
+        if opt.wandb_entity:
+            wandb_logger = wandb.init(entity=opt.wandb_entity, project=opt.wandb_project, name=opt.wandb_name)
+        else:
+            try:
+                tb_logger = torch.utils.tensorboard.SummaryWriter(Path(opt.checkpoint_dir)/opt.name)
+            except:
+                logger.warning('Tensorboard is not available.')
 
     torch.manual_seed(opt.global_rank + opt.seed) #different seed for different sampling depending on global_rank
     train_sampler = RandomSampler(train_dataset)
@@ -69,6 +72,9 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             train_loss = src.util.average_main(train_loss, opt)
             curr_loss += train_loss.item()
 
+            if step % opt.accumulation_steps == 0 and wandb_logger is not None:
+                wandb_logger.log({'train-loss': train_loss.item()}, step=step)
+
             if step % opt.eval_freq == 0:
                 dev_em = evaluate(model, eval_dataset, tokenizer, collator, opt)
                 model.train()
@@ -81,7 +87,9 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
                     log += f"train: {curr_loss/opt.eval_freq:.3f} |"
                     log += f"evaluation: {100*dev_em:.2f}EM |"
                     log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
-                    logger.info(log)    
+                    logger.info(log)
+                    if wandb_logger is not None:
+                        wandb_logger.log({'dev-em': dev_em}, step=step)
                     if tb_logger is not None:
                         tb_logger.add_scalar("Evaluation", dev_em, step)
                         tb_logger.add_scalar("Training", curr_loss / (opt.eval_freq), step)
