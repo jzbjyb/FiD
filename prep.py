@@ -172,7 +172,7 @@ def convert_to_beir_format(sciq_dir: str, beir_dir: str):
         fout.write(f'{qid}\t{did}\t1\n')
 
 
-def eval_answer(ret_file: str, sort: bool = False, topk: int = 100):
+def eval_answer(ret_file: str, sort: bool = False, topk: int = 100, key: str = 'score'):
   score_len_li: List[Tuple[float, int]] = []
   with open(ret_file, 'r') as fin:
     data = json.load(fin)
@@ -185,9 +185,9 @@ def eval_answer(ret_file: str, sort: bool = False, topk: int = 100):
     data = list(query2example.values())
     for example in data:
       for ctx in example['ctxs']:
-        score_len_li.append((float(ctx['score']), len(ctx['text'])))
+        score_len_li.append((float(ctx[key]), len(ctx['text'])))
       if sort:
-        example['ctxs'] = sorted(example['ctxs'], key=lambda x: float(x['score']), reverse=True)
+        example['ctxs'] = sorted(example['ctxs'], key=lambda x: float(x[key]), reverse=True)
       example['ctxs'] = example['ctxs'][:topk]
     print('score length correlation', scipy.stats.pearsonr(*list(zip(*score_len_li))))
     validate(data, 10)
@@ -248,7 +248,7 @@ if __name__ == '__main__':
 
   elif args.task == 'eval_answer':
     ret_file = args.inp[0]
-    eval_answer(ret_file, sort=True)
+    eval_answer(ret_file, sort=True, key='two_tower_attn_score')
 
   elif args.task == 'create_whole_test':
     data_dir = args.inp[0]

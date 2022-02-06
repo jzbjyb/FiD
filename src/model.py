@@ -111,6 +111,13 @@ def t5attention_forward(
   if mask is not None:
     scores = scores + mask  # (batch_size, n_heads, seq_length, key_length)
 
+  if not self.training:
+    if hasattr(self, 'collect_for_retrieval'):
+      # collect things used for retrieval
+      self.collect_for_retrieval(scores, hidden_states)
+    if hasattr(self, 'collect_cross_attention'):
+      self.score_storage = scores
+
   attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
     scores
   )  # (batch_size, n_heads, seq_length, key_length)
@@ -250,6 +257,9 @@ class FiDT5(transformers.T5ForConditionalGeneration):
     def reset_attention_separate_mask(self):
         self.encoder.attention_separate_mask = None
 
+    def get_collected_for_retrieval(self):
+        return self.encoder.get_collected_for_retrieval()
+
     def get_crossattention_scores(self, context_mask):
         """
         Cross-attention scores are aggregated to obtain a single scalar per
@@ -282,10 +292,12 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         """
         import transformers
         use_old = transformers.__version__ == '3.0.2'
-        forward_func = cross_attention_forward if use_old else cross_attention_forward_new
         for mod in self.decoder.block:
             attn = mod.layer[1].EncDecAttention
-            attn.forward = types.MethodType(forward_func, attn)
+            if use_old:
+                attn.forward = types.MethodType(cross_attention_forward, attn)
+            else:
+                attn.collect_cross_attention = True
 
 class EncoderWrapper(torch.nn.Module):
     """
@@ -326,23 +338,49 @@ class EncoderWrapper(torch.nn.Module):
     def apply_t5block_wrapper(self):
       layers = []
       for i, layer in enumerate(self.encoder.block):
+        used_for_retreival = i == self.n_layer_two_tower
         wrapped_layer = T5blockWrapper(
-          layer, use_checkpoint=self.use_checkpoint, use_full_attention=i >= self.n_layer_two_tower)
+          layer,
+          use_checkpoint=self.use_checkpoint,
+          use_full_attention=i >= self.n_layer_two_tower,
+          used_for_retreival=used_for_retreival)
+        if used_for_retreival:
+          self.retrieval_t5block = wrapped_layer
         layers.append(wrapped_layer)
       self.encoder.block = nn.ModuleList(layers)
+
+    def get_collected_for_retrieval(self):
+      return self.retrieval_t5block.get_collected_for_retrieval()
 
 class T5blockWrapper(torch.nn.Module):
     """
     (1) replacing None outputs by empty tensors, which allows the use of checkpointing.
     (2) added code to handle separate/full attention at different layers.
     """
-    def __init__(self, module, use_checkpoint: bool = False, use_full_attention: bool = True):
+    def __init__(self,
+                 module,
+                 use_checkpoint: bool = False,
+                 use_full_attention: bool = True,
+                 used_for_retreival: bool = False):
+        assert not used_for_retreival or use_full_attention, 'retrieval layer must use full attention'
         super().__init__()
         self.module = module
         self.use_checkpoint = use_checkpoint
         self.use_full_attention = use_full_attention
+        self.used_for_retreival = used_for_retreival
 
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
+        # register callback for retrieval
+        if self.used_for_retreival and not self.training:
+            reg_point = self.module.layer[0].SelfAttention
+            reg_point.collect_for_retrieval = types.MethodType(
+              functools.partial(
+                collect_for_retrieval,
+                attention_mask=attention_mask[:, 0].eq(0),
+                aggregation_method='sum-max',
+                field='query',
+                use_hidden_states=True,
+              ), reg_point)
         # handle separate/full attention
         if self.use_full_attention:
             # modify (potentially separate) attention mask to make it a full attention
@@ -370,6 +408,38 @@ class T5blockWrapper(torch.nn.Module):
         else:
             output = self.module(hidden_states, attention_mask, position_bias, **kwargs)
         return output
+
+    def get_collected_for_retrieval(self):
+        reg_point = self.module.layer[0].SelfAttention
+        return reg_point.retrieval
+
+def collect_for_retrieval(
+     self,
+     scores: torch.FloatTensor,  # (bs, n_heads, seq_len, seq_len)
+     hidden_states: torch.FloatTensor,  # (bs, seq_len, emb_size)
+     attention_mask: torch.BoolTensor,  # (bs, seq_len, seq_len)
+     aggregation_method: str,
+     field: str,
+     use_hidden_states: bool,
+):
+  if use_hidden_states:
+    scores = torch.matmul(
+      hidden_states,
+      hidden_states.transpose(1, 2)
+    )
+    scores = scores.unsqueeze(1)
+  pad_mask = attention_mask.max(1)[0]  # (bs, seq_len)
+  if field == 'query':
+    field_mask = attention_mask[:, 0]  # (bs, seq_len)
+  elif field == 'doc':
+    field_mask = attention_mask[:, -1]  # (bs, seq_len)
+  elif field == 'all':
+    field_mask = pad_mask
+  else:
+    raise NotImplementedError
+  cross_mask = ~attention_mask & pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)  # (bs, seq_len, seq_len)
+  final = ((scores - (~cross_mask.unsqueeze(1) * 1e5)).max(-1)[0].sum(1) * field_mask).sum(-1) / field_mask.sum(-1)  # (bs)
+  self.retrieval = {'two_tower_attn_score': final}
 
 def cross_attention_forward_new(
      self,

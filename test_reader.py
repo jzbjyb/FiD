@@ -49,6 +49,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
 
             if opt.write_crossattention_scores:
                 crossattention_scores = model.get_crossattention_scores(context_mask.cuda())
+                retrieval = model.get_collected_for_retrieval()
 
             for k, o in enumerate(outputs):
                 ans = tokenizer.decode(o, skip_special_tokens=True)
@@ -62,6 +63,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                 if opt.write_crossattention_scores:
                     for j in range(context_ids.size(1)):
                         example['ctxs'][j]['score'] = crossattention_scores[k, j].item()
+                        example['ctxs'][j]['two_tower_attn_score'] = retrieval['two_tower_attn_score'][j].item()
 
                 total += 1
             if (i + 1) % opt.eval_print_freq == 0:
@@ -99,7 +101,6 @@ if __name__ == "__main__":
     logger = src.util.init_logger(opt.is_main, opt.is_distributed, Path(opt.checkpoint_dir) / opt.name / 'run.log')
     if not directory_exists and opt.is_main:
         options.print_options(opt)
-
 
     tokenizer = transformers.T5Tokenizer.from_pretrained('t5-base', return_dict=False)
 
