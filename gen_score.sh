@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-model=trained_reader/sciq_reader_base_v11lm/checkpoint/latest
-data=open_domain_data/SciQ/test.json
-ckpt_dir=${model}.sciq_test
+model=trained_reader/sciq_reader_base_v11lm_separate/checkpoint/latest
+data=open_domain_data/SciQ/test.all.json
+ckpt_dir=${model}.sciq_test_all
 
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1

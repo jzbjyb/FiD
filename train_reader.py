@@ -25,7 +25,7 @@ import src.model
 def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_em, checkpoint_path):
     wandb_logger = tb_logger = None
     if opt.is_main:
-        if opt.wandb_entity:
+        if opt.wandb_entity and opt.wandb_name.split('/')[-1] != 'test':
             wandb_logger = wandb.init(entity=opt.wandb_entity, project=opt.wandb_project, name=opt.wandb_name)
         else:
             try:
@@ -53,12 +53,13 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
         for i, batch in enumerate(train_dataloader):
             step += 1
             pbar.update(1)
-            (idx, labels, _, context_ids, context_mask) = batch
-
+            (idx, labels, _, context_ids, context_mask, context_sep_mask) = batch
+            context_sep_mask = context_sep_mask.cuda() if context_sep_mask is not None else context_sep_mask
             train_loss = model(
                 input_ids=context_ids.cuda(),
                 attention_mask=context_mask.cuda(),
-                labels=labels.cuda()
+                attention_separate_mask=context_sep_mask,
+                labels=labels.cuda(),
             )[0]
 
             train_loss.backward()
@@ -101,6 +102,9 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             if step > opt.total_steps:
                 break
 
+    if opt.is_main and opt.total_steps == 0:  # save the original model
+        src.util.save(model, optimizer, scheduler, step, best_dev_em, opt, checkpoint_path, f'step-{step}')
+
 def evaluate(model, dataset, tokenizer, collator, opt):
     sampler = SequentialSampler(dataset)
     dataloader = DataLoader(dataset,
@@ -116,11 +120,12 @@ def evaluate(model, dataset, tokenizer, collator, opt):
     model = model.module if hasattr(model, "module") else model
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
-            (idx, _, _, context_ids, context_mask) = batch
-
+            (idx, _, _, context_ids, context_mask, context_sep_mask) = batch
+            context_sep_mask = context_sep_mask.cuda() if context_sep_mask is not None else context_sep_mask
             outputs = model.generate(
                 input_ids=context_ids.cuda(),
                 attention_mask=context_mask.cuda(),
+                attention_separate_mask=context_sep_mask,
                 max_length=50
             )
 
@@ -168,7 +173,11 @@ if __name__ == "__main__":
 
     #load data
     tokenizer = transformers.T5Tokenizer.from_pretrained(model_name)
-    collator = src.data.Collator(opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength)
+    collator = src.data.Collator(
+      opt.text_maxlength,
+      tokenizer,
+      answer_maxlength=opt.answer_maxlength,
+      separate_question_passage='separate')
 
     # use golbal rank and world size to split the eval set on multiple gpus
     train_examples = src.data.load_data(
@@ -185,12 +194,12 @@ if __name__ == "__main__":
         world_size=opt.world_size,
         n_context=opt.n_context,
     )
+    if opt.eval_num_examples:
+        eval_examples = eval_examples[:opt.eval_num_examples]
     eval_dataset = src.data.Dataset(eval_examples, opt.n_context)
 
     if not checkpoint_exists and opt.model_path == "none":
-        t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
-        model = src.model.FiDT5(t5.config)
-        model.load_t5(t5.state_dict())
+        model = src.model.FiDT5.from_t5(model_name, n_layer_two_tower=opt.n_layer_two_tower)
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
         step, best_dev_em = 0, 0.0

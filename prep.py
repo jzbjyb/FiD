@@ -6,6 +6,8 @@ import numpy as np
 import time
 import random
 import logging
+import copy
+from tqdm import tqdm
 import scipy.stats
 from collections import defaultdict
 from beir.datasets.data_loader import GenericDataLoader
@@ -170,23 +172,57 @@ def convert_to_beir_format(sciq_dir: str, beir_dir: str):
         fout.write(f'{qid}\t{did}\t1\n')
 
 
-def eval_answer(ret_file: str, sort: bool = False):
+def eval_answer(ret_file: str, sort: bool = False, topk: int = 100):
   score_len_li: List[Tuple[float, int]] = []
   with open(ret_file, 'r') as fin:
     data = json.load(fin)
+    query2example: Dict[str, Dict] = {}
+    for example in data:
+      if example['question'] not in query2example:
+        query2example[example['question']] = example
+        continue
+      query2example[example['question']]['ctxs'].extend(example['ctxs'])
+    data = list(query2example.values())
     for example in data:
       for ctx in example['ctxs']:
         score_len_li.append((float(ctx['score']), len(ctx['text'])))
       if sort:
         example['ctxs'] = sorted(example['ctxs'], key=lambda x: float(x['score']), reverse=True)
+      example['ctxs'] = example['ctxs'][:topk]
     print('score length correlation', scipy.stats.pearsonr(*list(zip(*score_len_li))))
     validate(data, 10)
+
+
+def create_whole_test(data_dir: str, out_num: int = None, topk: int = 100):
+  test_file = os.path.join(data_dir, 'test.json')
+  psgs_file = os.path.join(data_dir, 'psgs.tsv')
+  out_test_file = os.path.join(data_dir, 'test.all.json' if out_num is None else f'test.all.{out_num}.json')
+  id2titletext: Dict[str, Tuple[str, str]] = {}
+  with open(psgs_file, 'r') as fin:
+    fin.readline()
+    for l in fin:
+      id, text, title = l.rstrip('\n').split('\t')
+      id2titletext[id] = (title, text)
+  ids = list(id2titletext.keys())
+  with open(test_file, 'r') as fin, open(out_test_file, 'w') as fout:
+    data = json.load(fin)
+    if out_num:
+      random.shuffle(data)
+      data = data[:out_num]
+    new_data = []
+    for example in tqdm(data):
+      for batch_ids in range(0, len(ids), topk):
+        batch_ids = ids[batch_ids:batch_ids + topk]
+        _example = {'question': example['question'], 'answers': example['answers']}
+        _example['ctxs'] = [{'id': id, 'title': id2titletext[id][0], 'text': id2titletext[id][1]} for id in batch_ids]
+        new_data.append(_example)
+    json.dump(new_data, fout, indent=2)
 
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
-    'aggregate_ctxs', 'convert_beir_to_fid_format', 'eval', 'convert_to_beir_format', 'eval_answer'])
+    'aggregate_ctxs', 'convert_beir_to_fid_format', 'eval', 'convert_to_beir_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   args = parser.parse_args()
@@ -212,4 +248,8 @@ if __name__ == '__main__':
 
   elif args.task == 'eval_answer':
     ret_file = args.inp[0]
-    eval_answer(ret_file, sort=False)
+    eval_answer(ret_file, sort=True)
+
+  elif args.task == 'create_whole_test':
+    data_dir = args.inp[0]
+    create_whole_test(data_dir, out_num=100)

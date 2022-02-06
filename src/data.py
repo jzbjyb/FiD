@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import List
 import torch
 import random
 import json
@@ -92,11 +93,48 @@ def encode_passages(batch_text_passages, tokenizer, max_length):
     passage_masks = torch.cat(passage_masks, dim=0)
     return passage_ids, passage_masks.bool()
 
+def encode_passages_separate(questions: List[str], passages: List[List[str]], tokenizer, max_length, method: str):
+  assert len(questions) == len(passages)
+  passage_ids = []  # (bs, num_doc, seq_len)
+  passage_masks = []  # (bs, num_doc, seq_len)
+  passage_sep_masks = []  # (bs, num_doc, seq_len, seq_len)
+  for qind in range(len(questions)):
+    passage_ids.append([])
+    passage_masks.append([])
+    passage_sep_masks.append([])
+    question = questions[qind]
+    # at least include one token from passage in addition to bos and eos
+    qids: List[int] = tokenizer.encode(question, add_special_tokens=False)[:max_length - 3]
+    for p in passages[qind]:
+      pids: List[int] = tokenizer.encode(p, add_special_tokens=True, max_length=max_length - len(qids))
+      qpids = qids + pids + [0] * (max_length - len(qids) - len(pids))
+      qpattentin_mask = np.zeros((max_length, max_length), dtype=int)
+      if method == 'query-side':
+        qpattentin_mask[:len(qids), :len(qids) + len(pids)] = 1  # question tokens can see all
+        qpattentin_mask[len(qids):, len(qids):len(qids) + len(pids)] = 1  # passage tokens can only see passage
+      elif method == 'separate':
+        qpattentin_mask[:len(qids), :len(qids)] = 1  # question tokens can only see question
+        qpattentin_mask[len(qids):, len(qids):len(qids) + len(pids)] = 1  # passage tokens can only see passage
+      else:
+        raise NotImplementedError
+      passage_ids[-1].append(qpids)
+      passage_masks[-1].append([1] * (len(qids) + len(pids)) + [0] * (max_length - len(qids) - len(pids)))
+      passage_sep_masks[-1].append(qpattentin_mask)
+  passage_ids = torch.tensor(passage_ids)
+  passage_masks = torch.tensor(np.array(passage_masks))
+  passage_sep_masks = torch.tensor(np.array(passage_sep_masks))
+  return passage_ids, passage_masks.bool(), passage_sep_masks.bool()
+
 class Collator(object):
-    def __init__(self, text_maxlength, tokenizer, answer_maxlength=20):
+    def __init__(self, text_maxlength, tokenizer, answer_maxlength=20, separate_question_passage: str = None):
         self.tokenizer = tokenizer
         self.text_maxlength = text_maxlength
         self.answer_maxlength = answer_maxlength
+        assert separate_question_passage in {None, 'query-side', 'separate'}
+        # None: full attention mask
+        # query-side: query can attend to doc but doc cannot attend to query
+        # separate: both query and doc cannot attent to each other
+        self.separate_question_passage = separate_question_passage
 
     def __call__(self, batch):
         assert(batch[0]['target'] != None)
@@ -113,16 +151,23 @@ class Collator(object):
         target_mask = target["attention_mask"].bool()
         target_ids = target_ids.masked_fill(~target_mask, -100)
 
-        def append_question(example):
-            if example['passages'] is None:
-                return [example['question']]
-            return [example['question'] + " " + t for t in example['passages']]
-        text_passages = [append_question(example) for example in batch]
-        passage_ids, passage_masks = encode_passages(text_passages,
-                                                     self.tokenizer,
-                                                     self.text_maxlength)
+        if self.separate_question_passage:
+            questions = [example['question'] for example in batch]
+            passages = [example['passages'] for example in batch]
+            passage_ids, passage_masks, passage_sep_masks = encode_passages_separate(
+              questions, passages, self.tokenizer, self.text_maxlength, method=self.separate_question_passage)
+        else:
+            def append_question(example):
+                if example['passages'] is None:
+                    return [example['question']]
+                return [example['question'] + " " + t for t in example['passages']]
+            text_passages = [append_question(example) for example in batch]
+            passage_ids, passage_masks = encode_passages(text_passages,
+                                                         self.tokenizer,
+                                                         self.text_maxlength)
+            passage_sep_masks = None
 
-        return (index, target_ids, target_mask, passage_ids, passage_masks)
+        return (index, target_ids, target_mask, passage_ids, passage_masks, passage_sep_masks)
 
 def load_data(data_path=None, global_rank=-1, world_size=-1, n_context=None):
     assert data_path

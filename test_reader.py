@@ -35,14 +35,15 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
         fw = open(write_path / ('%d.txt'%opt.global_rank), 'a')
     with torch.no_grad():
         for i, batch in tqdm(enumerate(dataloader), disable=not opt.is_main):
-            (idx, _, _, context_ids, context_mask) = batch
+            (idx, _, _, context_ids, context_mask, context_sep_mask) = batch
 
             if opt.write_crossattention_scores:
                 model.reset_score_storage()
-
+            context_sep_mask = context_sep_mask.cuda() if context_sep_mask is not None else context_sep_mask
             outputs = model.generate(
                 input_ids=context_ids.cuda(),
                 attention_mask=context_mask.cuda(),
+                attention_separate_mask=context_sep_mask,
                 max_length=50,
             )
 
@@ -102,7 +103,10 @@ if __name__ == "__main__":
 
     tokenizer = transformers.T5Tokenizer.from_pretrained('t5-base', return_dict=False)
 
-    collator_function = src.data.Collator(opt.text_maxlength, tokenizer)
+    collator_function = src.data.Collator(
+        opt.text_maxlength,
+        tokenizer,
+        separate_question_passage='separate')
     eval_examples = src.data.load_data(
         opt.eval_data, 
         global_rank=opt.global_rank,  #use the global rank and world size attibutes to split the eval set on multiple gpus
@@ -138,4 +142,3 @@ if __name__ == "__main__":
         src.util.write_output(glob_path, write_path) 
     if opt.write_crossattention_scores:
         src.util.save_distributed_dataset(eval_dataset.data, opt)
-

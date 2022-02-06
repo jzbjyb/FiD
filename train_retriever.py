@@ -115,8 +115,8 @@ def train(model, optimizer, scheduler, global_step,
             if global_step > opt.total_steps:
                 break
 
-    if opt.total_steps == 0:  # save the original model
-        src.util.save(model, optimizer, scheduler, global_step, best_eval_loss, opt, dir_path, f"step-{global_step}")
+    if opt.is_main and opt.total_steps == 0:  # save the original model
+        src.util.save(model, optimizer, scheduler, global_step, best_eval_loss, opt, dir_path, f'step-{global_step}')
 
 
 def evaluate(model, dataset, collator, opt):
