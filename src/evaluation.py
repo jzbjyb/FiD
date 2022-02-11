@@ -14,6 +14,8 @@ from functools import partial
 from multiprocessing import Pool as ProcessPool
 from typing import Tuple, List, Dict
 import numpy as np
+from rouge_score import rouge_scorer
+rouge_inst = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
 
 """
 Evaluation code from DPR: https://github.com/facebookresearch/DPR
@@ -140,6 +142,9 @@ def exact_match_score(prediction, ground_truth):
 
 def ems(prediction, ground_truths):
     return max([exact_match_score(prediction, gt) for gt in ground_truths])
+
+def rougels(prediction, ground_truths):
+    return max([rouge_inst.score(gt, prediction)['rougeL'][2] for gt in ground_truths])
 
 ####################################################
 ########        RETRIEVER EVALUATION        ########

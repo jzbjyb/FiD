@@ -1,12 +1,14 @@
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Callable
 import argparse
 import json
 import os
+import re
 import numpy as np
 import time
 import random
 import logging
 import copy
+import statistics
 from tqdm import tqdm
 import scipy.stats
 from collections import defaultdict
@@ -16,6 +18,7 @@ from beir.retrieval.search.lexical import BM25Search as BM25
 from passage_retrieval import validate
 
 logging.basicConfig(level=logging.DEBUG)
+
 
 class BEIRDataset:
   def __init__(self, root_dir: str, name: str):
@@ -31,6 +34,9 @@ class BEIRDataset:
       return 'uncertain'
     return labels[0].lower()
 
+  def get_answer_techqa(cls, metadata: Dict):
+    return metadata['answer']
+
   def get_answer_sciq(cls, metadata: Dict):
     return metadata['answer']
 
@@ -43,6 +49,7 @@ class BEIRDataset:
         ans = getattr(self, f'get_answer_{self.name}')(metadata)
         qid2answer[id] = ans
     return qid2answer
+
 
 def aggregate_ctxs(json_files: List[str], out_file: str):
   assert out_file.endswith('.tsv'), 'plz use .tsv as extension'
@@ -73,8 +80,8 @@ def eval(beir_dir: str, ret_file: str, topks: List[int] = [1, 5, 10, 100]):
   for qid in qrels:
     query = queries[qid]
     qid2dids_gold[query].extend([did for did in qrels[qid]])
-    #print(qid, query, qid2dids_gold[query], corpus[qid2dids_gold[query][0]])
-    #input()
+    # print(qid, query, qid2dids_gold[query], corpus[qid2dids_gold[query][0]])
+    # input()
 
   topk2has = defaultdict(list)
   for qid in qid2dids:
@@ -136,8 +143,27 @@ def convert_beir_to_fid_format(beir_dir: str, out_dir: str, dataset_name: str, s
     json.dump(examples, open(os.path.join(out_dir, f'{split}.json'), 'w'), indent=2)
 
 
-def convert_to_beir_format(sciq_dir: str, beir_dir: str):
-  # load
+def save_beir_format(beir_dir: str,
+                     qid2dict: Dict[str, Dict],
+                     did2dict: Dict[str, Dict],
+                     split2qiddid: Dict[str, List[Tuple[str, str]]]):
+  # save
+  os.makedirs(beir_dir, exist_ok=True)
+  with open(os.path.join(beir_dir, 'queries.jsonl'), 'w') as fout:
+    for qid in qid2dict:
+      fout.write(json.dumps(qid2dict[qid]) + '\n')
+  with open(os.path.join(beir_dir, 'corpus.jsonl'), 'w') as fout:
+    for did in did2dict:
+      fout.write(json.dumps(did2dict[did]) + '\n')
+  os.makedirs(os.path.join(beir_dir, 'qrels'), exist_ok=True)
+  for split in split2qiddid:
+    with open(os.path.join(beir_dir, 'qrels', f'{split}.tsv'), 'w') as fout:
+      fout.write('query-id\tcorpus-id\tscore\n')
+      for qid, did in split2qiddid[split]:
+        fout.write(f'{qid}\t{did}\t1\n')
+
+
+def convert_sciq_to_beir_format(sciq_dir: str, beir_dir: str):
   qid2dict: Dict[str, Dict] = {}
   did2dict: Dict[str, Dict] = {}
   unique_text_set: Set[str] = set()
@@ -155,27 +181,92 @@ def convert_to_beir_format(sciq_dir: str, beir_dir: str):
         did2dict[did] = {'_id': did, 'title': '', 'text': ex['support']}
         unique_text_set.add(ex['support'])
         split2qiddid[nsplit].append((qid, did))
-
-  # save
-  os.makedirs(beir_dir, exist_ok=True)
-  with open(os.path.join(beir_dir, 'queries.jsonl'), 'w') as fout:
-    for qid in qid2dict:
-      fout.write(json.dumps(qid2dict[qid]) + '\n')
-  with open(os.path.join(beir_dir, 'corpus.jsonl'), 'w') as fout:
-    for did in did2dict:
-      fout.write(json.dumps(did2dict[did]) + '\n')
-  os.makedirs(os.path.join(beir_dir, 'qrels'), exist_ok=True)
-  for split in split2qiddid:
-    with open(os.path.join(beir_dir, 'qrels', f'{split}.tsv'), 'w') as fout:
-      fout.write('query-id\tcorpus-id\tscore\n')
-      for qid, did in split2qiddid[split]:
-        fout.write(f'{qid}\t{did}\t1\n')
+  save_beir_format(beir_dir, qid2dict, did2dict, split2qiddid)
 
 
-def eval_answer(ret_file: str, sort: bool = False, topk: int = 100, key: str = 'score'):
-  score_len_li: List[Tuple[float, int]] = []
+def convert_techqa_to_beir_format(techqa_dir: str, beir_dir: str, question_field: str):
+  pattern = re.compile(r'\s+')
+  def clean(text):
+    return re.sub(pattern, ' ', text).strip()
+  qid2dict: Dict[str, Dict] = {}
+  did2dict: Dict[str, Dict] = {}
+  swgid2did: Dict[str, str] = {}
+  split2qiddid: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+  for split, nsplit in [('training', 'train'), ('dev', 'dev')]:
+    with open(os.path.join(techqa_dir, 'training_and_dev', f'{split}_Q_A.json'), 'r') as fin:
+      data = json.load(fin)
+      for ex in data:
+        if ex['ANSWERABLE'] == 'N':
+          continue
+        qid = f'{str(len(qid2dict) + len(did2dict))}'
+        if question_field == 'title':
+          question = clean(ex['QUESTION_TITLE'])
+        elif question_field == 'text':
+          question = clean(ex['QUESTION_TEXT'])
+        elif question_field == 'all':
+          question = clean(ex['QUESTION_TITLE'] + ' ' + ex['QUESTION_TEXT'])
+        else:
+          raise NotImplementedError
+        answer = clean(ex['ANSWER'])
+        gold_swgid = ex['DOCUMENT']
+        qid2dict[qid] = {
+          '_id': qid,
+          'text': question,
+          'metadata': {'document': gold_swgid, 'answer': answer, 'offset': [ex['START_OFFSET'], ex['END_OFFSET']]}}
+        if gold_swgid not in swgid2did:
+          did = f'{str(len(qid2dict) + len(did2dict))}'
+          did2dict[did] = {}  # placeholder
+          swgid2did[gold_swgid] = did
+        split2qiddid[nsplit].append((qid, swgid2did[gold_swgid]))
+  with open(os.path.join(techqa_dir, 'training_and_dev', 'training_dev_technotes.json'), 'r') as fin:
+    data = json.load(fin)
+    for swgid, doc in data.items():
+      if swgid not in swgid2did:
+        did = f'{str(len(qid2dict) + len(did2dict))}'
+        did2dict[did] = {}  # placeholder
+        swgid2did[swgid] = did
+      did = swgid2did[swgid]
+      did2dict[did] = {'_id': did, 'title': clean(doc['title']), 'text': clean(doc['text'])}
+  save_beir_format(beir_dir, qid2dict, did2dict, split2qiddid)
+
+
+def convert_quasar_to_beir_format(quasar_dir: str, beir_dir: str):
+  qid2dict: Dict[str, Dict] = {}
+  did2dict: Dict[str, Dict] = {}
+  text2did: Dict[str, str] = {}
+  split2qiddid: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+  num_docs = 0
+  for split, nsplit in [('train', 'train'), ('dev', 'dev'), ('test', 'test')]:
+    with open(os.path.join(quasar_dir, 'questions', f'{split}_questions.json'), 'r') as qfin, \
+         open(os.path.join(quasar_dir, 'context', 'long', f'{split}_contexts.json'), 'r') as cfin:
+      for l in tqdm(qfin):
+        question = json.loads(l)
+        answer = question['answer']
+        docs = json.loads(cfin.readline())
+        assert question['uid'] == docs['uid']
+        if 'yes-answer-long' not in question['tags']:
+          continue
+        qid = f'{str(len(qid2dict) + len(did2dict))}'
+        qid2dict[qid] = {'_id': qid, 'text': question['question'], 'metadata': {'answer': answer}}
+        num_docs += len(docs['contexts'])
+        for score, doc in docs['contexts']:
+          if doc not in text2did:
+            did = f'{str(len(qid2dict) + len(did2dict))}'
+            text2did[doc] = did
+            did2dict[did] = {}
+          did = text2did[doc]
+          did2dict[did] = {'_id': did, 'title': '', 'text': doc}
+          if answer.lower() in doc.lower():
+            split2qiddid[nsplit].append((qid, did))  # TODO: this annotation is noisy and also not complete
+  save_beir_format(beir_dir, qid2dict, did2dict, split2qiddid)
+  print(f'#docs {len(text2did)}')
+
+
+def eval_answer(ret_file: str, sort: bool = False, shuffle: bool = False, topk: int = 100, key_func: Callable = lambda x: x['score']):
+  #score_len_li: List[Tuple[float, int]] = []
   with open(ret_file, 'r') as fin:
     data = json.load(fin)
+    # aggregate ctx of the same query
     query2example: Dict[str, Dict] = {}
     for example in data:
       if example['question'] not in query2example:
@@ -184,13 +275,33 @@ def eval_answer(ret_file: str, sort: bool = False, topk: int = 100, key: str = '
       query2example[example['question']]['ctxs'].extend(example['ctxs'])
     data = list(query2example.values())
     for example in data:
-      for ctx in example['ctxs']:
-        score_len_li.append((float(ctx[key]), len(ctx['text'])))
+      #for ctx in example['ctxs']:
+      #  score_len_li.append((float(key_func(ctx)), len(ctx['text'])))
       if sort:
-        example['ctxs'] = sorted(example['ctxs'], key=lambda x: float(x[key]), reverse=True)
+        example['ctxs'] = sorted(example['ctxs'], key=lambda x: float(key_func(x)), reverse=True)
+      if shuffle:
+        random.shuffle(example['ctxs'])
       example['ctxs'] = example['ctxs'][:topk]
-    print('score length correlation', scipy.stats.pearsonr(*list(zip(*score_len_li))))
-    validate(data, 10)
+    #print('score length correlation', scipy.stats.pearsonr(*list(zip(*score_len_li))))
+    validate(data, 32)
+
+
+def eval_variance(ret_file: str, key_func: Callable = lambda x: x['score']):
+  with open(ret_file, 'r') as fin:
+    data = json.load(fin)
+    # aggregate ctx of the same query
+    query2example: Dict[str, Dict] = {}
+    for example in data:
+      if example['question'] not in query2example:
+        query2example[example['question']] = example
+        continue
+      query2example[example['question']]['ctxs'].extend(example['ctxs'])
+    data = list(query2example.values())
+    vars: List[float] = []
+    for example in data:
+      scores = [float(key_func(ctx)) for ctx in example['ctxs']]
+      vars.append(statistics.variance(scores))
+  print(f'avg variance {np.mean(vars)}')
 
 
 def create_whole_test(data_dir: str, out_num: int = None, topk: int = 100):
@@ -222,7 +333,8 @@ def create_whole_test(data_dir: str, out_num: int = None, topk: int = 100):
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
-    'aggregate_ctxs', 'convert_beir_to_fid_format', 'eval', 'convert_to_beir_format', 'eval_answer', 'create_whole_test'])
+    'convert_sciq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
+    'aggregate_ctxs', 'eval', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   args = parser.parse_args()
@@ -235,20 +347,69 @@ if __name__ == '__main__':
   elif args.task == 'convert_beir_to_fid_format':
     beir_dir = args.inp[0]
     out_dir = args.out[0]
-    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='sciq', splits=['test', 'dev', 'train'])
+    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='techqa', splits=['dev', 'train'])
 
   elif args.task == 'eval':
     beir_dir, ret_file = args.inp
     eval(beir_dir, ret_file)
 
-  elif args.task == 'convert_to_beir_format':
+  elif args.task == 'convert_sciq_to_beir_format':
     sciq_dir = args.inp[0]
     beir_dir = args.out[0]
-    convert_to_beir_format(sciq_dir, beir_dir)
+    convert_sciq_to_beir_format(sciq_dir, beir_dir)
+
+  elif args.task == 'convert_techqa_to_beir_format':
+    techqa_dir = args.inp[0]
+    beir_dir = args.out[0]
+    convert_techqa_to_beir_format(techqa_dir, beir_dir, question_field='all')
+
+  elif args.task == 'convert_quasar_to_beir_format':
+    quasar_dir = args.inp[0]
+    beir_dir = args.out[0]
+    convert_quasar_to_beir_format(quasar_dir, beir_dir)
 
   elif args.task == 'eval_answer':
+    key = 'score'  # score two_tower_attn_score
+    method = 'avg'
+    n_two_tower_layers = 0
+    num_heads = 12
+
     ret_file = args.inp[0]
-    eval_answer(ret_file, sort=True, key='two_tower_attn_score')
+    if method == 'default':
+      eval_answer(ret_file, sort=False)
+      exit()
+    elif method == 'shuffle':
+      eval_answer(ret_file, shuffle=True)
+      exit()
+    elif method == 'avg':
+      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key]))
+      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][-1]))
+      exit()
+    elif method == 'avg_head':
+      for i in range(num_heads):
+        print(f'head {i}')
+        eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][11][i]))
+      exit()
+    elif method == 'specific':
+      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][0][0]))
+      exit()
+
+    for l in range(12 - n_two_tower_layers):
+      if method == 'avg_layer':
+        eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][l]))
+        continue
+      for i in range(num_heads):
+        print(f'layer {l}, head {i}')
+        eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][l][i]))
+
+  elif args.task == 'eval_variance':
+    ret_file = args.inp[0]
+    n_two_tower_layers = 9
+    num_heads = 12
+    for l in range(12 - n_two_tower_layers):
+      for i in range(num_heads):
+        print(f'layer {l}, head {i}')
+        eval_variance(ret_file, key_func=lambda x: x[f'two_tower_attn_score_{l}'][i])
 
   elif args.task == 'create_whole_test':
     data_dir = args.inp[0]

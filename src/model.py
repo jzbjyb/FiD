@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Callable
 import types
 import torch
 import transformers
@@ -158,9 +159,10 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         self.wrap_encoder()
 
     @classmethod
-    def from_t5(cls, model_name: str, n_layer_two_tower: int = 0):
+    def from_t5(cls, model_name: str, n_layer_two_tower: int = 0, attention_mask: str = 'separate'):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
-        config = cls.config_class(n_layer_two_tower=n_layer_two_tower, **t5.config.to_dict())
+        config = cls.config_class(
+          n_layer_two_tower=n_layer_two_tower, attention_mask=attention_mask, **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
         return model
@@ -200,13 +202,14 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         return result
 
     # We need to resize the inputs here, as the generate method expect 2D tensors
-    def generate(self, input_ids, attention_mask, attention_separate_mask=None, max_length=None):
+    def generate(self, input_ids, attention_mask, attention_separate_mask=None, max_length=None, **kwargs):
         self.set_attention_separate_mask(attention_separate_mask)  # set separate mask for encoder
         self.encoder.n_passages = input_ids.size(1)
         result = super().generate(
             input_ids=input_ids.view(input_ids.size(0), -1),
             attention_mask=attention_mask.view(attention_mask.size(0), -1),
-            max_length=max_length
+            max_length=max_length,
+            **kwargs
         )
         self.reset_attention_separate_mask()  # always reset separate mask to clean it up
         return result
@@ -260,7 +263,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
     def get_collected_for_retrieval(self):
         return self.encoder.get_collected_for_retrieval()
 
-    def get_crossattention_scores(self, context_mask):
+    def get_crossattention_scores(self, context_mask, sum_over_head_and_layer: bool = True):
         """
         Cross-attention scores are aggregated to obtain a single scalar per
         passage. This scalar can be seen as a similarity score between the
@@ -280,9 +283,15 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         # batch_size, n_head, n_layers, n_passages, text_maxlength
         scores = scores.view(bsz, n_heads, n_layers, n_passages, -1)
         scores = scores.masked_fill(~context_mask[:, None, None], 0.)
-        scores = scores.sum(dim=[1, 2, 4])
-        ntokens = context_mask.sum(dim=[2]) * n_layers * n_heads
-        scores = scores/ntokens
+        if sum_over_head_and_layer:
+          scores = scores.sum(dim=[1, 2, 4])
+          ntokens = context_mask.sum(dim=[2]) * n_layers * n_heads
+          scores = scores / ntokens  # batch_size, n_passages
+        else:
+          scores = scores.sum(dim=[4])
+          ntokens = context_mask.sum(dim=[2])[:, None, None]
+          scores = scores / ntokens  # batch_size, n_head, n_layers, n_passages
+          scores = scores.permute(0, 3, 2, 1)  # batch_size, n_passages, n_layers, n_head
         return scores
 
     def overwrite_forward_crossattention(self):
@@ -312,7 +321,9 @@ class EncoderWrapper(torch.nn.Module):
         self.encoder = encoder
         self.use_checkpoint = use_checkpoint
         self.n_layer_two_tower = n_layer_two_tower
-        self.apply_t5block_wrapper()
+        only_use_first_layer = lambda i, n_layer_two_tower: i == n_layer_two_tower
+        use_all_layers = lambda i, n_layer_two_tower: i >= n_layer_two_tower
+        self.apply_t5block_wrapper(use_all_layers)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
         if 'direct' in kwargs and kwargs['direct']:  # no reshaping, used in retrieval
@@ -323,7 +334,7 @@ class EncoderWrapper(torch.nn.Module):
         bsz, total_length = input_ids.shape
         passage_length = total_length // n_passages
         input_ids = input_ids.view(bsz*n_passages, passage_length)
-        if self.n_layer_two_tower > 0:  # use separate attention mask
+        if hasattr(self, 'attention_separate_mask') and self.attention_separate_mask is not None:  # use separate attention mask
           attention_mask = self.attention_separate_mask.view(
             *((bsz * n_passages,) + self.attention_separate_mask.size()[2:]))  # (bs * n_passage, seq_len * seq_len)
         else:
@@ -335,22 +346,34 @@ class EncoderWrapper(torch.nn.Module):
           outputs = (outputs[0].view(bsz, n_passages*passage_length, -1), ) + outputs[1:]
         return outputs
 
-    def apply_t5block_wrapper(self):
+    def apply_t5block_wrapper(self,
+                              use_for_retrieval_func: Callable):
       layers = []
+      self.retrieval_t5block_funcs = []
       for i, layer in enumerate(self.encoder.block):
-        used_for_retreival = i == self.n_layer_two_tower
+        used_for_retreival = use_for_retrieval_func(i, self.n_layer_two_tower)
         wrapped_layer = T5blockWrapper(
           layer,
           use_checkpoint=self.use_checkpoint,
           use_full_attention=i >= self.n_layer_two_tower,
           used_for_retreival=used_for_retreival)
         if used_for_retreival:
-          self.retrieval_t5block = wrapped_layer
+          self.retrieval_t5block_funcs.append(wrapped_layer.get_collected_for_retrieval)
         layers.append(wrapped_layer)
       self.encoder.block = nn.ModuleList(layers)
 
     def get_collected_for_retrieval(self):
-      return self.retrieval_t5block.get_collected_for_retrieval()
+      merge = {}
+      for i, func in enumerate(self.retrieval_t5block_funcs):
+        result = func()
+        for k, v in result.items():  # v is (bs, num_heads)
+          if k not in merge:
+            merge[k] = [v]
+          else:
+            merge[k].append(v)
+      for k in merge:
+        merge[k] = torch.stack(merge[k], 1)  # (bs, num_layers, num_heads)
+      return merge
 
 class T5blockWrapper(torch.nn.Module):
     """
@@ -377,9 +400,9 @@ class T5blockWrapper(torch.nn.Module):
               functools.partial(
                 collect_for_retrieval,
                 attention_mask=attention_mask[:, 0].eq(0),
-                aggregation_method='sum-max',
+                aggregation_method='all-avg-max',
                 field='query',
-                use_hidden_states=True,
+                use_hidden_states=False,
               ), reg_point)
         # handle separate/full attention
         if self.use_full_attention:
@@ -418,7 +441,7 @@ def collect_for_retrieval(
      scores: torch.FloatTensor,  # (bs, n_heads, seq_len, seq_len)
      hidden_states: torch.FloatTensor,  # (bs, seq_len, emb_size)
      attention_mask: torch.BoolTensor,  # (bs, seq_len, seq_len)
-     aggregation_method: str,
+     aggregation_method: str,  # 'head-query-key'
      field: str,
      use_hidden_states: bool,
 ):
@@ -438,8 +461,24 @@ def collect_for_retrieval(
   else:
     raise NotImplementedError
   cross_mask = ~attention_mask & pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)  # (bs, seq_len, seq_len)
-  final = ((scores - (~cross_mask.unsqueeze(1) * 1e5)).max(-1)[0].sum(1) * field_mask).sum(-1) / field_mask.sum(-1)  # (bs)
-  self.retrieval = {'two_tower_attn_score': final}
+  head_agg, query_agg, key_agg = aggregation_method.split('-')
+  if key_agg == 'max':
+    scores = (scores - (~cross_mask.unsqueeze(1) * 1e5)).max(-1)[0]  # (bs, n_heads, seq_len)
+  elif key_agg == 'avg':
+    scores = (scores * cross_mask.unsqueeze(1)).sum(-1) / (cross_mask.unsqueeze(1).sum(-1) + 1e-10)  # (bs, n_heads, seq_len)
+  else:
+    raise NotImplementedError
+  if query_agg == 'avg':
+    scores = (scores * field_mask.unsqueeze(1)).sum(-1) / field_mask.unsqueeze(1).sum(-1)  # (bs, n_heads)
+  else:
+    raise NotImplementedError
+  if head_agg == 'avg':
+    scores = scores.mean(-1)  # (bs)
+  elif head_agg == 'all':
+    pass
+  else:
+    raise NotImplementedError
+  self.retrieval = {'two_tower_attn_score': scores}
 
 def cross_attention_forward_new(
      self,

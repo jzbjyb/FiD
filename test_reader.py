@@ -44,11 +44,12 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                 input_ids=context_ids.cuda(),
                 attention_mask=context_mask.cuda(),
                 attention_separate_mask=context_sep_mask,
-                max_length=50,
+                max_length=opt.answer_maxlength,
             )
 
             if opt.write_crossattention_scores:
-                crossattention_scores = model.get_crossattention_scores(context_mask.cuda())
+                crossattention_scores = model.get_crossattention_scores(
+                  context_mask.cuda(), sum_over_head_and_layer=False)
                 retrieval = model.get_collected_for_retrieval()
 
             for k, o in enumerate(outputs):
@@ -62,8 +63,15 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                     fw.write(str(example['id']) + "\t" + ans + '\n')
                 if opt.write_crossattention_scores:
                     for j in range(context_ids.size(1)):
-                        example['ctxs'][j]['score'] = crossattention_scores[k, j].item()
-                        example['ctxs'][j]['two_tower_attn_score'] = retrieval['two_tower_attn_score'][j].item()
+                        cs = crossattention_scores[k, j]
+                        cs = cs.item() if cs.dim() == 0 else cs.cpu().numpy().tolist()
+                        example['ctxs'][j]['score'] = cs
+
+                        if 'two_tower_attn_score' not in retrieval:
+                          continue
+                        tt = retrieval['two_tower_attn_score'][j]
+                        tt = tt.item() if tt.dim() == 0 else tt.cpu().numpy().tolist()
+                        example['ctxs'][j]['two_tower_attn_score'] = tt
 
                 total += 1
             if (i + 1) % opt.eval_print_freq == 0:
@@ -107,7 +115,7 @@ if __name__ == "__main__":
     collator_function = src.data.Collator(
         opt.text_maxlength,
         tokenizer,
-        separate_question_passage='separate')
+        separate_question_passage=opt.attention_mask)
     eval_examples = src.data.load_data(
         opt.eval_data, 
         global_rank=opt.global_rank,  #use the global rank and world size attibutes to split the eval set on multiple gpus

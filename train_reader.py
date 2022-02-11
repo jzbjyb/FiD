@@ -22,7 +22,7 @@ import src.data
 import src.model
 
 
-def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_em, checkpoint_path):
+def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_metric, checkpoint_path):
     wandb_logger = tb_logger = None
     if opt.is_main:
         if opt.wandb_entity and opt.wandb_name.split('/')[-1] != 'test':
@@ -77,33 +77,33 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
                 wandb_logger.log({'train-loss': train_loss.item()}, step=step)
 
             if step % opt.eval_freq == 0:
-                dev_em = evaluate(model, eval_dataset, tokenizer, collator, opt)
+                dev_metric = evaluate(model, eval_dataset, tokenizer, collator, opt)
                 model.train()
                 if opt.is_main:
-                    if dev_em > best_dev_em:
-                        best_dev_em = dev_em
-                        src.util.save(model, optimizer, scheduler, step, best_dev_em,
+                    if dev_metric > best_dev_metric:
+                        best_dev_metric = dev_metric
+                        src.util.save(model, optimizer, scheduler, step, best_dev_metric,
                                   opt, checkpoint_path, 'best_dev')
                     log = f"{step} / {opt.total_steps} |"
                     log += f"train: {curr_loss/opt.eval_freq:.3f} |"
-                    log += f"evaluation: {100*dev_em:.2f}EM |"
+                    log += f"evaluation: {100*dev_metric:.2f}EM |"
                     log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
                     logger.info(log)
                     if wandb_logger is not None:
-                        wandb_logger.log({'dev-em': dev_em}, step=step)
+                        wandb_logger.log({f'dev-{opt.metric}': dev_metric}, step=step)
                     if tb_logger is not None:
-                        tb_logger.add_scalar("Evaluation", dev_em, step)
+                        tb_logger.add_scalar("Evaluation", dev_metric, step)
                         tb_logger.add_scalar("Training", curr_loss / (opt.eval_freq), step)
                     curr_loss = 0.
 
             if opt.is_main and step % opt.save_freq == 0:
-                src.util.save(model, optimizer, scheduler, step, best_dev_em,
+                src.util.save(model, optimizer, scheduler, step, best_dev_metric,
                           opt, checkpoint_path, f"step-{step}")
             if step > opt.total_steps:
                 break
 
     if opt.is_main and opt.total_steps == 0:  # save the original model
-        src.util.save(model, optimizer, scheduler, step, best_dev_em, opt, checkpoint_path, f'step-{step}')
+        src.util.save(model, optimizer, scheduler, step, best_dev_metric, opt, checkpoint_path, f'step-{step}')
 
 def evaluate(model, dataset, tokenizer, collator, opt):
     sampler = SequentialSampler(dataset)
@@ -132,7 +132,12 @@ def evaluate(model, dataset, tokenizer, collator, opt):
             for k, o in enumerate(outputs):
                 ans = tokenizer.decode(o, skip_special_tokens=True)
                 gold = dataset.get_example(idx[k])['answers']
-                score = src.evaluation.ems(ans, gold)
+                if opt.metric == 'em':
+                    score = src.evaluation.ems(ans, gold)
+                elif opt.metric == 'rougel':
+                    score = src.evaluation.rougels(ans, gold)
+                else:
+                    raise NotImplementedError
                 total += 1
                 exactmatch.append(score)
 
@@ -177,7 +182,7 @@ if __name__ == "__main__":
       opt.text_maxlength,
       tokenizer,
       answer_maxlength=opt.answer_maxlength,
-      separate_question_passage='separate')
+      separate_question_passage=opt.attention_mask)
 
     # use golbal rank and world size to split the eval set on multiple gpus
     train_examples = src.data.load_data(
@@ -199,17 +204,20 @@ if __name__ == "__main__":
     eval_dataset = src.data.Dataset(eval_examples, opt.n_context)
 
     if not checkpoint_exists and opt.model_path == "none":
-        model = src.model.FiDT5.from_t5(model_name, n_layer_two_tower=opt.n_layer_two_tower)
+        model = src.model.FiDT5.from_t5(
+          model_name,
+          n_layer_two_tower=opt.n_layer_two_tower,
+          attention_mask=opt.attention_mask)
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
-        step, best_dev_em = 0, 0.0
+        step, best_dev_metric = 0, 0.0
     elif opt.model_path == "none":
         load_path = checkpoint_path / 'checkpoint' / 'latest'
-        model, optimizer, scheduler, opt_checkpoint, step, best_dev_em = \
+        model, optimizer, scheduler, opt_checkpoint, step, best_dev_metric = \
             src.util.load(model_class, load_path, opt, reset_params=False)
         logger.info(f"Model loaded from {load_path}")
     else:
-        model, optimizer, scheduler, opt_checkpoint, step, best_dev_em = \
+        model, optimizer, scheduler, opt_checkpoint, step, best_dev_metric = \
             src.util.load(model_class, opt.model_path, opt, reset_params=True)
         logger.info(f"Model loaded from {opt.model_path}")
 
@@ -233,6 +241,6 @@ if __name__ == "__main__":
         eval_dataset,
         opt,
         collator,
-        best_dev_em,
+        best_dev_metric,
         checkpoint_path
     )

@@ -2,21 +2,25 @@
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
-#train_data=open_domain_data/NQ/train.json
-#eval_data=open_domain_data/NQ/dev.json
+train_data=open_domain_data/NQ/train.json
+eval_data=open_domain_data/NQ/dev.json
 #train_data=open_domain_data/scifact/train.json
 #eval_data=open_domain_data/scifact/test.json
-train_data=open_domain_data/SciQ/train.json
-eval_data=open_domain_data/SciQ/dev.json
+#train_data=open_domain_data/SciQ/train.json
+#eval_data=open_domain_data/SciQ/dev.json
+#train_data=open_domain_data/quasar_s/train.json
+#eval_data=open_domain_data/quasar_s/dev.json
+metric=em
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=sciq_reader_base_v11lm_separate_layer9
-n_layer_two_tower=9
+name=nq_reader_base_v11lm_queryside
+n_layer_two_tower=12
+attention_mask=query-side
 
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
-batch_size=1
+batch_size=2
 accum=$2
 
 if (( ${num_gpu} == 1 )); then
@@ -39,6 +43,7 @@ python ${prefix} train_reader.py \
   --model_size ${init_model} \
   --use_checkpoint \
   --text_maxlength 250 \
+  --answer_maxlength 50 \
   --per_gpu_batch_size ${batch_size} \
   --accumulation_steps ${accum} \
   --n_context 100 \
@@ -49,9 +54,23 @@ python ${prefix} train_reader.py \
   --scheduler linear \
   --weight_decay 0.01 \
   --n_layer_two_tower ${n_layer_two_tower} \
-  --total_step 1001 \
-  --warmup_step 100 \
+  --attention_mask ${attention_mask} \
+  --total_step 3501 \
+  --warmup_step 250 \
   --save_freq 500 \
-  --eval_freq 30 \
-  --eval_num_examples 100 \
+  --eval_freq 300 \
+  --eval_num_examples 200 \
+  --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name}
+
+# 3501
+# 250
+# 500
+# 300
+# 200
+
+# 501
+# 50
+# 250
+# 25
+# 100
