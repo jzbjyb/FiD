@@ -26,7 +26,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
     if hasattr(model, "module"):
         model = model.module
     if opt.write_crossattention_scores:
-        model.overwrite_forward_crossattention()
+        model.overwrite_forward_crossattention(opt.n_context)
         model.reset_score_storage() 
     total = 0
     exactmatch = []
@@ -35,7 +35,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
         fw = open(write_path / ('%d.txt'%opt.global_rank), 'a')
     with torch.no_grad():
         for i, batch in tqdm(enumerate(dataloader), disable=not opt.is_main):
-            (idx, _, _, context_ids, context_mask, context_sep_mask) = batch
+            (idx, labels, _, context_ids, context_mask, context_sep_mask) = batch
 
             if opt.write_crossattention_scores:
                 model.reset_score_storage()
@@ -47,16 +47,23 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                 max_length=opt.answer_maxlength,
             )
 
+            # extract answers and their starting positions
+            queries, predictions, predictions_position = list(zip(*[
+              src.util.extract_query_answer(o, tokenizer, query_in_decoder=opt.query_in_decoder) for o in outputs]))
+
             if opt.write_crossattention_scores:
                 crossattention_scores = model.get_crossattention_scores(
-                  context_mask.cuda(), sum_over_head_and_layer=False)
+                  predictions_position,
+                  context_mask.cuda(),
+                  sum_over_head_and_layer=False)
                 retrieval = model.get_collected_for_retrieval()
 
             for k, o in enumerate(outputs):
-                ans = tokenizer.decode(o, skip_special_tokens=True)
+                query, ans = queries[k], predictions[k]
                 example = dataset.data[idx[k]]
                 if 'answers' in example:
                     score = src.evaluation.ems(ans, example['answers'])
+                    #score = src.evaluation.ems(queries[k].strip('question:').strip().lower(), [example['question'].strip().lower()])
                     exactmatch.append(score)
 
                 if opt.write_results:
@@ -115,7 +122,8 @@ if __name__ == "__main__":
     collator_function = src.data.Collator(
         opt.text_maxlength,
         tokenizer,
-        separate_question_passage=opt.attention_mask)
+        separate_query_passage=opt.attention_mask,
+        query_in_decoder=opt.query_in_decoder)
     eval_examples = src.data.load_data(
         opt.eval_data, 
         global_rank=opt.global_rank,  #use the global rank and world size attibutes to split the eval set on multiple gpus

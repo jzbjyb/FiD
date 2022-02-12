@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Callable
+from typing import Callable, List
 import types
 import torch
 import transformers
@@ -117,7 +117,7 @@ def t5attention_forward(
       # collect things used for retrieval
       self.collect_for_retrieval(scores, hidden_states)
     if hasattr(self, 'collect_cross_attention'):
-      self.score_storage = scores
+      self.collect_cross_attention(scores, mask.eq(0))
 
   attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
     scores
@@ -146,9 +146,10 @@ class FiDT5Config(transformers.T5Config):
   def __init__(self,
                *args,
                **kwargs):
-    if 'n_layer_two_tower' in kwargs:
-      self.n_layer_two_tower = kwargs['n_layer_two_tower']
-      del kwargs['n_layer_two_tower']
+    for extra in ['n_layer_two_tower', 'attention_mask', 'query_in_decoder']:
+      if extra in kwargs:
+        setattr(self, extra, kwargs[extra])
+        del kwargs[extra]
     super().__init__(*args, **kwargs)
 
 class FiDT5(transformers.T5ForConditionalGeneration):
@@ -159,10 +160,17 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         self.wrap_encoder()
 
     @classmethod
-    def from_t5(cls, model_name: str, n_layer_two_tower: int = 0, attention_mask: str = 'separate'):
+    def from_t5(cls,
+                model_name: str,
+                n_layer_two_tower: int = 0,
+                attention_mask: str = 'separate',
+                query_in_decoder: str = 'no'):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
-          n_layer_two_tower=n_layer_two_tower, attention_mask=attention_mask, **t5.config.to_dict())
+          n_layer_two_tower=n_layer_two_tower,
+          attention_mask=attention_mask,
+          query_in_decoder=query_in_decoder,
+          **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
         return model
@@ -263,38 +271,57 @@ class FiDT5(transformers.T5ForConditionalGeneration):
     def get_collected_for_retrieval(self):
         return self.encoder.get_collected_for_retrieval()
 
-    def get_crossattention_scores(self, context_mask, sum_over_head_and_layer: bool = True):
-        """
-        Cross-attention scores are aggregated to obtain a single scalar per
-        passage. This scalar can be seen as a similarity score between the
-        question and the input passage. It is obtained by averaging the
-        cross-attention scores obtained on the first decoded token over heads,
-        layers, and tokens of the input passage.
+    def get_crossattention_scores(
+         self,
+         positions: List[int],  # (bs)
+         context_mask,  # (bs, n_passages, text_maxlength)
+         sum_over_head_and_layer: bool = True):
+      """
+      Cross-attention scores are aggregated to obtain a single scalar per
+      passage. This scalar can be seen as a similarity score between the
+      question and the input passage. It is obtained by averaging the
+      cross-attention scores obtained on the first decoded token over heads,
+      layers, and tokens of the input passage.
 
-        More details in Distilling Knowledge from Reader to Retriever:
-        https://arxiv.org/abs/2012.04584.
-        """
-        scores = []
-        n_passages = context_mask.size(1)
-        for mod in self.decoder.block:
-            scores.append(mod.layer[1].EncDecAttention.score_storage)
-        scores = torch.cat(scores, dim=2)
-        bsz, n_heads, n_layers, _ = scores.size()
-        # batch_size, n_head, n_layers, n_passages, text_maxlength
-        scores = scores.view(bsz, n_heads, n_layers, n_passages, -1)
-        scores = scores.masked_fill(~context_mask[:, None, None], 0.)
-        if sum_over_head_and_layer:
-          scores = scores.sum(dim=[1, 2, 4])
-          ntokens = context_mask.sum(dim=[2]) * n_layers * n_heads
-          scores = scores / ntokens  # batch_size, n_passages
-        else:
-          scores = scores.sum(dim=[4])
-          ntokens = context_mask.sum(dim=[2])[:, None, None]
-          scores = scores / ntokens  # batch_size, n_head, n_layers, n_passages
-          scores = scores.permute(0, 3, 2, 1)  # batch_size, n_passages, n_layers, n_head
-        return scores
+      More details in Distilling Knowledge from Reader to Retriever:
+      https://arxiv.org/abs/2012.04584.
+      """
+      n_passages = context_mask.size(1)
 
-    def overwrite_forward_crossattention(self):
+      # collect
+      scores = []
+      for mod in self.decoder.block:
+        s = torch.cat(mod.layer[1].EncDecAttention.score_storage, dim=2)  # (bs, n_head, decode_len, encode_len)
+        scores.append(s)
+      scores = torch.stack(scores, dim=2)  # (bs, n_head, n_layers, decode_len, encode_len)
+      bsz, n_heads, n_layers, decode_len, _ = scores.size()
+      scores = scores.view(bsz, n_heads, n_layers, decode_len, n_passages, -1)  # (bs, n_head, n_layers, decode_len, n_passages, text_maxlength)
+
+      # decide whether score is already summed over text_maxlength
+      if scores.size(-1) != context_mask.size(-1) and scores.size(-1) == 1:  # already summed
+        context_mask = torch.ones_like(context_mask)[:, :, :1]  # (bs, n_passages, 1)
+
+      # choose the cross attn corresponding to positions
+      scores = scores.masked_fill(~context_mask[:, None, None, None], 0.)
+      assert len(positions) == bsz
+      _scores = []
+      for i, p in enumerate(positions):
+        _scores.append(scores[i, :, :, p])  # (n_head, n_layers, n_passages, text_maxlength)
+      scores = torch.stack(_scores, dim=0)  # (bs, n_head, n_layers, n_passages, text_maxlength)
+
+      # aggregation
+      if sum_over_head_and_layer:
+        scores = scores.sum(dim=[1, 2, 4])
+        ntokens = context_mask.sum(dim=[2]) * n_layers * n_heads
+        scores = scores / ntokens  # batch_size, n_passages
+      else:
+        scores = scores.sum(dim=[4])
+        ntokens = context_mask.sum(dim=[2])[:, None, None]
+        scores = scores / ntokens  # batch_size, n_head, n_layers, n_passages
+        scores = scores.permute(0, 3, 2, 1)  # batch_size, n_passages, n_layers, n_head
+      return scores
+
+    def overwrite_forward_crossattention(self, n_context: int):
         """
         Replace cross-attention forward function, only used to save
         cross-attention scores.
@@ -306,7 +333,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
             if use_old:
                 attn.forward = types.MethodType(cross_attention_forward, attn)
             else:
-                attn.collect_cross_attention = True
+                attn.collect_cross_attention = types.MethodType(
+                  functools.partial(collect_cross_attention, n_context=n_context, sum_over_tokens=True), attn)
 
 class EncoderWrapper(torch.nn.Module):
     """
@@ -435,6 +463,25 @@ class T5blockWrapper(torch.nn.Module):
     def get_collected_for_retrieval(self):
         reg_point = self.module.layer[0].SelfAttention
         return reg_point.retrieval
+
+def collect_cross_attention(
+     self,
+     scores: torch.FloatTensor,  # (bs, n_heads, 1, enc_seq_len)
+     mask: torch.BoolTensor,  # (bs, n_heads or 1, 1, enc_seq_len)
+     n_context: int,
+     sum_over_tokens: bool):
+  # save cross attn at all decoding position
+  if sum_over_tokens:
+    # TODO: we sum over text_len to save space but is there any better workaround?
+    s = scores.view(*(scores.size()[:3] + (n_context, -1)))  # (bs, n_heads, 1, n_context, text_len)
+    m = mask.view(*(mask.size()[:3] + (n_context, -1)))  # (bs, n_heads, 1, n_context, text_len)
+    s = (s * m).sum(-1) / m.sum(-1)  # (bs, n_heads, 1, n_context)
+  else:
+    s = score
+  if self.score_storage is None:
+    self.score_storage = [s]
+  else:
+    self.score_storage.append(s)
 
 def collect_for_retrieval(
      self,

@@ -49,8 +49,11 @@ class Options():
         self.parser.add_argument('--n_context', type=int, default=1)
         self.parser.add_argument('--n_layer_two_tower', type=int, default=0,
                                  help='number of layers used for two tower representation')
-        self.parser.add_argument('--attention_mask', type=str, default='separate', choices=['separate', 'query-side'],
+        self.parser.add_argument('--attention_mask', type=str, default=None,
+                                 choices=[None, 'separate', 'query-side', 'no-query'],
                                  help='how to generate attention for query/doc')
+        self.parser.add_argument('--query_in_decoder', type=str, default='no', choices=['no', 'all'],
+                                 help='use query at the beginning of the decoder')
         self.parser.add_argument('--metric', type=str, default='em', choices=['em', 'rougel'])
 
     def add_retriever_options(self):

@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Tuple, List
 import os
 import errno
 import torch
@@ -224,3 +225,33 @@ def load_passages(path):
                 except:
                     logger.warning(f'The following input line has not been correctly loaded: {row}')
     return passages
+
+def extract_query_answer(output: List[int], tokenizer, query_in_decoder: bool = False) -> Tuple[str, str, int]:
+  pad_id = tokenizer.pad_token_id
+  splits: List[List[int]] = []
+  splits_start_position: List[int] = []
+  for i, t in enumerate(output):
+    if t != pad_id:
+      splits[-1].append(t)
+    elif len(splits) == 0 or len(splits[-1]) > 0:
+      splits.append([])
+      splits_start_position.append(i)
+  if len(splits[-1]) == 0:
+    del splits[-1]
+    del splits_start_position[-1]
+  if query_in_decoder == 'no':  # only answer
+    query = ''
+    ans = tokenizer.decode(splits[0], skip_special_tokens=True)
+    ans_position = splits_start_position[0]
+  elif len(splits) == 1:
+    # only query
+    # this is the case where the decoder fails to generate answers
+    # but we still use the first pad as ans_position to collect decoder attn
+    query = tokenizer.decode(splits[0], skip_special_tokens=True)
+    ans = ''
+    ans_position = splits_start_position[0]
+  else:  # query & ?? & answer
+    query = tokenizer.decode(splits[0], skip_special_tokens=True)
+    ans = tokenizer.decode(splits[-1], skip_special_tokens=True)
+    ans_position = splits_start_position[-1]
+  return query, ans, ans_position

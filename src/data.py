@@ -106,40 +106,62 @@ def encode_passages_separate(questions: List[str], passages: List[List[str]], to
     # at least include one token from passage in addition to bos and eos
     qids: List[int] = tokenizer.encode(question, add_special_tokens=False)[:max_length - 3]
     for p in passages[qind]:
-      pids: List[int] = tokenizer.encode(p, add_special_tokens=True, max_length=max_length - len(qids))
-      qpids = qids + pids + [0] * (max_length - len(qids) - len(pids))
-      qpattentin_mask = np.zeros((max_length, max_length), dtype=int)
-      if method == 'query-side':
-        qpattentin_mask[:len(qids), :len(qids) + len(pids)] = 1  # question tokens can see all
-        qpattentin_mask[len(qids):, len(qids):len(qids) + len(pids)] = 1  # passage tokens can only see passage
-      elif method == 'separate':
-        qpattentin_mask[:len(qids), :len(qids)] = 1  # question tokens can only see question
-        qpattentin_mask[len(qids):, len(qids):len(qids) + len(pids)] = 1  # passage tokens can only see passage
+      if method == 'no-query':
+        pids: List[int] = tokenizer.encode(p, add_special_tokens=True, max_length=max_length)
+        pattn_mask = np.zeros((max_length, max_length), dtype=int)
+        pattn_mask[:, :len(pids)] = 1
+        passage_ids[-1].append(pids + [0] * (max_length - len(pids)))
+        passage_masks[-1].append(pattn_mask[0])
+        passage_sep_masks[-1].append(pattn_mask)
       else:
-        raise NotImplementedError
-      passage_ids[-1].append(qpids)
-      passage_masks[-1].append([1] * (len(qids) + len(pids)) + [0] * (max_length - len(qids) - len(pids)))
-      passage_sep_masks[-1].append(qpattentin_mask)
+        pids: List[int] = tokenizer.encode(p, add_special_tokens=True, max_length=max_length - len(qids))
+        qpids = qids + pids + [0] * (max_length - len(qids) - len(pids))
+        qpattn_mask = np.zeros((max_length, max_length), dtype=int)
+        if method == 'query-side':
+          qpattn_mask[:len(qids), :len(qids) + len(pids)] = 1  # question tokens can see all
+          qpattn_mask[len(qids):, len(qids):len(qids) + len(pids)] = 1  # passage tokens can only see passage
+        elif method == 'separate':
+          qpattn_mask[:len(qids), :len(qids)] = 1  # question tokens can only see question
+          qpattn_mask[len(qids):, len(qids):len(qids) + len(pids)] = 1  # passage tokens can only see passage
+        else:
+          raise NotImplementedError
+        passage_ids[-1].append(qpids)
+        passage_masks[-1].append([1] * (len(qids) + len(pids)) + [0] * (max_length - len(qids) - len(pids)))
+        passage_sep_masks[-1].append(qpattn_mask)
   passage_ids = torch.tensor(passage_ids)
   passage_masks = torch.tensor(np.array(passage_masks))
   passage_sep_masks = torch.tensor(np.array(passage_sep_masks))
   return passage_ids, passage_masks.bool(), passage_sep_masks.bool()
 
 class Collator(object):
-    def __init__(self, text_maxlength, tokenizer, answer_maxlength=20, separate_question_passage: str = None):
+    def __init__(self,
+                 text_maxlength,
+                 tokenizer,
+                 answer_maxlength=20,
+                 separate_query_passage: str = None,
+                 query_in_decoder: str = 'no'):
         self.tokenizer = tokenizer
         self.text_maxlength = text_maxlength
         self.answer_maxlength = answer_maxlength
-        assert separate_question_passage in {None, 'query-side', 'separate'}
+        assert separate_query_passage in {None, 'query-side', 'separate', 'no-query'}
         # None: full attention mask
         # query-side: query can attend to doc but doc cannot attend to query
         # separate: both query and doc cannot attent to each other
-        self.separate_question_passage = separate_question_passage
+        # no-query: only include doc
+        self.separate_query_passage = separate_query_passage
+        assert query_in_decoder in {'no', 'all'}
+        # no: no query in decoder
+        # all: decode query and answer
+        self.query_in_decoder = query_in_decoder
 
     def __call__(self, batch):
-        assert(batch[0]['target'] != None)
         index = torch.tensor([ex['index'] for ex in batch])
-        target = [ex['target'] for ex in batch]
+
+        # decoder
+        decoder_start_token = self.tokenizer.pad_token  # T5 uses pad as the start token of decoding
+        assert batch[0]['target'] != None
+        target = ['{} {} {}'.format(ex['question'], decoder_start_token, ex['target'])
+                  if self.query_in_decoder != 'no' else ex['target'] for ex in batch]
         target = self.tokenizer.batch_encode_plus(
             target,
             max_length=self.answer_maxlength if self.answer_maxlength > 0 else None,
@@ -147,15 +169,16 @@ class Collator(object):
             return_tensors='pt',
             truncation=True if self.answer_maxlength > 0 else False,
         )
-        target_ids = target["input_ids"]
-        target_mask = target["attention_mask"].bool()
+        target_ids = target['input_ids']
+        target_mask = target['attention_mask'].bool()
         target_ids = target_ids.masked_fill(~target_mask, -100)
 
-        if self.separate_question_passage:
+        # encoder
+        if self.separate_query_passage:
             questions = [example['question'] for example in batch]
             passages = [example['passages'] for example in batch]
             passage_ids, passage_masks, passage_sep_masks = encode_passages_separate(
-              questions, passages, self.tokenizer, self.text_maxlength, method=self.separate_question_passage)
+              questions, passages, self.tokenizer, self.text_maxlength, method=self.separate_query_passage)
         else:
             def append_question(example):
                 if example['passages'] is None:

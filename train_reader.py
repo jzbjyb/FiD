@@ -126,11 +126,10 @@ def evaluate(model, dataset, tokenizer, collator, opt):
                 input_ids=context_ids.cuda(),
                 attention_mask=context_mask.cuda(),
                 attention_separate_mask=context_sep_mask,
-                max_length=50
-            )
+                max_length=opt.answer_maxlength)
 
             for k, o in enumerate(outputs):
-                ans = tokenizer.decode(o, skip_special_tokens=True)
+                _, ans = src.util.extract_query_answer(o, tokenizer, query_in_decoder=opt.query_in_decoder)[:2]
                 gold = dataset.get_example(idx[k])['answers']
                 if opt.metric == 'em':
                     score = src.evaluation.ems(ans, gold)
@@ -182,7 +181,8 @@ if __name__ == "__main__":
       opt.text_maxlength,
       tokenizer,
       answer_maxlength=opt.answer_maxlength,
-      separate_question_passage=opt.attention_mask)
+      separate_query_passage=opt.attention_mask,
+      query_in_decoder=opt.query_in_decoder)
 
     # use golbal rank and world size to split the eval set on multiple gpus
     train_examples = src.data.load_data(
@@ -207,7 +207,8 @@ if __name__ == "__main__":
         model = src.model.FiDT5.from_t5(
           model_name,
           n_layer_two_tower=opt.n_layer_two_tower,
-          attention_mask=opt.attention_mask)
+          attention_mask=opt.attention_mask,
+          query_in_decoder=opt.query_in_decoder)
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
         step, best_dev_metric = 0, 0.0

@@ -14,14 +14,21 @@ metric=em
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_queryside
+name=nq_reader_base_v11lm_separate_qid
 n_layer_two_tower=12
-attention_mask=query-side
+attention_mask=separate
+query_in_decoder=all
 
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
 batch_size=2
 accum=$2
+
+if [[ ${query_in_decoder} == 'no' ]]; then
+  answer_maxlength=50
+else
+  answer_maxlength=100
+fi
 
 if (( ${num_gpu} == 1 )); then
   echo 'single-GPU'
@@ -43,7 +50,7 @@ python ${prefix} train_reader.py \
   --model_size ${init_model} \
   --use_checkpoint \
   --text_maxlength 250 \
-  --answer_maxlength 50 \
+  --answer_maxlength ${answer_maxlength} \
   --per_gpu_batch_size ${batch_size} \
   --accumulation_steps ${accum} \
   --n_context 100 \
@@ -55,6 +62,7 @@ python ${prefix} train_reader.py \
   --weight_decay 0.01 \
   --n_layer_two_tower ${n_layer_two_tower} \
   --attention_mask ${attention_mask} \
+  --query_in_decoder ${query_in_decoder} \
   --total_step 3501 \
   --warmup_step 250 \
   --save_freq 500 \

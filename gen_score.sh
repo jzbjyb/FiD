@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-model=trained_reader/nq_reader_base_v11lm_queryside/checkpoint/latest
+model=trained_reader/nq_reader_base_v11lm_queryside_qid/checkpoint/latest
 #data=open_domain_data/SciQ/test.json
 #data=open_domain_data/quasar_s/dev.json
 data=open_domain_data/NQ/test.json
@@ -9,6 +9,13 @@ ckpt_dir=${model}.allhead.nq_test
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
 attention_mask=query-side
+query_in_decoder=all
+
+if [[ ${query_in_decoder} == 'no' ]]; then
+  answer_maxlength=50
+else
+  answer_maxlength=100
+fi
 
 if (( ${num_gpu} == 1 )); then
   echo 'single-GPU'
@@ -29,8 +36,9 @@ python ${prefix} test_reader.py \
   --per_gpu_batch_size 12 \
   --n_context 100 \
   --text_maxlength 250 \
-  --answer_maxlength 50 \
+  --answer_maxlength ${answer_maxlength} \
   --attention_mask ${attention_mask} \
+  --query_in_decoder ${query_in_decoder} \
   --name distill \
   --checkpoint_dir ${ckpt_dir} \
   --write_crossattention_scores \
