@@ -255,3 +255,26 @@ def extract_query_answer(output: List[int], tokenizer, query_in_decoder: bool = 
     ans = tokenizer.decode(splits[-1], skip_special_tokens=True)
     ans_position = splits_start_position[-1]
   return query, ans, ans_position
+
+
+def max_sparsify(
+     scores: torch.FloatTensor,  # (any)
+     mask: torch.BoolTensor,  # (any)
+     dim: int,
+     inplace: bool = False):
+  value, ind = (scores * mask - (~mask * 1e10)).max(dim)  # make masked position -inf
+  valid = value.gt(-1e10)
+  value *= valid
+  value, ind, valid = value.unsqueeze(dim), ind.unsqueeze(dim), valid.unsqueeze(dim)
+  if inplace:
+    scores[:] = 0
+    scores.scatter_(dim, ind, value)
+    mask[:] = False
+    mask.scatter_(dim, ind, valid)
+    return scores, mask
+  else:
+    _scores = torch.zeros_like(scores)
+    _mask = torch.zeros_like(scores).to(mask)
+    _scores.scatter_(dim, ind, value)
+    _mask.scatter_(dim, ind, valid)
+    return _scores, _mask

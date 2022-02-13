@@ -371,7 +371,7 @@ if __name__ == '__main__':
   elif args.task == 'eval_answer':
     key = 'score'  # score two_tower_attn_score
     method = 'avg'
-    n_two_tower_layers = 0
+    n_two_tower_layers = 6
     num_heads = 12
 
     ret_file = args.inp[0]
@@ -391,7 +391,7 @@ if __name__ == '__main__':
         eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][11][i]))
       exit()
     elif method == 'specific':
-      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][0][0]))
+      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][0][3]))
       exit()
 
     for l in range(12 - n_two_tower_layers):

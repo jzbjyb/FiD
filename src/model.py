@@ -16,6 +16,7 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 import numpy as np
 from transformers.models.t5.modeling_t5 import T5Attention
+from .util import max_sparsify
 
 def t5attention_forward(
      self,
@@ -112,19 +113,19 @@ def t5attention_forward(
   if mask is not None:
     scores = scores + mask  # (batch_size, n_heads, seq_length, key_length)
 
-  if not self.training:
-    if hasattr(self, 'collect_for_retrieval'):
-      # collect things used for retrieval
-      self.collect_for_retrieval(scores, hidden_states)
-    if hasattr(self, 'collect_cross_attention'):
-      self.collect_cross_attention(scores, mask.eq(0))
-
   attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
     scores
   )  # (batch_size, n_heads, seq_length, key_length)
   attn_weights = nn.functional.dropout(
     attn_weights, p=self.dropout, training=self.training
   )  # (batch_size, n_heads, seq_length, key_length)
+
+  if not self.training:
+    if hasattr(self, 'collect_for_retrieval'):
+      # collect things used for retrieval
+      self.collect_for_retrieval(scores, hidden_states)
+    if hasattr(self, 'collect_cross_attention'):
+      self.collect_cross_attention(scores, mask.eq(0))
 
   # Mask heads if we want to
   if layer_head_mask is not None:
@@ -401,6 +402,8 @@ class EncoderWrapper(torch.nn.Module):
             merge[k].append(v)
       for k in merge:
         merge[k] = torch.stack(merge[k], 1)  # (bs, num_layers, num_heads)
+        # (num_query, n_context, num_layers, num_heads)
+        merge[k] = merge[k].view(-1, self.n_passages, merge[k].size(1), merge[k].size(2))
       return merge
 
 class T5blockWrapper(torch.nn.Module):
@@ -498,6 +501,7 @@ def collect_for_retrieval(
       hidden_states.transpose(1, 2)
     )
     scores = scores.unsqueeze(1)
+
   pad_mask = attention_mask.max(1)[0]  # (bs, seq_len)
   if field == 'query':
     field_mask = attention_mask[:, 0]  # (bs, seq_len)
@@ -507,24 +511,36 @@ def collect_for_retrieval(
     field_mask = pad_mask
   else:
     raise NotImplementedError
-  cross_mask = ~attention_mask & pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)  # (bs, seq_len, seq_len)
+  cross_mask = (~attention_mask & pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)).unsqueeze(1)  # (bs, 1, seq_len, seq_len)
+
   head_agg, query_agg, key_agg = aggregation_method.split('-')
   if key_agg == 'max':
-    scores = (scores - (~cross_mask.unsqueeze(1) * 1e5)).max(-1)[0]  # (bs, n_heads, seq_len)
+    scores = (scores - (~cross_mask * 1e10)).max(-1)[0]  # (bs, n_heads, seq_len)
   elif key_agg == 'avg':
-    scores = (scores * cross_mask.unsqueeze(1)).sum(-1) / (cross_mask.unsqueeze(1).sum(-1) + 1e-10)  # (bs, n_heads, seq_len)
+    scores = (scores * cross_mask).sum(-1) / (cross_mask.sum(-1) + 1e-10)  # (bs, n_heads, seq_len)
+  elif key_agg == 'maxsp':
+    cross_mask = cross_mask.repeat(1, scores.size(1), 1, 1)
+    max_sparsify(scores, cross_mask, -1, inplace=True)  # (bs, n_heads, seq_len, seq_len)
   else:
     raise NotImplementedError
+
   if query_agg == 'avg':
     scores = (scores * field_mask.unsqueeze(1)).sum(-1) / field_mask.unsqueeze(1).sum(-1)  # (bs, n_heads)
+  elif query_agg == 'maxsp':
+    assert key_agg == 'maxsp', 'maxsp must be used consecutively'
+    max_sparsify(scores, cross_mask, -2, inplace=True)  # (bs, n_heads, seq_len, seq_len)
+    scores = (scores.sum(-1) * field_mask[:, None]).sum(-1) / \
+             (cross_mask.sum(-1) * field_mask[:, None]).sum(-1)  # (bs, n_heads)
   else:
     raise NotImplementedError
+
   if head_agg == 'avg':
     scores = scores.mean(-1)  # (bs)
   elif head_agg == 'all':
     pass
   else:
     raise NotImplementedError
+
   self.retrieval = {'two_tower_attn_score': scores}
 
 def cross_attention_forward_new(

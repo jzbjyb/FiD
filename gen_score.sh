@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 
-model=trained_reader/nq_reader_base_v11lm_queryside_qid/checkpoint/latest
-#data=open_domain_data/SciQ/test.json
+model=trained_reader/sciq_reader_base_v11lm_separate_layer6/checkpoint/latest
+data=open_domain_data/SciQ/test.json
 #data=open_domain_data/quasar_s/dev.json
-data=open_domain_data/NQ/test.json
-ckpt_dir=${model}.allhead.nq_test
+#data=open_domain_data/NQ/test.json
+ckpt_dir=${model}.allhead.sciq_test
 
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
-attention_mask=query-side
-query_in_decoder=all
+attention_mask=separate
+query_in_decoder=no
 
 if [[ ${query_in_decoder} == 'no' ]]; then
   answer_maxlength=50

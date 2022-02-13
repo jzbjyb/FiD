@@ -76,7 +76,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
 
                         if 'two_tower_attn_score' not in retrieval:
                           continue
-                        tt = retrieval['two_tower_attn_score'][j]
+                        tt = retrieval['two_tower_attn_score'][k, j]
                         tt = tt.item() if tt.dim() == 0 else tt.cpu().numpy().tolist()
                         example['ctxs'][j]['two_tower_attn_score'] = tt
 
