@@ -14,8 +14,41 @@ import json
 from pathlib import Path
 import torch.distributed as dist
 import csv
+import wandb
 
 logger = logging.getLogger(__name__)
+
+class WandbLogger:
+  _wandb_logger = None
+  _step = None
+
+  @classmethod
+  def init(cls, opt):
+    if opt.wandb_entity and opt.wandb_name.split('/')[-1] != 'test':
+      cls._wandb_logger = wandb.init(entity=opt.wandb_entity, project=opt.wandb_project, name=opt.wandb_name)
+
+  @classmethod
+  def enabled(cls):
+    return cls._wandb_logger is not None
+
+  @classmethod
+  def step(cls, step: int):
+    cls._step = step
+
+  @classmethod
+  def log_w_step(cls, data):
+    if not cls.enabled():
+      return
+    _data = {}
+    for k in data:
+      if type(data[k]) is torch.Tensor:
+        data[k] = data[k].detach().cpu().numpy().tolist()
+      if type(data[k]) is list:
+        for i in range(len(data[k])):
+          _data[f'{k}-{i}'] = data[k][i]
+      else:
+        _data[k] = data[k]
+    cls._wandb_logger.log(_data, step=cls._step)
 
 def init_logger(is_main=True, is_distributed=False, filename=None):
     if is_distributed:

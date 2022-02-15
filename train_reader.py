@@ -11,7 +11,6 @@ import transformers
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
-import wandb
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
 from src.options import Options
 
@@ -20,18 +19,19 @@ import src.util
 import src.evaluation
 import src.data
 import src.model
+from src.util import WandbLogger
 
 
 def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_metric, checkpoint_path):
-    wandb_logger = tb_logger = None
+    tb_logger = None
     if opt.is_main:
-        if opt.wandb_entity and opt.wandb_name.split('/')[-1] != 'test':
-            wandb_logger = wandb.init(entity=opt.wandb_entity, project=opt.wandb_project, name=opt.wandb_name)
-        else:
-            try:
-                tb_logger = torch.utils.tensorboard.SummaryWriter(Path(opt.checkpoint_dir)/opt.name)
-            except:
-                logger.warning('Tensorboard is not available.')
+        WandbLogger.init(opt)
+        '''
+        try:
+            tb_logger = torch.utils.tensorboard.SummaryWriter(Path(opt.checkpoint_dir)/opt.name)
+        except:
+            logger.warning('Tensorboard is not available.')
+        '''
 
     torch.manual_seed(opt.global_rank + opt.seed) #different seed for different sampling depending on global_rank
     train_sampler = RandomSampler(train_dataset)
@@ -52,6 +52,7 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
         epoch += 1
         for i, batch in enumerate(train_dataloader):
             step += 1
+            WandbLogger.step(step)
             pbar.update(1)
             (idx, labels, _, context_ids, context_mask, context_sep_mask) = batch
             context_sep_mask = context_sep_mask.cuda() if context_sep_mask is not None else context_sep_mask
@@ -73,8 +74,8 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             train_loss = src.util.average_main(train_loss, opt)
             curr_loss += train_loss.item()
 
-            if step % opt.accumulation_steps == 0 and wandb_logger is not None:
-                wandb_logger.log({'train-loss': train_loss.item()}, step=step)
+            if step % opt.accumulation_steps == 0:
+                WandbLogger.log_w_step({'train-loss': train_loss.item()})
 
             if step % opt.eval_freq == 0:
                 dev_metric = evaluate(model, eval_dataset, tokenizer, collator, opt)
@@ -89,8 +90,7 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
                     log += f"evaluation: {100*dev_metric:.2f}EM |"
                     log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
                     logger.info(log)
-                    if wandb_logger is not None:
-                        wandb_logger.log({f'dev-{opt.metric}': dev_metric}, step=step)
+                    WandbLogger.log_w_step({f'dev-{opt.metric}': dev_metric})
                     if tb_logger is not None:
                         tb_logger.add_scalar("Evaluation", dev_metric, step)
                         tb_logger.add_scalar("Training", curr_loss / (opt.eval_freq), step)
@@ -208,7 +208,9 @@ if __name__ == "__main__":
           model_name,
           n_layer_two_tower=opt.n_layer_two_tower,
           attention_mask=opt.attention_mask,
-          query_in_decoder=opt.query_in_decoder)
+          query_in_decoder=opt.query_in_decoder,
+          num_keep_ctx_in_decoder=opt.num_keep_ctx_in_decoder,
+          keep_ctx_in_decoder_with_head=opt.keep_ctx_in_decoder_with_head)
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
         step, best_dev_metric = 0, 0.0

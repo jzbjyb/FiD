@@ -8,15 +8,13 @@ from typing import Callable, List
 import types
 import torch
 import transformers
-import inspect
-import time
 import functools
 import torch.nn.functional as F
 from torch import nn
-from torch.nn import CrossEntropyLoss
 import numpy as np
+import wandb
 from transformers.models.t5.modeling_t5 import T5Attention
-from .util import max_sparsify
+from .util import max_sparsify, WandbLogger
 
 def t5attention_forward(
      self,
@@ -113,6 +111,10 @@ def t5attention_forward(
   if mask is not None:
     scores = scores + mask  # (batch_size, n_heads, seq_length, key_length)
 
+  # modify decoder attn based on encoder
+  if self.is_decoder and hasattr(self, 'encoder_imp'):  # masking certain ctx from encoder
+    scores += self.encoder_imp + self.encoder_imp_mask
+
   attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
     scores
   )  # (batch_size, n_heads, seq_length, key_length)
@@ -120,12 +122,12 @@ def t5attention_forward(
     attn_weights, p=self.dropout, training=self.training
   )  # (batch_size, n_heads, seq_length, key_length)
 
-  if not self.training:
-    if hasattr(self, 'collect_for_retrieval'):
-      # collect things used for retrieval
-      self.collect_for_retrieval(scores, hidden_states)
-    if hasattr(self, 'collect_cross_attention'):
-      self.collect_cross_attention(scores, mask.eq(0))
+  # collect encoder attn
+  if hasattr(self, 'collect_for_retrieval'):
+    self.collect_for_retrieval(scores, hidden_states)
+  # collect decoder attn
+  if self.is_decoder and not self.training and hasattr(self, 'collect_cross_attention'):
+    self.collect_cross_attention(scores, mask.eq(0))
 
   # Mask heads if we want to
   if layer_head_mask is not None:
@@ -146,31 +148,43 @@ T5Attention.forward = t5attention_forward
 class FiDT5Config(transformers.T5Config):
   def __init__(self,
                *args,
+               n_layer_two_tower: int = 0,
+               attention_mask: str = 'separate',
+               query_in_decoder: str = 'no',
+               num_keep_ctx_in_decoder: int = 0,
+               keep_ctx_in_decoder_with_head: int = None,
                **kwargs):
-    for extra in ['n_layer_two_tower', 'attention_mask', 'query_in_decoder']:
-      if extra in kwargs:
-        setattr(self, extra, kwargs[extra])
-        del kwargs[extra]
     super().__init__(*args, **kwargs)
+    self.n_layer_two_tower = n_layer_two_tower
+    self.attention_mask = attention_mask
+    self.query_in_decoder = query_in_decoder
+    self.num_keep_ctx_in_decoder = num_keep_ctx_in_decoder
+    self.keep_ctx_in_decoder_with_head = keep_ctx_in_decoder_with_head
 
 class FiDT5(transformers.T5ForConditionalGeneration):
     config_class = FiDT5Config
 
     def __init__(self, config):
         super().__init__(config)
-        self.wrap_encoder()
+        self.config = config
+        self.wrap_encoder(config)
+        self.wrap_decoder(config)
 
     @classmethod
     def from_t5(cls,
                 model_name: str,
                 n_layer_two_tower: int = 0,
                 attention_mask: str = 'separate',
-                query_in_decoder: str = 'no'):
+                query_in_decoder: str = 'no',
+                num_keep_ctx_in_decoder: int = 0,
+                keep_ctx_in_decoder_with_head: int = None):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
           attention_mask=attention_mask,
           query_in_decoder=query_in_decoder,
+          num_keep_ctx_in_decoder=num_keep_ctx_in_decoder,
+          keep_ctx_in_decoder_with_head=keep_ctx_in_decoder_with_head,
           **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
@@ -223,11 +237,26 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         self.reset_attention_separate_mask()  # always reset separate mask to clean it up
         return result
 
-    def wrap_encoder(self):
+    def wrap_decoder(self, config):
+      if config.num_keep_ctx_in_decoder == 0:
+        return
+      get_encoder_importance_func = lambda: self.get_collected_for_retrieval()['two_tower_attn_score']
+      self.decoder = DecoderWrapper(config, self.decoder, get_encoder_importance_func)
+
+    def unwrap_decoder(self, config):
+      if config.num_keep_ctx_in_decoder == 0:
+        return
+      self.decoder = self.decoder.decoder
+
+    def get_inner_decoder(self):
+      decoder = self.decoder.decoder if type(self.decoder) is DecoderWrapper else self.decoder
+      return decoder
+
+    def wrap_encoder(self, config):
         """
         Wrap T5 encoder to obtain a Fusion-in-Decoder model.
         """
-        self.encoder = EncoderWrapper(self.encoder, n_layer_two_tower=self.config.n_layer_two_tower)
+        self.encoder = EncoderWrapper(config, self.encoder)
 
     def unwrap_encoder(self, keep_checkpoint: bool = False):
         """
@@ -244,8 +273,10 @@ class FiDT5(transformers.T5ForConditionalGeneration):
 
     def load_t5(self, state_dict):
         self.unwrap_encoder()
+        self.unwrap_decoder(self.config)
         self.load_state_dict(state_dict)
-        self.wrap_encoder()
+        self.wrap_encoder(self.config)
+        self.wrap_decoder(self.config)
 
     def set_checkpoint(self, use_checkpoint):
         """
@@ -255,14 +286,6 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         for mod in self.encoder.encoder.block:
             mod.use_checkpoint = use_checkpoint
 
-    def reset_score_storage(self):
-        """
-        Reset score storage, only used when cross-attention scores are saved
-        to train a retriever.
-        """
-        for mod in self.decoder.block:
-            mod.layer[1].EncDecAttention.score_storage = None
-
     def set_attention_separate_mask(self, attention_separate_mask):
         self.encoder.attention_separate_mask = attention_separate_mask
 
@@ -271,6 +294,14 @@ class FiDT5(transformers.T5ForConditionalGeneration):
 
     def get_collected_for_retrieval(self):
         return self.encoder.get_collected_for_retrieval()
+
+    def reset_score_storage(self):
+        """
+        Reset score storage, only used when cross-attention scores are saved
+        to train a retriever.
+        """
+        for mod in self.get_inner_decoder().block:
+            mod.layer[1].EncDecAttention.score_storage = None
 
     def get_crossattention_scores(
          self,
@@ -291,7 +322,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
 
       # collect
       scores = []
-      for mod in self.decoder.block:
+      for mod in self.get_inner_decoder().block:
         s = torch.cat(mod.layer[1].EncDecAttention.score_storage, dim=2)  # (bs, n_head, decode_len, encode_len)
         scores.append(s)
       scores = torch.stack(scores, dim=2)  # (bs, n_head, n_layers, decode_len, encode_len)
@@ -329,7 +360,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         """
         import transformers
         use_old = transformers.__version__ == '3.0.2'
-        for mod in self.decoder.block:
+        for mod in self.get_inner_decoder().block:
             attn = mod.layer[1].EncDecAttention
             if use_old:
                 attn.forward = types.MethodType(cross_attention_forward, attn)
@@ -337,22 +368,72 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 attn.collect_cross_attention = types.MethodType(
                   functools.partial(collect_cross_attention, n_context=n_context, sum_over_tokens=True), attn)
 
+class DecoderWrapper(torch.nn.Module):
+  def __init__(self, config, decoder, get_encoder_importance_func: Callable):
+    super().__init__()
+    self.decoder = decoder
+    self.get_encoder_importance_func = get_encoder_importance_func
+    if config.keep_ctx_in_decoder_with_head is None:
+      self.head_weights = torch.nn.Parameter(torch.zeros(config.num_heads), requires_grad=True)
+    else:
+      weights = [-1e5] * config.num_heads
+      weights[config.keep_ctx_in_decoder_with_head] = 1.0
+      self.head_weights = torch.nn.Parameter(torch.tensor(weights), requires_grad=False)
+    self.combine_weight = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
+    self.num_keep_ctx_in_decoder = config.num_keep_ctx_in_decoder
+    self.keep_ctx_in_decoder_with_head = config.keep_ctx_in_decoder_with_head
+
+  def forward(
+       self,
+       input_ids=None,
+       attention_mask=None,
+       encoder_hidden_states=None,
+       encoder_attention_mask=None,
+       **kwargs):
+    # fetch encoder importance
+    encoder_imp = self.get_encoder_importance_func()  # (num_q, num_d, num_layer, num_head)
+    num_q, num_d, num_layer, num_head = encoder_imp.size()
+    num_q, dt, _ = encoder_hidden_states.size()  # (num_q, num_d * ctx_len, emb_size)
+    assert dt % num_d == 0, 'encoder_hidden_states shape error'
+    ctx_len = dt // num_d
+    # use the first layer
+    encoder_imp = encoder_imp[:, :, 0, :]  # (num_q, num_d, num_head)
+    # combine multiple heads
+    encoder_imp = (encoder_imp * torch.softmax(self.head_weights, 0)[None, None, :]).sum(-1)  # (num_q, num_d)
+    # apply combine weight
+    encoder_imp = torch.exp(self.combine_weight) * encoder_imp
+    # spasify
+    assert self.num_keep_ctx_in_decoder <= num_d
+    value, ind = encoder_imp.topk(self.num_keep_ctx_in_decoder, -1)
+    encoder_imp_mask = torch.zeros_like(encoder_imp).bool()
+    encoder_imp_mask.scatter_(-1, ind, True)  # encoder_imp still contains all values and we use this mask to force sparsity
+    WandbLogger.log_w_step({'head-weight': torch.softmax(self.head_weights, 0)})
+    WandbLogger.log_w_step({'combine-weight': torch.exp(self.combine_weight).item()})
+    # reshape to (num_q, 1 (num_head), 1 (query_len), num_d * ctx_len)
+    encoder_imp = encoder_imp.unsqueeze(-1).repeat(1, 1, ctx_len).view(num_q, 1, 1, -1)
+    # convert to final mask of shape (num_q, 1 (num_head), 1 (query_len), num_d * ctx_len)
+    encoder_imp_mask = self.decoder.invert_attention_mask(encoder_imp_mask.unsqueeze(-1).repeat(1, 1, ctx_len).view(num_q, -1))
+    # assign to each cross attn module
+    for layer in self.decoder.block:
+      layer.layer[1].EncDecAttention.encoder_imp = encoder_imp
+      layer.layer[1].EncDecAttention.encoder_imp_mask = encoder_imp_mask
+    # decode
+    return self.decoder(input_ids, attention_mask, encoder_hidden_states, encoder_attention_mask, **kwargs)
+
 class EncoderWrapper(torch.nn.Module):
     """
     Encoder Wrapper for T5 Wrapper to obtain a Fusion-in-Decoder model.
     """
     def __init__(self,
+                 config,
                  encoder,
-                 use_checkpoint: bool = False,
-                 n_layer_two_tower: int = 0):
+                 use_checkpoint: bool = False):
         super().__init__()
 
         self.encoder = encoder
         self.use_checkpoint = use_checkpoint
-        self.n_layer_two_tower = n_layer_two_tower
-        only_use_first_layer = lambda i, n_layer_two_tower: i == n_layer_two_tower
-        use_all_layers = lambda i, n_layer_two_tower: i >= n_layer_two_tower
-        self.apply_t5block_wrapper(use_all_layers)
+        self.n_layer_two_tower = config.n_layer_two_tower
+        self.apply_t5block_wrapper(config)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
         if 'direct' in kwargs and kwargs['direct']:  # no reshaping, used in retrieval
@@ -375,16 +456,18 @@ class EncoderWrapper(torch.nn.Module):
           outputs = (outputs[0].view(bsz, n_passages*passage_length, -1), ) + outputs[1:]
         return outputs
 
-    def apply_t5block_wrapper(self,
-                              use_for_retrieval_func: Callable):
+    def apply_t5block_wrapper(self, config):
+      only_use_first_layer = lambda i: i == config.n_layer_two_tower
+      use_all_layers = lambda i: i >= config.n_layer_two_tower
       layers = []
       self.retrieval_t5block_funcs = []
       for i, layer in enumerate(self.encoder.block):
-        used_for_retreival = use_for_retrieval_func(i, self.n_layer_two_tower)
+        used_for_retreival = use_all_layers(i)
         wrapped_layer = T5blockWrapper(
+          config,
           layer,
           use_checkpoint=self.use_checkpoint,
-          use_full_attention=i >= self.n_layer_two_tower,
+          use_full_attention=i >= config.n_layer_two_tower,
           used_for_retreival=used_for_retreival)
         if used_for_retreival:
           self.retrieval_t5block_funcs.append(wrapped_layer.get_collected_for_retrieval)
@@ -412,6 +495,7 @@ class T5blockWrapper(torch.nn.Module):
     (2) added code to handle separate/full attention at different layers.
     """
     def __init__(self,
+                 config,
                  module,
                  use_checkpoint: bool = False,
                  use_full_attention: bool = True,
@@ -422,10 +506,11 @@ class T5blockWrapper(torch.nn.Module):
         self.use_checkpoint = use_checkpoint
         self.use_full_attention = use_full_attention
         self.used_for_retreival = used_for_retreival
+        self.collect_for_decoder = config.num_keep_ctx_in_decoder != 0
 
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
         # register callback for retrieval
-        if self.used_for_retreival and not self.training:
+        if self.used_for_retreival and (not self.training or self.collect_for_decoder):
             reg_point = self.module.layer[0].SelfAttention
             reg_point.collect_for_retrieval = types.MethodType(
               functools.partial(
@@ -480,7 +565,7 @@ def collect_cross_attention(
     m = mask.view(*(mask.size()[:3] + (n_context, -1)))  # (bs, n_heads, 1, n_context, text_len)
     s = (s * m).sum(-1) / m.sum(-1)  # (bs, n_heads, 1, n_context)
   else:
-    s = score
+    s = scores
   if self.score_storage is None:
     self.score_storage = [s]
   else:

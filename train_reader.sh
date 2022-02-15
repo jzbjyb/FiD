@@ -14,10 +14,12 @@ metric=em
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_qid
-n_layer_two_tower=12
+name=nq_reader_base_v11lm_separate_layer6_decoder50_head3
+n_layer_two_tower=6
+num_keep_ctx_in_decoder=50
+keep_ctx_in_decoder_with_head=3
 attention_mask=separate
-query_in_decoder=all
+query_in_decoder=no
 
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
@@ -61,6 +63,8 @@ python ${prefix} train_reader.py \
   --scheduler linear \
   --weight_decay 0.01 \
   --n_layer_two_tower ${n_layer_two_tower} \
+  --num_keep_ctx_in_decoder ${num_keep_ctx_in_decoder} \
+  --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
   --total_step 3501 \

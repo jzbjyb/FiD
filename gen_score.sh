@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 
-model=trained_reader/sciq_reader_base_v11lm_separate_layer6/checkpoint/latest
-data=open_domain_data/SciQ/test.json
+model=trained_reader/nq_reader_base_v11lm_separate_layer6_decoder50_head3/checkpoint/latest
+#model=pretrained_models/nq_reader_base
+#data=open_domain_data/SciQ/test.json
 #data=open_domain_data/quasar_s/dev.json
-#data=open_domain_data/NQ/test.json
-ckpt_dir=${model}.allhead.sciq_test
+data=open_domain_data/NQ/test.json
+ckpt_dir=${model}.allhead.nq_test
 
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1

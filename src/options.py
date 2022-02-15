@@ -54,6 +54,9 @@ class Options():
                                  help='how to generate attention for query/doc')
         self.parser.add_argument('--query_in_decoder', type=str, default='no', choices=['no', 'all'],
                                  help='use query at the beginning of the decoder')
+        self.parser.add_argument('--num_keep_ctx_in_decoder', type=int, default=0, help='num of ctx used in decoder')
+        self.parser.add_argument('--keep_ctx_in_decoder_with_head', type=int, default=None,
+                                 help='only use a specific head to keep ctx in decoder')
         self.parser.add_argument('--metric', type=str, default='em', choices=['em', 'rougel'])
 
     def add_retriever_options(self):
