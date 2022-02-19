@@ -57,6 +57,8 @@ class Options():
         self.parser.add_argument('--num_keep_ctx_in_decoder', type=int, default=0, help='num of ctx used in decoder')
         self.parser.add_argument('--keep_ctx_in_decoder_with_head', type=int, default=None,
                                  help='only use a specific head to keep ctx in decoder')
+        self.parser.add_argument('--encoder_decoder_kl_ratio', type=float, default=0,
+                                 help='the ratio of KL divergence between encoder and decoder attn')
         self.parser.add_argument('--metric', type=str, default='em', choices=['em', 'rougel'])
 
     def add_retriever_options(self):
@@ -83,7 +85,8 @@ class Options():
         # basic parameters
         self.parser.add_argument('--name', type=str, default='experiment_name', help='name of the experiment')
         self.parser.add_argument('--checkpoint_dir', type=str, default='./checkpoint/', help='models are saved here')
-        self.parser.add_argument('--model_path', type=str, default='none', help='path for retraining')
+        self.parser.add_argument('--model_path', type=str, default='none', help='path for continue training')
+        self.parser.add_argument('--init_from', type=str, default=None, help='path for loading initial parameteres')
 
         # dataset parameters
         self.parser.add_argument("--per_gpu_batch_size", default=1, type=int, 

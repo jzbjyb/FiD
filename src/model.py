@@ -111,8 +111,11 @@ def t5attention_forward(
   if mask is not None:
     scores = scores + mask  # (batch_size, n_heads, seq_length, key_length)
 
+  # compute the KL between encoder and decoder attn
+  if self.is_decoder and hasattr(self, 'encoder_imp') and hasattr(self, 'encoder_decoder_kl'):
+    self.kl_loss = self.encoder_decoder_kl(scores, mask.eq(0), self.encoder_imp)
   # modify decoder attn based on encoder
-  if self.is_decoder and hasattr(self, 'encoder_imp'):  # masking certain ctx from encoder
+  if self.is_decoder and hasattr(self, 'encoder_imp') and not hasattr(self, 'encoder_decoder_kl'):
     scores += self.encoder_imp + self.encoder_imp_mask
 
   attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
@@ -121,7 +124,6 @@ def t5attention_forward(
   attn_weights = nn.functional.dropout(
     attn_weights, p=self.dropout, training=self.training
   )  # (batch_size, n_heads, seq_length, key_length)
-
   # collect encoder attn
   if hasattr(self, 'collect_for_retrieval'):
     self.collect_for_retrieval(scores, hidden_states)
@@ -153,6 +155,7 @@ class FiDT5Config(transformers.T5Config):
                query_in_decoder: str = 'no',
                num_keep_ctx_in_decoder: int = 0,
                keep_ctx_in_decoder_with_head: int = None,
+               encoder_decoder_kl_ratio: float = 0,
                **kwargs):
     super().__init__(*args, **kwargs)
     self.n_layer_two_tower = n_layer_two_tower
@@ -160,6 +163,7 @@ class FiDT5Config(transformers.T5Config):
     self.query_in_decoder = query_in_decoder
     self.num_keep_ctx_in_decoder = num_keep_ctx_in_decoder
     self.keep_ctx_in_decoder_with_head = keep_ctx_in_decoder_with_head
+    self.encoder_decoder_kl_ratio = encoder_decoder_kl_ratio
 
 class FiDT5(transformers.T5ForConditionalGeneration):
     config_class = FiDT5Config
@@ -169,6 +173,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         self.config = config
         self.wrap_encoder(config)
         self.wrap_decoder(config)
+        self.collect_kl_loss_from_decoder = bool(config.encoder_decoder_kl_ratio)
 
     @classmethod
     def from_t5(cls,
@@ -177,7 +182,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 attention_mask: str = 'separate',
                 query_in_decoder: str = 'no',
                 num_keep_ctx_in_decoder: int = 0,
-                keep_ctx_in_decoder_with_head: int = None):
+                keep_ctx_in_decoder_with_head: int = None,
+                encoder_decoder_kl_ratio: float = 0):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
@@ -185,6 +191,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           query_in_decoder=query_in_decoder,
           num_keep_ctx_in_decoder=num_keep_ctx_in_decoder,
           keep_ctx_in_decoder_with_head=keep_ctx_in_decoder_with_head,
+          encoder_decoder_kl_ratio=encoder_decoder_kl_ratio,
           **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
@@ -221,6 +228,12 @@ class FiDT5(transformers.T5ForConditionalGeneration):
             attention_mask=attention_mask,
             **kwargs
         )
+        if self.collect_kl_loss_from_decoder:
+          kl_loss = self.decoder.get_kl_loss()
+          if 'return_dict' in kwargs and kwargs['return_dict'] and result.loss is not None:
+            result.loss = result.loss + kl_loss
+          elif 'labels' in kwargs and kwargs['labels'] is not None:
+            result = (result[0] + kl_loss,) + result[1:]
         self.reset_attention_separate_mask()  # always reset separate mask to clean it up
         return result
 
@@ -238,15 +251,19 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         return result
 
     def wrap_decoder(self, config):
-      if config.num_keep_ctx_in_decoder == 0:
+      if not self.need_wrap_decoder(config):
         return
       get_encoder_importance_func = lambda: self.get_collected_for_retrieval()['two_tower_attn_score']
       self.decoder = DecoderWrapper(config, self.decoder, get_encoder_importance_func)
 
     def unwrap_decoder(self, config):
-      if config.num_keep_ctx_in_decoder == 0:
+      if not self.need_wrap_decoder(config):
         return
       self.decoder = self.decoder.decoder
+
+    @staticmethod
+    def need_wrap_decoder(config):
+      return bool(config.num_keep_ctx_in_decoder) or bool(config.encoder_decoder_kl_ratio)
 
     def get_inner_decoder(self):
       decoder = self.decoder.decoder if type(self.decoder) is DecoderWrapper else self.decoder
@@ -277,6 +294,13 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         self.load_state_dict(state_dict)
         self.wrap_encoder(self.config)
         self.wrap_decoder(self.config)
+
+    def load_from(self, model):
+      self.encoder.load_state_dict(model.encoder.state_dict())
+      if type(self.decoder) == type(model.decoder) == DecoderWrapper:
+        self.decoder.load_state_dict(model.decoder.state_dict())
+      else:
+        self.get_inner_decoder().load_state_dict(model.get_inner_decoder().state_dict())
 
     def set_checkpoint(self, use_checkpoint):
         """
@@ -373,15 +397,28 @@ class DecoderWrapper(torch.nn.Module):
     super().__init__()
     self.decoder = decoder
     self.get_encoder_importance_func = get_encoder_importance_func
-    if config.keep_ctx_in_decoder_with_head is None:
-      self.head_weights = torch.nn.Parameter(torch.zeros(config.num_heads), requires_grad=True)
-    else:
-      weights = [-1e5] * config.num_heads
-      weights[config.keep_ctx_in_decoder_with_head] = 1.0
-      self.head_weights = torch.nn.Parameter(torch.tensor(weights), requires_grad=False)
-    self.combine_weight = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
     self.num_keep_ctx_in_decoder = config.num_keep_ctx_in_decoder
     self.keep_ctx_in_decoder_with_head = config.keep_ctx_in_decoder_with_head
+    self.encoder_decoder_kl_ratio = config.encoder_decoder_kl_ratio
+    if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
+      raise ValueError('only one of the KL and combined loss should be used')
+    if FiDT5.need_wrap_decoder(config):
+      # head weight always needed
+      if config.keep_ctx_in_decoder_with_head is None:
+        self.head_weights = torch.nn.Parameter(torch.zeros(config.num_heads), requires_grad=True)
+      else:
+        weights = [-1e5] * config.num_heads
+        weights[config.keep_ctx_in_decoder_with_head] = 1.0
+        self.head_weights = torch.nn.Parameter(torch.tensor(weights), requires_grad=False)
+      # combine weight only for combined attn
+      if config.num_keep_ctx_in_decoder:
+        self.combine_weight = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
+
+  def get_kl_loss(self):
+    assert self.encoder_decoder_kl_ratio
+    kl_loss = self.decoder.block[-1].layer[1].EncDecAttention.kl_loss * self.encoder_decoder_kl_ratio
+    WandbLogger.log_w_step({'kl-loss': kl_loss.item()})
+    return kl_loss
 
   def forward(
        self,
@@ -400,23 +437,31 @@ class DecoderWrapper(torch.nn.Module):
     encoder_imp = encoder_imp[:, :, 0, :]  # (num_q, num_d, num_head)
     # combine multiple heads
     encoder_imp = (encoder_imp * torch.softmax(self.head_weights, 0)[None, None, :]).sum(-1)  # (num_q, num_d)
-    # apply combine weight
-    encoder_imp = torch.exp(self.combine_weight) * encoder_imp
-    # spasify
-    assert self.num_keep_ctx_in_decoder <= num_d
-    value, ind = encoder_imp.topk(self.num_keep_ctx_in_decoder, -1)
-    encoder_imp_mask = torch.zeros_like(encoder_imp).bool()
-    encoder_imp_mask.scatter_(-1, ind, True)  # encoder_imp still contains all values and we use this mask to force sparsity
     WandbLogger.log_w_step({'head-weight': torch.softmax(self.head_weights, 0)})
-    WandbLogger.log_w_step({'combine-weight': torch.exp(self.combine_weight).item()})
-    # reshape to (num_q, 1 (num_head), 1 (query_len), num_d * ctx_len)
-    encoder_imp = encoder_imp.unsqueeze(-1).repeat(1, 1, ctx_len).view(num_q, 1, 1, -1)
-    # convert to final mask of shape (num_q, 1 (num_head), 1 (query_len), num_d * ctx_len)
-    encoder_imp_mask = self.decoder.invert_attention_mask(encoder_imp_mask.unsqueeze(-1).repeat(1, 1, ctx_len).view(num_q, -1))
-    # assign to each cross attn module
-    for layer in self.decoder.block:
-      layer.layer[1].EncDecAttention.encoder_imp = encoder_imp
-      layer.layer[1].EncDecAttention.encoder_imp_mask = encoder_imp_mask
+    if self.num_keep_ctx_in_decoder:
+      # apply combine weight
+      encoder_imp = torch.exp(self.combine_weight) * encoder_imp
+      WandbLogger.log_w_step({'combine-weight': torch.exp(self.combine_weight).item()})
+      # spasify
+      assert self.num_keep_ctx_in_decoder <= num_d
+      value, ind = encoder_imp.topk(self.num_keep_ctx_in_decoder, -1)
+      encoder_imp_mask = torch.zeros_like(encoder_imp).bool()
+      encoder_imp_mask.scatter_(-1, ind, True)  # encoder_imp still contains all values and we use this mask to force sparsity
+      # reshape to (num_q, 1 (num_head), 1 (query_len), num_d * ctx_len)
+      encoder_imp = encoder_imp.unsqueeze(-1).repeat(1, 1, ctx_len).view(num_q, 1, 1, -1)
+      # convert to final mask of shape (num_q, 1 (num_head), 1 (query_len), num_d * ctx_len)
+      encoder_imp_mask = self.decoder.invert_attention_mask(encoder_imp_mask.unsqueeze(-1).repeat(1, 1, ctx_len).view(num_q, -1))
+      # assign to each cross attn module
+      for layer in self.decoder.block:
+        layer.layer[1].EncDecAttention.encoder_imp = encoder_imp
+        layer.layer[1].EncDecAttention.encoder_imp_mask = encoder_imp_mask
+    elif self.encoder_decoder_kl_ratio:
+      # assign to the last cross attn module
+      reg_point = self.decoder.block[-1].layer[1].EncDecAttention
+      reg_point.encoder_imp = encoder_imp
+      reg_point.encoder_decoder_kl = types.MethodType(functools.partial(encoder_decoder_kl, n_context=num_d), reg_point)
+    else:
+      raise NotImplementedError
     # decode
     return self.decoder(input_ids, attention_mask, encoder_hidden_states, encoder_attention_mask, **kwargs)
 
@@ -462,7 +507,7 @@ class EncoderWrapper(torch.nn.Module):
       layers = []
       self.retrieval_t5block_funcs = []
       for i, layer in enumerate(self.encoder.block):
-        used_for_retreival = use_all_layers(i)
+        used_for_retreival = only_use_first_layer(i)
         wrapped_layer = T5blockWrapper(
           config,
           layer,
@@ -506,7 +551,7 @@ class T5blockWrapper(torch.nn.Module):
         self.use_checkpoint = use_checkpoint
         self.use_full_attention = use_full_attention
         self.used_for_retreival = used_for_retreival
-        self.collect_for_decoder = config.num_keep_ctx_in_decoder != 0
+        self.collect_for_decoder = FiDT5.need_wrap_decoder(config)
 
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
         # register callback for retrieval
@@ -525,7 +570,7 @@ class T5blockWrapper(torch.nn.Module):
             # modify (potentially separate) attention mask to make it a full attention
             attention_mask = attention_mask.max(2, keepdim=True)[0]  # (bs, num_heads, 1, seq_len)
         # handle checkpointing
-        if self.use_checkpoint and self.training:
+        if self.use_checkpoint and self.training and not self.used_for_retreival:
             kwargs = {k: v for k, v in kwargs.items() if v is not None}
             def custom_forward(*inputs):
                 output = self.module(*inputs, **kwargs)
@@ -562,7 +607,7 @@ def collect_cross_attention(
   if sum_over_tokens:
     # TODO: we sum over text_len to save space but is there any better workaround?
     s = scores.view(*(scores.size()[:3] + (n_context, -1)))  # (bs, n_heads, 1, n_context, text_len)
-    m = mask.view(*(mask.size()[:3] + (n_context, -1)))  # (bs, n_heads, 1, n_context, text_len)
+    m = mask.view(*(mask.size()[:3] + (n_context, -1)))  # (bs, n_heads or 1, 1, n_context, text_len)
     s = (s * m).sum(-1) / m.sum(-1)  # (bs, n_heads, 1, n_context)
   else:
     s = scores
@@ -570,6 +615,25 @@ def collect_cross_attention(
     self.score_storage = [s]
   else:
     self.score_storage.append(s)
+
+def encoder_decoder_kl(
+     self,
+     decoder_score: torch.FloatTensor,  # (bs, n_heads, dec_seq_len, enc_seq_len)
+     decoder_mask: torch.BoolTensor,  # (bs, n_heads or 1, dec_seq_len, enc_seq_len)
+     encoder_score: torch.FloatTensor,  # (bs, n_context)
+     n_context: int):
+  # avg over doc tokens
+  s = decoder_score.view(*(decoder_score.size()[:3] + (n_context, -1)))  # (bs, n_heads, dec_seq_len, n_context, text_len)
+  m = decoder_mask.view(*(decoder_mask.size()[:3] + (n_context, -1)))  # (bs, n_heads or 1, dec_seq_len, n_context, text_len)
+  s = (s * m).sum(-1) / m.sum(-1)  # (bs, n_heads, dec_seq_len, n_context)
+  # avg over head, use the first decoder tok
+  s = s.mean(1)[:, 0]  # (bs, n_context)
+  # kl
+  kl_loss = torch.nn.KLDivLoss(reduction='batchmean')
+  dec_attn = torch.softmax(s.detach(), dim=-1)  # no grad to decoder
+  enc_attn = torch.nn.functional.log_softmax(encoder_score, dim=-1)
+  kl = kl_loss(enc_attn, dec_attn)
+  return kl
 
 def collect_for_retrieval(
      self,
@@ -625,7 +689,6 @@ def collect_for_retrieval(
     pass
   else:
     raise NotImplementedError
-
   self.retrieval = {'two_tower_attn_score': scores}
 
 def cross_attention_forward_new(

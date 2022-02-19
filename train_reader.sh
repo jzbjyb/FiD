@@ -14,10 +14,11 @@ metric=em
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_decoder50_head3
+name=nq_reader_base_v11lm_separate_layer6_continue
 n_layer_two_tower=6
-num_keep_ctx_in_decoder=50
+num_keep_ctx_in_decoder=0
 keep_ctx_in_decoder_with_head=3
+encoder_decoder_kl_ratio=0.0
 attention_mask=separate
 query_in_decoder=no
 
@@ -65,24 +66,40 @@ python ${prefix} train_reader.py \
   --n_layer_two_tower ${n_layer_two_tower} \
   --num_keep_ctx_in_decoder ${num_keep_ctx_in_decoder} \
   --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
+  --encoder_decoder_kl_ratio ${encoder_decoder_kl_ratio} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 3501 \
-  --warmup_step 250 \
+  --total_step 1001 \
+  --warmup_step 100 \
   --save_freq 500 \
-  --eval_freq 300 \
+  --eval_freq 500 \
   --eval_num_examples 200 \
   --metric ${metric} \
-  --wandb_name ${ckpt_dir}/${name}
+  --wandb_name ${ckpt_dir}/${name} \
+  --init_from trained_reader/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
 
+# NQ
 # 3501
 # 250
 # 500
 # 300
 # 200
 
+# 1001
+# 100
+# 500
+# 200
+# 200
+
+# SciQ
+# 1001
+# 100
+# 500
+# 50
+# 100
+
 # 501
 # 50
 # 250
-# 25
+# 50
 # 100

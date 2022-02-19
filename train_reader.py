@@ -210,7 +210,12 @@ if __name__ == "__main__":
           attention_mask=opt.attention_mask,
           query_in_decoder=opt.query_in_decoder,
           num_keep_ctx_in_decoder=opt.num_keep_ctx_in_decoder,
-          keep_ctx_in_decoder_with_head=opt.keep_ctx_in_decoder_with_head)
+          keep_ctx_in_decoder_with_head=opt.keep_ctx_in_decoder_with_head,
+          encoder_decoder_kl_ratio=opt.encoder_decoder_kl_ratio)
+        if opt.init_from:
+          logger.info(f'Init from {opt.init_from}')
+          _model = model_class.from_pretrained(opt.init_from)
+          model.load_from(_model)
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
         step, best_dev_metric = 0, 0.0
@@ -219,10 +224,12 @@ if __name__ == "__main__":
         model, optimizer, scheduler, opt_checkpoint, step, best_dev_metric = \
             src.util.load(model_class, load_path, opt, reset_params=False)
         logger.info(f"Model loaded from {load_path}")
-    else:
-        model, optimizer, scheduler, opt_checkpoint, step, best_dev_metric = \
-            src.util.load(model_class, opt.model_path, opt, reset_params=True)
-        logger.info(f"Model loaded from {opt.model_path}")
+    else:  # init from another checkpoint
+        logger.info(f'Continue training from {opt.model_path}')
+        model = model_class.from_pretrained(opt.model_path)
+        model = model.to(opt.local_rank)
+        optimizer, scheduler = src.util.set_optim(opt, model)
+        step, best_dev_metric = 0, 0.0
 
     model.set_checkpoint(opt.use_checkpoint)
 

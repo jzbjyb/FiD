@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-model=trained_reader/nq_reader_base_v11lm_separate_layer6_decoder50_head3/checkpoint/latest
+model=trained_reader/nq_reader_base_v11lm_separate_layer6_continue/checkpoint/latest
 #model=pretrained_models/nq_reader_base
 #data=open_domain_data/SciQ/test.json
 #data=open_domain_data/quasar_s/dev.json
