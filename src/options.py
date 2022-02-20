@@ -55,10 +55,14 @@ class Options():
         self.parser.add_argument('--query_in_decoder', type=str, default='no', choices=['no', 'all'],
                                  help='use query at the beginning of the decoder')
         self.parser.add_argument('--num_keep_ctx_in_decoder', type=int, default=0, help='num of ctx used in decoder')
+        self.parser.add_argument('--keep_ctx_in_decoder_head_tau', type=float, default=1.0,
+                                 help='tau for head weight softmax')
         self.parser.add_argument('--keep_ctx_in_decoder_with_head', type=int, default=None,
                                  help='only use a specific head to keep ctx in decoder')
         self.parser.add_argument('--encoder_decoder_kl_ratio', type=float, default=0,
                                  help='the ratio of KL divergence between encoder and decoder attn')
+        self.parser.add_argument('--decoder_attn_ctx_normalize', action='store_true',
+                                 help='normalize decoder attention for each context')
         self.parser.add_argument('--metric', type=str, default='em', choices=['em', 'rougel'])
 
     def add_retriever_options(self):

@@ -12,7 +12,6 @@ import functools
 import torch.nn.functional as F
 from torch import nn
 import numpy as np
-import wandb
 from transformers.models.t5.modeling_t5 import T5Attention
 from .util import max_sparsify, WandbLogger
 
@@ -106,17 +105,21 @@ def t5attention_forward(
     if past_key_value is not None:
       position_bias = position_bias[:, :, -hidden_states.size(1):, :]
 
-  # TODO: this is the key change! (any better workaround?)
+  # separate position_bias from mask
+  # TODO: any better workaround?
   scores += position_bias
-  if mask is not None:
-    scores = scores + mask  # (batch_size, n_heads, seq_length, key_length)
 
-  # compute the KL between encoder and decoder attn
-  if self.is_decoder and hasattr(self, 'encoder_imp') and hasattr(self, 'encoder_decoder_kl'):
-    self.kl_loss = self.encoder_decoder_kl(scores, mask.eq(0), self.encoder_imp)
-  # modify decoder attn based on encoder
-  if self.is_decoder and hasattr(self, 'encoder_imp') and not hasattr(self, 'encoder_decoder_kl'):
-    scores += self.encoder_imp + self.encoder_imp_mask
+  if mask is not None:
+    # apply token-leve mask
+    scores = scores + mask  # (batch_size, n_heads, seq_length, key_length)
+    # compute the KL between encoder and decoder attn
+    if self.is_decoder and hasattr(self, 'encoder_imp') and hasattr(self, 'encoder_decoder_kl'):
+      self.kl_loss = self.encoder_decoder_kl(scores, mask.eq(0), self.encoder_imp)
+    # modify decoder attn based on encoder
+    if self.is_decoder and hasattr(self, 'encoder_imp') and not hasattr(self, 'encoder_decoder_kl'):
+      if hasattr(self, 'decoder_attn_ctx_normalize'):  # normalize raw attn wrt ctx
+        scores = self.decoder_attn_ctx_normalize(scores)
+      scores = scores + self.encoder_imp + self.encoder_imp_mask
 
   attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
     scores
@@ -124,6 +127,7 @@ def t5attention_forward(
   attn_weights = nn.functional.dropout(
     attn_weights, p=self.dropout, training=self.training
   )  # (batch_size, n_heads, seq_length, key_length)
+
   # collect encoder attn
   if hasattr(self, 'collect_for_retrieval'):
     self.collect_for_retrieval(scores, hidden_states)
@@ -155,7 +159,9 @@ class FiDT5Config(transformers.T5Config):
                query_in_decoder: str = 'no',
                num_keep_ctx_in_decoder: int = 0,
                keep_ctx_in_decoder_with_head: int = None,
+               keep_ctx_in_decoder_head_tau: float = 1.0,
                encoder_decoder_kl_ratio: float = 0,
+               decoder_attn_ctx_normalize: bool = False,
                **kwargs):
     super().__init__(*args, **kwargs)
     self.n_layer_two_tower = n_layer_two_tower
@@ -163,7 +169,9 @@ class FiDT5Config(transformers.T5Config):
     self.query_in_decoder = query_in_decoder
     self.num_keep_ctx_in_decoder = num_keep_ctx_in_decoder
     self.keep_ctx_in_decoder_with_head = keep_ctx_in_decoder_with_head
+    self.keep_ctx_in_decoder_head_tau = keep_ctx_in_decoder_head_tau
     self.encoder_decoder_kl_ratio = encoder_decoder_kl_ratio
+    self.decoder_attn_ctx_normalize = decoder_attn_ctx_normalize
 
 class FiDT5(transformers.T5ForConditionalGeneration):
     config_class = FiDT5Config
@@ -183,7 +191,9 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 query_in_decoder: str = 'no',
                 num_keep_ctx_in_decoder: int = 0,
                 keep_ctx_in_decoder_with_head: int = None,
-                encoder_decoder_kl_ratio: float = 0):
+                keep_ctx_in_decoder_head_tau: float = 1.0,
+                encoder_decoder_kl_ratio: float = 0,
+                decoder_attn_ctx_normalize: bool = False):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
@@ -191,7 +201,9 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           query_in_decoder=query_in_decoder,
           num_keep_ctx_in_decoder=num_keep_ctx_in_decoder,
           keep_ctx_in_decoder_with_head=keep_ctx_in_decoder_with_head,
+          keep_ctx_in_decoder_head_tau=keep_ctx_in_decoder_head_tau,
           encoder_decoder_kl_ratio=encoder_decoder_kl_ratio,
+          decoder_attn_ctx_normalize=decoder_attn_ctx_normalize,
           **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
@@ -389,8 +401,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
             if use_old:
                 attn.forward = types.MethodType(cross_attention_forward, attn)
             else:
-                attn.collect_cross_attention = types.MethodType(
-                  functools.partial(collect_cross_attention, n_context=n_context, sum_over_tokens=True), attn)
+                attn.collect_cross_attention = types.MethodType(functools.partial(
+                  collect_cross_attention, n_context=n_context, sum_over_tokens=True, use_softmax=True), attn)
 
 class DecoderWrapper(torch.nn.Module):
   def __init__(self, config, decoder, get_encoder_importance_func: Callable):
@@ -399,9 +411,14 @@ class DecoderWrapper(torch.nn.Module):
     self.get_encoder_importance_func = get_encoder_importance_func
     self.num_keep_ctx_in_decoder = config.num_keep_ctx_in_decoder
     self.keep_ctx_in_decoder_with_head = config.keep_ctx_in_decoder_with_head
+    self.keep_ctx_in_decoder_head_tau = config.keep_ctx_in_decoder_head_tau
     self.encoder_decoder_kl_ratio = config.encoder_decoder_kl_ratio
+    self.decoder_attn_ctx_normalize = config.decoder_attn_ctx_normalize
     if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
       raise ValueError('only one of the KL and combined loss should be used')
+    if self.decoder_attn_ctx_normalize:
+      assert self.num_keep_ctx_in_decoder and not self.encoder_decoder_kl_ratio, \
+        'normalized decoder is not used in a proper setting'
     if FiDT5.need_wrap_decoder(config):
       # head weight always needed
       if config.keep_ctx_in_decoder_with_head is None:
@@ -436,8 +453,10 @@ class DecoderWrapper(torch.nn.Module):
     # use the first layer
     encoder_imp = encoder_imp[:, :, 0, :]  # (num_q, num_d, num_head)
     # combine multiple heads
-    encoder_imp = (encoder_imp * torch.softmax(self.head_weights, 0)[None, None, :]).sum(-1)  # (num_q, num_d)
-    WandbLogger.log_w_step({'head-weight': torch.softmax(self.head_weights, 0)})
+    encoder_imp = (encoder_imp * torch.softmax(
+      self.head_weights / self.keep_ctx_in_decoder_head_tau, 0)[None, None, :]).sum(-1)  # (num_q, num_d)
+    WandbLogger.log_w_step({'head-weight': torch.softmax(
+      self.head_weights / self.keep_ctx_in_decoder_head_tau, 0)})
     if self.num_keep_ctx_in_decoder:
       # apply combine weight
       encoder_imp = torch.exp(self.combine_weight) * encoder_imp
@@ -453,8 +472,12 @@ class DecoderWrapper(torch.nn.Module):
       encoder_imp_mask = self.decoder.invert_attention_mask(encoder_imp_mask.unsqueeze(-1).repeat(1, 1, ctx_len).view(num_q, -1))
       # assign to each cross attn module
       for layer in self.decoder.block:
-        layer.layer[1].EncDecAttention.encoder_imp = encoder_imp
-        layer.layer[1].EncDecAttention.encoder_imp_mask = encoder_imp_mask
+        reg_point = layer.layer[1].EncDecAttention
+        reg_point.encoder_imp = encoder_imp
+        reg_point.encoder_imp_mask = encoder_imp_mask
+        if self.decoder_attn_ctx_normalize:
+          reg_point.decoder_attn_ctx_normalize = types.MethodType(
+            functools.partial(decoder_attn_ctx_normalize, n_context=num_d), reg_point)
     elif self.encoder_decoder_kl_ratio:
       # assign to the last cross attn module
       reg_point = self.decoder.block[-1].layer[1].EncDecAttention
@@ -599,10 +622,14 @@ class T5blockWrapper(torch.nn.Module):
 
 def collect_cross_attention(
      self,
-     scores: torch.FloatTensor,  # (bs, n_heads, 1, enc_seq_len)
+     scores: torch.FloatTensor,  # (bs, n_heads, 1, enc_seq_len) where masked positions have -inf
      mask: torch.BoolTensor,  # (bs, n_heads or 1, 1, enc_seq_len)
      n_context: int,
-     sum_over_tokens: bool):
+     sum_over_tokens: bool,
+     use_softmax: bool = False):
+  # apply softmax
+  if use_softmax:
+    scores = nn.functional.softmax(scores.float(), dim=-1).type_as(scores)
   # save cross attn at all decoding position
   if sum_over_tokens:
     # TODO: we sum over text_len to save space but is there any better workaround?
@@ -615,6 +642,16 @@ def collect_cross_attention(
     self.score_storage = [s]
   else:
     self.score_storage.append(s)
+
+def decoder_attn_ctx_normalize(
+     self,
+     score: torch.FloatTensor,  # (bs, n_heads, dec_seq_len, enc_seq_len) where masked positions have -inf
+     n_context: int):
+  raw_size = score.size()
+  s = score.view(*(raw_size[:3] + (n_context, -1)))  # (bs, n_heads, dec_seq_len, n_context, text_len)
+  s = s - torch.logsumexp(s, -1, keepdim=True)
+  s = s.view(*raw_size)  # (bs, n_heads, dec_seq_len, n_context * text_len)
+  return s
 
 def encoder_decoder_kl(
      self,

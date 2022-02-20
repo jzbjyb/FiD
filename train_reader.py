@@ -211,7 +211,9 @@ if __name__ == "__main__":
           query_in_decoder=opt.query_in_decoder,
           num_keep_ctx_in_decoder=opt.num_keep_ctx_in_decoder,
           keep_ctx_in_decoder_with_head=opt.keep_ctx_in_decoder_with_head,
-          encoder_decoder_kl_ratio=opt.encoder_decoder_kl_ratio)
+          keep_ctx_in_decoder_head_tau=opt.keep_ctx_in_decoder_head_tau,
+          encoder_decoder_kl_ratio=opt.encoder_decoder_kl_ratio,
+          decoder_attn_ctx_normalize=opt.decoder_attn_ctx_normalize)
         if opt.init_from:
           logger.info(f'Init from {opt.init_from}')
           _model = model_class.from_pretrained(opt.init_from)
