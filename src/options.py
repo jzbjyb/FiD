@@ -49,6 +49,8 @@ class Options():
         self.parser.add_argument('--n_context', type=int, default=1)
         self.parser.add_argument('--n_layer_two_tower', type=int, default=0,
                                  help='number of layers used for two tower representation')
+        self.parser.add_argument('--layer_for_retrieval', type=str, default='first', choices=['first', 'emb-first', 'emb'],
+                                 help='layers used for retrieval')
         self.parser.add_argument('--attention_mask', type=str, default=None,
                                  choices=[None, 'separate', 'query-side', 'no-query'],
                                  help='how to generate attention for query/doc')

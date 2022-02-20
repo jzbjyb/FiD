@@ -207,6 +207,7 @@ if __name__ == "__main__":
         model = src.model.FiDT5.from_t5(
           model_name,
           n_layer_two_tower=opt.n_layer_two_tower,
+          layer_for_retrieval=opt.layer_for_retrieval,
           attention_mask=opt.attention_mask,
           query_in_decoder=opt.query_in_decoder,
           num_keep_ctx_in_decoder=opt.num_keep_ctx_in_decoder,

@@ -2,22 +2,22 @@
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
-train_data=open_domain_data/NQ/train.json
-eval_data=open_domain_data/NQ/dev.json
+#train_data=open_domain_data/NQ/train.json
+#eval_data=open_domain_data/NQ/dev.json
 #train_data=open_domain_data/scifact/train.json
 #eval_data=open_domain_data/scifact/test.json
-#train_data=open_domain_data/SciQ/train.json
-#eval_data=open_domain_data/SciQ/dev.json
+train_data=open_domain_data/SciQ/train.json
+eval_data=open_domain_data/SciQ/dev.json
 #train_data=open_domain_data/quasar_s/train.json
 #eval_data=open_domain_data/quasar_s/dev.json
 metric=em
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_decoder50_decattnnorm_tau0001_step3k
-init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
+name=sciq_reader_base_v11lm_separate_layer6_step1k_continue_emb_decoder50_decattnnorm_tau0001  # sciq_reader_base_v11lm_separate_layer6_step1k_continue_decoder50_tau0001
+init_from=${ckpt_dir}/sciq_reader_base_v11lm_separate_layer6_step1k/checkpoint/latest
 n_layer_two_tower=6
-layer_for_retrieval=first
+layer_for_retrieval=emb
 num_keep_ctx_in_decoder=50
 keep_ctx_in_decoder_with_head=3
 keep_ctx_in_decoder_head_tau=0.001
@@ -27,7 +27,7 @@ query_in_decoder=no
 
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
-batch_size=2
+batch_size=1
 accum=$2
 
 if [[ ${query_in_decoder} == 'no' ]]; then
@@ -74,11 +74,11 @@ python ${prefix} train_reader.py \
   --encoder_decoder_kl_ratio ${encoder_decoder_kl_ratio} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 3501 \
-  --warmup_step 250 \
+  --total_step 501 \
+  --warmup_step 50 \
   --save_freq 500 \
-  --eval_freq 300 \
-  --eval_num_examples 200 \
+  --eval_freq 50 \
+  --eval_num_examples 100 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
   --init_from ${init_from}

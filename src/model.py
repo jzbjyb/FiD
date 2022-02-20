@@ -109,6 +109,10 @@ def t5attention_forward(
   # TODO: any better workaround?
   scores += position_bias
 
+  # collect encoder attn (before applying mask)
+  if hasattr(self, 'collect_for_retrieval'):
+    self.collect_for_retrieval(scores, hidden_states)
+
   if mask is not None:
     # apply token-leve mask
     scores = scores + mask  # (batch_size, n_heads, seq_length, key_length)
@@ -128,10 +132,7 @@ def t5attention_forward(
     attn_weights, p=self.dropout, training=self.training
   )  # (batch_size, n_heads, seq_length, key_length)
 
-  # collect encoder attn
-  if hasattr(self, 'collect_for_retrieval'):
-    self.collect_for_retrieval(scores, hidden_states)
-  # collect decoder attn
+  # collect decoder attn (after applying mask)
   if self.is_decoder and not self.training and hasattr(self, 'collect_cross_attention'):
     self.collect_cross_attention(scores, mask.eq(0))
 
@@ -155,6 +156,7 @@ class FiDT5Config(transformers.T5Config):
   def __init__(self,
                *args,
                n_layer_two_tower: int = 0,
+               layer_for_retrieval: str = 'first',
                attention_mask: str = 'separate',
                query_in_decoder: str = 'no',
                num_keep_ctx_in_decoder: int = 0,
@@ -165,6 +167,7 @@ class FiDT5Config(transformers.T5Config):
                **kwargs):
     super().__init__(*args, **kwargs)
     self.n_layer_two_tower = n_layer_two_tower
+    self.layer_for_retrieval = layer_for_retrieval
     self.attention_mask = attention_mask
     self.query_in_decoder = query_in_decoder
     self.num_keep_ctx_in_decoder = num_keep_ctx_in_decoder
@@ -187,6 +190,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
     def from_t5(cls,
                 model_name: str,
                 n_layer_two_tower: int = 0,
+                layer_for_retrieval: str = 'first',
                 attention_mask: str = 'separate',
                 query_in_decoder: str = 'no',
                 num_keep_ctx_in_decoder: int = 0,
@@ -197,6 +201,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
+          layer_for_retrieval=layer_for_retrieval,
           attention_mask=attention_mask,
           query_in_decoder=query_in_decoder,
           num_keep_ctx_in_decoder=num_keep_ctx_in_decoder,
@@ -414,6 +419,7 @@ class DecoderWrapper(torch.nn.Module):
     self.keep_ctx_in_decoder_head_tau = config.keep_ctx_in_decoder_head_tau
     self.encoder_decoder_kl_ratio = config.encoder_decoder_kl_ratio
     self.decoder_attn_ctx_normalize = config.decoder_attn_ctx_normalize
+    self.layer_for_retrieval = config.layer_for_retrieval
     if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
       raise ValueError('only one of the KL and combined loss should be used')
     if self.decoder_attn_ctx_normalize:
@@ -422,8 +428,15 @@ class DecoderWrapper(torch.nn.Module):
     if FiDT5.need_wrap_decoder(config):
       # head weight always needed
       if config.keep_ctx_in_decoder_with_head is None:
-        self.head_weights = torch.nn.Parameter(torch.zeros(config.num_heads), requires_grad=True)
+        if self.layer_for_retrieval in {'first', 'emb'}:
+          self.head_weights = torch.nn.Parameter(torch.zeros(config.num_heads), requires_grad=True)
+        elif self.layer_for_retrieval == 'emb-first':
+          self.head_weights = torch.nn.Parameter(torch.zeros(2 * config.num_heads), requires_grad=True)
+        else:
+          raise NotImplementedError
       else:
+        assert self.layer_for_retrieval == 'first', \
+          'only the first layer after bi-encoder should used for retrieval when using a specific head'
         weights = [-1e5] * config.num_heads
         weights[config.keep_ctx_in_decoder_with_head] = 1.0
         self.head_weights = torch.nn.Parameter(torch.tensor(weights), requires_grad=False)
@@ -450,8 +463,13 @@ class DecoderWrapper(torch.nn.Module):
     num_q, dt, _ = encoder_hidden_states.size()  # (num_q, num_d * ctx_len, emb_size)
     assert dt % num_d == 0, 'encoder_hidden_states shape error'
     ctx_len = dt // num_d
-    # use the first layer
-    encoder_imp = encoder_imp[:, :, 0, :]  # (num_q, num_d, num_head)
+    if self.layer_for_retrieval in {'first', 'emb'}:  # use the first layer
+      encoder_imp = encoder_imp[:, :, 0, :]  # (num_q, num_d, num_head)
+    elif self.layer_for_retrieval == 'emb-first':  # use the emb and first layer after bi-encoder
+      assert encoder_imp.size(2) == 2, 'provide attn for emb and the first layer after bi-encoder'
+      encoder_imp = encoder_imp.view(num_q, num_d, -1)  # (num_q, num_d, 2 * num_head)
+    else:
+      raise NotImplementedError
     # combine multiple heads
     encoder_imp = (encoder_imp * torch.softmax(
       self.head_weights / self.keep_ctx_in_decoder_head_tau, 0)[None, None, :]).sum(-1)  # (num_q, num_d)
@@ -501,6 +519,7 @@ class EncoderWrapper(torch.nn.Module):
         self.encoder = encoder
         self.use_checkpoint = use_checkpoint
         self.n_layer_two_tower = config.n_layer_two_tower
+        self.layer_for_retrieval = config.layer_for_retrieval
         self.apply_t5block_wrapper(config)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
@@ -526,18 +545,28 @@ class EncoderWrapper(torch.nn.Module):
 
     def apply_t5block_wrapper(self, config):
       only_use_first_layer = lambda i: i == config.n_layer_two_tower
+      only_use_emb_layer = lambda i: i == 0
       use_all_layers = lambda i: i >= config.n_layer_two_tower
+      only_use_emb_and_first_layer = lambda i: i == 0 or i == config.n_layer_two_tower
+      if config.layer_for_retrieval == 'first':
+        use_for_retrieval_func = only_use_first_layer
+      elif config.layer_for_retrieval == 'emb':
+        use_for_retrieval_func = only_use_emb_layer
+      elif config.layer_for_retrieval == 'emb-first':
+        use_for_retrieval_func = only_use_emb_and_first_layer
+      else:
+        raise NotImplementedError
       layers = []
       self.retrieval_t5block_funcs = []
       for i, layer in enumerate(self.encoder.block):
-        used_for_retreival = only_use_first_layer(i)
+        use_for_retrieval = use_for_retrieval_func(i)
         wrapped_layer = T5blockWrapper(
           config,
           layer,
           use_checkpoint=self.use_checkpoint,
           use_full_attention=i >= config.n_layer_two_tower,
-          used_for_retreival=used_for_retreival)
-        if used_for_retreival:
+          use_for_retrieval=use_for_retrieval)
+        if use_for_retrieval:
           self.retrieval_t5block_funcs.append(wrapped_layer.get_collected_for_retrieval)
         layers.append(wrapped_layer)
       self.encoder.block = nn.ModuleList(layers)
@@ -567,18 +596,17 @@ class T5blockWrapper(torch.nn.Module):
                  module,
                  use_checkpoint: bool = False,
                  use_full_attention: bool = True,
-                 used_for_retreival: bool = False):
-        assert not used_for_retreival or use_full_attention, 'retrieval layer must use full attention'
+                 use_for_retrieval: bool = False):
         super().__init__()
         self.module = module
         self.use_checkpoint = use_checkpoint
         self.use_full_attention = use_full_attention
-        self.used_for_retreival = used_for_retreival
+        self.use_for_retrieval = use_for_retrieval
         self.collect_for_decoder = FiDT5.need_wrap_decoder(config)
 
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
         # register callback for retrieval
-        if self.used_for_retreival and (not self.training or self.collect_for_decoder):
+        if self.use_for_retrieval and (not self.training or self.collect_for_decoder):
             reg_point = self.module.layer[0].SelfAttention
             reg_point.collect_for_retrieval = types.MethodType(
               functools.partial(
@@ -593,7 +621,7 @@ class T5blockWrapper(torch.nn.Module):
             # modify (potentially separate) attention mask to make it a full attention
             attention_mask = attention_mask.max(2, keepdim=True)[0]  # (bs, num_heads, 1, seq_len)
         # handle checkpointing
-        if self.use_checkpoint and self.training and not self.used_for_retreival:
+        if self.use_checkpoint and self.training and not self.use_for_retrieval:
             kwargs = {k: v for k, v in kwargs.items() if v is not None}
             def custom_forward(*inputs):
                 output = self.module(*inputs, **kwargs)
