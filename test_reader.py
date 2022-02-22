@@ -52,7 +52,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
               src.util.extract_query_answer(o, tokenizer, query_in_decoder=opt.query_in_decoder) for o in outputs]))
 
             if opt.write_crossattention_scores:
-                crossattention_scores = model.get_crossattention_scores(
+                crossattention_scores, crossattention_encoder_scores = model.get_crossattention_scores(
                   predictions_position,
                   context_mask.cuda(),
                   sum_over_head_and_layer=False)
@@ -73,6 +73,10 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                         cs = crossattention_scores[k, j]
                         cs = cs.item() if cs.dim() == 0 else cs.cpu().numpy().tolist()
                         example['ctxs'][j]['score'] = cs
+
+                        if crossattention_encoder_scores is not None:
+                          ces = crossattention_encoder_scores[k, j]
+                          example['ctxs'][j]['encoder_score'] = ces.item()
 
                         if 'two_tower_attn_score' not in retrieval:
                           continue

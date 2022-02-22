@@ -11,3 +11,4 @@ pip install bertviz
 pip install jupyterlab==3.2.9
 pip install ipywidgets==7.6.5
 pip install rouge-score==0.0.4
+pip install fairscale==0.4.5

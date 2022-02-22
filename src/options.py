@@ -40,6 +40,7 @@ class Options():
         self.parser.add_argument('--eval_data', type=str, default='none', help='path of eval data')
         self.parser.add_argument('--model_size', type=str, default='base')
         self.parser.add_argument('--use_checkpoint', action='store_true', help='use checkpoint in the encoder')
+        self.parser.add_argument('--use_sharding', action='store_true', help='use ZeRO')
         self.parser.add_argument('--text_maxlength', type=int, default=200, 
                         help='maximum number of tokens in text segments (question+passage)')
         self.parser.add_argument('--answer_maxlength', type=int, default=-1, 

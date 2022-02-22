@@ -369,7 +369,7 @@ if __name__ == '__main__':
     convert_quasar_to_beir_format(quasar_dir, beir_dir)
 
   elif args.task == 'eval_answer':
-    key = 'score'  # score two_tower_attn_score
+    key = 'score'  # score two_tower_attn_score encoder_score
     method = 'avg'
     n_two_tower_layers = 6
     num_heads = 12
@@ -381,6 +381,9 @@ if __name__ == '__main__':
     elif method == 'shuffle':
       eval_answer(ret_file, shuffle=True)
       exit()
+    elif method == 'raw':
+      eval_answer(ret_file, sort=True, key_func=lambda x: x[key])
+      exit()
     elif method == 'avg':
       eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key]))
       eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][-1]))
@@ -391,7 +394,7 @@ if __name__ == '__main__':
         eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][11][i]))
       exit()
     elif method == 'specific':
-      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][0][3]))
+      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][-1][3]))
       exit()
 
     for l in range(12 - n_two_tower_layers):

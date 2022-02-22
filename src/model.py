@@ -392,7 +392,12 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         ntokens = context_mask.sum(dim=[2])[:, None, None]
         scores = scores / ntokens  # batch_size, n_head, n_layers, n_passages
         scores = scores.permute(0, 3, 2, 1)  # batch_size, n_passages, n_layers, n_head
-      return scores
+
+      encoder_scores = None
+      if type(self.decoder) is DecoderWrapper:
+        encoder_scores = self.decoder.encoder_imp  # batch_size, n_passages
+
+      return scores, encoder_scores
 
     def overwrite_forward_crossattention(self, n_context: int):
         """
@@ -440,9 +445,7 @@ class DecoderWrapper(torch.nn.Module):
         weights = [-1e5] * config.num_heads
         weights[config.keep_ctx_in_decoder_with_head] = 1.0
         self.head_weights = torch.nn.Parameter(torch.tensor(weights), requires_grad=False)
-      # combine weight only for combined attn
-      if config.num_keep_ctx_in_decoder:
-        self.combine_weight = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
+      self.combine_weight = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
   def get_kl_loss(self):
     assert self.encoder_decoder_kl_ratio
@@ -475,10 +478,11 @@ class DecoderWrapper(torch.nn.Module):
       self.head_weights / self.keep_ctx_in_decoder_head_tau, 0)[None, None, :]).sum(-1)  # (num_q, num_d)
     WandbLogger.log_w_step({'head-weight': torch.softmax(
       self.head_weights / self.keep_ctx_in_decoder_head_tau, 0)})
+    # apply combine weight
+    encoder_imp = torch.exp(self.combine_weight) * encoder_imp
+    WandbLogger.log_w_step({'combine-weight': torch.exp(self.combine_weight).item()})
+    self.encoder_imp = encoder_imp  # used for output
     if self.num_keep_ctx_in_decoder:
-      # apply combine weight
-      encoder_imp = torch.exp(self.combine_weight) * encoder_imp
-      WandbLogger.log_w_step({'combine-weight': torch.exp(self.combine_weight).item()})
       # spasify
       assert self.num_keep_ctx_in_decoder <= num_d
       value, ind = encoder_imp.topk(self.num_keep_ctx_in_decoder, -1)
@@ -500,7 +504,8 @@ class DecoderWrapper(torch.nn.Module):
       # assign to the last cross attn module
       reg_point = self.decoder.block[-1].layer[1].EncDecAttention
       reg_point.encoder_imp = encoder_imp
-      reg_point.encoder_decoder_kl = types.MethodType(functools.partial(encoder_decoder_kl, n_context=num_d), reg_point)
+      reg_point.encoder_decoder_kl = types.MethodType(
+        functools.partial(encoder_decoder_kl, n_context=num_d, use_softmax=True), reg_point)
     else:
       raise NotImplementedError
     # decode
@@ -686,16 +691,24 @@ def encoder_decoder_kl(
      decoder_score: torch.FloatTensor,  # (bs, n_heads, dec_seq_len, enc_seq_len)
      decoder_mask: torch.BoolTensor,  # (bs, n_heads or 1, dec_seq_len, enc_seq_len)
      encoder_score: torch.FloatTensor,  # (bs, n_context)
-     n_context: int):
+     n_context: int,
+     use_softmax: bool = False):
+  # apply softmax
+  if use_softmax:
+    decoder_score = nn.functional.softmax(decoder_score.float(), dim=-1).type_as(decoder_score)
   # avg over doc tokens
   s = decoder_score.view(*(decoder_score.size()[:3] + (n_context, -1)))  # (bs, n_heads, dec_seq_len, n_context, text_len)
   m = decoder_mask.view(*(decoder_mask.size()[:3] + (n_context, -1)))  # (bs, n_heads or 1, dec_seq_len, n_context, text_len)
-  s = (s * m).sum(-1) / m.sum(-1)  # (bs, n_heads, dec_seq_len, n_context)
+  s = (s * m).sum(-1)  # (bs, n_heads, dec_seq_len, n_context)  # TODO: avg instead of sum since avg is used in final evaluation?
   # avg over head, use the first decoder tok
   s = s.mean(1)[:, 0]  # (bs, n_context)
   # kl
   kl_loss = torch.nn.KLDivLoss(reduction='batchmean')
-  dec_attn = torch.softmax(s.detach(), dim=-1)  # no grad to decoder
+  if use_softmax:
+    dec_attn = s.detach()
+  else:
+    dec_attn = torch.softmax(s.detach(), dim=-1)  # no grad to decoder
+  WandbLogger.log_w_step({'decoder-dist-kl': torch.sort(dec_attn[0], descending=True)[0][:10]})
   enc_attn = torch.nn.functional.log_softmax(encoder_score, dim=-1)
   kl = kl_loss(enc_attn, dec_attn)
   return kl

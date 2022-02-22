@@ -13,6 +13,7 @@ import logging
 import json
 from pathlib import Path
 import torch.distributed as dist
+from fairscale.optim.oss import OSS
 import csv
 import wandb
 
@@ -119,11 +120,11 @@ def load(model_class, dir_path, opt, reset_params=False):
     else:
         best_eval_metric = checkpoint["best_dev_em"]
     if not reset_params:
-        optimizer, scheduler = set_optim(opt_checkpoint, model)
+        optimizer, scheduler = set_optim(opt_checkpoint, model, sharding=opt.use_sharding)
         scheduler.load_state_dict(checkpoint["scheduler"])
         optimizer.load_state_dict(checkpoint["optimizer"])
     else:
-        optimizer, scheduler = set_optim(opt, model)
+        optimizer, scheduler = set_optim(opt, model, sharding=opt.use_sharding)
 
     return model, optimizer, scheduler, opt_checkpoint, step, best_eval_metric
 
@@ -162,20 +163,31 @@ def set_dropout(model, dropout_rate):
             mod.p = dropout_rate
 
 
-def set_optim(opt, model):
-    if opt.optim == 'adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
-    elif opt.optim == 'adamw':
-        optimizer = torch.optim.AdamW(model.parameters(), lr=opt.lr, weight_decay=opt.weight_decay)
-    if opt.scheduler == 'fixed':
-        scheduler = FixedScheduler(optimizer)
-    elif opt.scheduler == 'linear':
-        if opt.scheduler_steps is None:
-            scheduler_steps = opt.total_steps
-        else:
-            scheduler_steps = opt.scheduler_steps
-        scheduler = WarmupLinearScheduler(optimizer, warmup_steps=opt.warmup_steps, scheduler_steps=scheduler_steps, min_ratio=0., fixed_lr=opt.fixed_lr)
-    return optimizer, scheduler
+def set_optim(opt, model, sharding: bool = False):
+  if opt.optim == 'adam':
+    params = {'lr': opt.lr}
+    base_optim = torch.optim.Adam
+  elif opt.optim == 'adamw':
+    params = {'lr': opt.lr, 'weight_decay': opt.weight_decay}
+    base_optim = torch.optim.AdamW
+  else:
+    raise NotImplementedError
+  if sharding:
+    optimizer = OSS(params=model.parameters(), optim=base_optim, **params)
+  else:
+    optimizer = base_optim(model.parameters(), **params)
+
+  if opt.scheduler == 'fixed':
+    scheduler = FixedScheduler(optimizer)
+  elif opt.scheduler == 'linear':
+    if opt.scheduler_steps is None:
+        scheduler_steps = opt.total_steps
+    else:
+        scheduler_steps = opt.scheduler_steps
+    scheduler = WarmupLinearScheduler(optimizer, warmup_steps=opt.warmup_steps, scheduler_steps=scheduler_steps, min_ratio=0., fixed_lr=opt.fixed_lr)
+  else:
+    raise NotImplementedError
+  return optimizer, scheduler
 
 
 def average_main(x, opt):

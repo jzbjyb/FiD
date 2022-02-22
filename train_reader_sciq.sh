@@ -14,14 +14,14 @@ metric=em
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=sciq_reader_base_v11lm_separate_layer6_step1k_continue_emb_decoder50_decattnnorm_tau0001  # sciq_reader_base_v11lm_separate_layer6_step1k_continue_decoder50_tau0001
+name=sciq_reader_base_v11lm_separate_layer6_step1k_continue_embfirst_kl1_tau0001
 init_from=${ckpt_dir}/sciq_reader_base_v11lm_separate_layer6_step1k/checkpoint/latest
 n_layer_two_tower=6
-layer_for_retrieval=emb
-num_keep_ctx_in_decoder=50
+layer_for_retrieval=emb-first
+num_keep_ctx_in_decoder=0
 keep_ctx_in_decoder_with_head=3
 keep_ctx_in_decoder_head_tau=0.001
-encoder_decoder_kl_ratio=0.0
+encoder_decoder_kl_ratio=1.0
 attention_mask=separate
 query_in_decoder=no
 
@@ -69,7 +69,6 @@ python ${prefix} train_reader.py \
   --n_layer_two_tower ${n_layer_two_tower} \
   --layer_for_retrieval ${layer_for_retrieval} \
   --num_keep_ctx_in_decoder ${num_keep_ctx_in_decoder} \
-  --decoder_attn_ctx_normalize \
   --keep_ctx_in_decoder_head_tau ${keep_ctx_in_decoder_head_tau} \
   --encoder_decoder_kl_ratio ${encoder_decoder_kl_ratio} \
   --attention_mask ${attention_mask} \
@@ -84,6 +83,7 @@ python ${prefix} train_reader.py \
   --init_from ${init_from}
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
+# --decoder_attn_ctx_normalize \
 
 # NQ
 # 3501

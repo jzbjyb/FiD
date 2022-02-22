@@ -12,8 +12,10 @@ import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
-from src.options import Options
+from fairscale.optim.oss import OSS
+from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
 
+from src.options import Options
 import src.slurm
 import src.util
 import src.evaluation
@@ -220,7 +222,7 @@ if __name__ == "__main__":
           _model = model_class.from_pretrained(opt.init_from)
           model.load_from(_model)
         model = model.to(opt.local_rank)
-        optimizer, scheduler = src.util.set_optim(opt, model)
+        optimizer, scheduler = src.util.set_optim(opt, model, sharding=opt.use_sharding)
         step, best_dev_metric = 0, 0.0
     elif opt.model_path == "none":
         load_path = checkpoint_path / 'checkpoint' / 'latest'
@@ -231,18 +233,21 @@ if __name__ == "__main__":
         logger.info(f'Continue training from {opt.model_path}')
         model = model_class.from_pretrained(opt.model_path)
         model = model.to(opt.local_rank)
-        optimizer, scheduler = src.util.set_optim(opt, model)
+        optimizer, scheduler = src.util.set_optim(opt, model, sharding=opt.use_sharding)
         step, best_dev_metric = 0, 0.0
 
     model.set_checkpoint(opt.use_checkpoint)
 
     if opt.is_distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[opt.local_rank],
-            output_device=opt.local_rank,
-            find_unused_parameters=False,
-        )
+        if opt.use_sharding:
+            model = ShardedDDP(model, optimizer)
+        else:
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[opt.local_rank],
+                output_device=opt.local_rank,
+                find_unused_parameters=False,
+            )
 
     logger.info("Start training")
     train(
