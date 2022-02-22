@@ -215,8 +215,10 @@ if __name__ == "__main__":
           num_keep_ctx_in_decoder=opt.num_keep_ctx_in_decoder,
           keep_ctx_in_decoder_with_head=opt.keep_ctx_in_decoder_with_head,
           keep_ctx_in_decoder_head_tau=opt.keep_ctx_in_decoder_head_tau,
+          head_weights_norm_func=opt.head_weights_norm_func,
           encoder_decoder_kl_ratio=opt.encoder_decoder_kl_ratio,
-          decoder_attn_ctx_normalize=opt.decoder_attn_ctx_normalize)
+          decoder_attn_ctx_normalize=opt.decoder_attn_ctx_normalize,
+          encoder_attention_pre_softmax=opt.encoder_attention_pre_softmax)
         if opt.init_from:
           logger.info(f'Init from {opt.init_from}')
           _model = model_class.from_pretrained(opt.init_from)

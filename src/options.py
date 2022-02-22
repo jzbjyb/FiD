@@ -50,7 +50,8 @@ class Options():
         self.parser.add_argument('--n_context', type=int, default=1)
         self.parser.add_argument('--n_layer_two_tower', type=int, default=0,
                                  help='number of layers used for two tower representation')
-        self.parser.add_argument('--layer_for_retrieval', type=str, default='first', choices=['first', 'emb-first', 'emb'],
+        self.parser.add_argument('--layer_for_retrieval', type=str, default='first',
+                                 choices=['first', 'emb-first', 'emb', 'prev-first', 'after-first'],
                                  help='layers used for retrieval')
         self.parser.add_argument('--attention_mask', type=str, default=None,
                                  choices=[None, 'separate', 'query-side', 'no-query'],
@@ -60,12 +61,17 @@ class Options():
         self.parser.add_argument('--num_keep_ctx_in_decoder', type=int, default=0, help='num of ctx used in decoder')
         self.parser.add_argument('--keep_ctx_in_decoder_head_tau', type=float, default=1.0,
                                  help='tau for head weight softmax')
+        self.parser.add_argument('--head_weights_norm_func', type=str, default='softmax',
+                                 choices=['softmax', 'sparsemax'],
+                                 help='head weights normalization function')
         self.parser.add_argument('--keep_ctx_in_decoder_with_head', type=int, default=None,
                                  help='only use a specific head to keep ctx in decoder')
         self.parser.add_argument('--encoder_decoder_kl_ratio', type=float, default=0,
                                  help='the ratio of KL divergence between encoder and decoder attn')
         self.parser.add_argument('--decoder_attn_ctx_normalize', action='store_true',
                                  help='normalize decoder attention for each context')
+        self.parser.add_argument('--encoder_attention_pre_softmax', action='store_true',
+                                 help='softmax encoder attention before KL or adding to decoder attention')
         self.parser.add_argument('--metric', type=str, default='em', choices=['em', 'rougel'])
 
     def add_retriever_options(self):

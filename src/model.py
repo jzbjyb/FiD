@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 import numpy as np
 from transformers.models.t5.modeling_t5 import T5Attention
+from entmax import sparsemax
 from .util import max_sparsify, WandbLogger
 
 def t5attention_forward(
@@ -146,8 +147,13 @@ def t5attention_forward(
   present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
   outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
 
-  if output_attentions:
-    outputs = outputs + (attn_weights,)
+  need_to_push_attn_in_output_to_enable_bp = self.training and hasattr(self, 'collect_for_retrieval')
+
+  if output_attentions or need_to_push_attn_in_output_to_enable_bp:
+    if need_to_push_attn_in_output_to_enable_bp:
+      outputs = outputs + (self.retrieval['two_tower_attn_score'],)  # (bs, num_heads)
+    else:
+      outputs = outputs + (attn_weights,)
   return outputs
 
 T5Attention.forward = t5attention_forward
@@ -162,6 +168,8 @@ class FiDT5Config(transformers.T5Config):
                num_keep_ctx_in_decoder: int = 0,
                keep_ctx_in_decoder_with_head: int = None,
                keep_ctx_in_decoder_head_tau: float = 1.0,
+               head_weights_norm_func: str = 'softmax',
+               encoder_attention_pre_softmax: bool = False,
                encoder_decoder_kl_ratio: float = 0,
                decoder_attn_ctx_normalize: bool = False,
                **kwargs):
@@ -173,6 +181,8 @@ class FiDT5Config(transformers.T5Config):
     self.num_keep_ctx_in_decoder = num_keep_ctx_in_decoder
     self.keep_ctx_in_decoder_with_head = keep_ctx_in_decoder_with_head
     self.keep_ctx_in_decoder_head_tau = keep_ctx_in_decoder_head_tau
+    self.head_weights_norm_func = head_weights_norm_func
+    self.encoder_attention_pre_softmax = encoder_attention_pre_softmax
     self.encoder_decoder_kl_ratio = encoder_decoder_kl_ratio
     self.decoder_attn_ctx_normalize = decoder_attn_ctx_normalize
 
@@ -196,6 +206,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 num_keep_ctx_in_decoder: int = 0,
                 keep_ctx_in_decoder_with_head: int = None,
                 keep_ctx_in_decoder_head_tau: float = 1.0,
+                head_weights_norm_func: str = 'softmax',
+                encoder_attention_pre_softmax: bool = False,
                 encoder_decoder_kl_ratio: float = 0,
                 decoder_attn_ctx_normalize: bool = False):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
@@ -207,6 +219,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           num_keep_ctx_in_decoder=num_keep_ctx_in_decoder,
           keep_ctx_in_decoder_with_head=keep_ctx_in_decoder_with_head,
           keep_ctx_in_decoder_head_tau=keep_ctx_in_decoder_head_tau,
+          head_weights_norm_func=head_weights_norm_func,
+          encoder_attention_pre_softmax=encoder_attention_pre_softmax,
           encoder_decoder_kl_ratio=encoder_decoder_kl_ratio,
           decoder_attn_ctx_normalize=decoder_attn_ctx_normalize,
           **t5.config.to_dict())
@@ -425,6 +439,10 @@ class DecoderWrapper(torch.nn.Module):
     self.encoder_decoder_kl_ratio = config.encoder_decoder_kl_ratio
     self.decoder_attn_ctx_normalize = config.decoder_attn_ctx_normalize
     self.layer_for_retrieval = config.layer_for_retrieval
+    self.n_layer_two_tower = config.n_layer_two_tower
+    self.encoder_attention_pre_softmax = config.encoder_attention_pre_softmax
+    if self.encoder_attention_pre_softmax and self.num_keep_ctx_in_decoder:
+      raise NotImplementedError
     if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
       raise ValueError('only one of the KL and combined loss should be used')
     if self.decoder_attn_ctx_normalize:
@@ -434,17 +452,28 @@ class DecoderWrapper(torch.nn.Module):
       # head weight always needed
       if config.keep_ctx_in_decoder_with_head is None:
         if self.layer_for_retrieval in {'first', 'emb'}:
-          self.head_weights = torch.nn.Parameter(torch.zeros(config.num_heads), requires_grad=True)
+          nw = config.num_heads
         elif self.layer_for_retrieval == 'emb-first':
-          self.head_weights = torch.nn.Parameter(torch.zeros(2 * config.num_heads), requires_grad=True)
+          nw = 2 * config.num_heads
+        elif self.layer_for_retrieval == 'prev-first':
+          nw = (self.n_layer_two_tower + 1) * config.num_heads
+        elif self.layer_for_retrieval == 'after-first':
+          nw = (config.num_layers - self.n_layer_two_tower) * config.num_heads
         else:
           raise NotImplementedError
+        self.head_weights = torch.nn.Parameter(torch.zeros(nw), requires_grad=True)
       else:
         assert self.layer_for_retrieval == 'first', \
           'only the first layer after bi-encoder should used for retrieval when using a specific head'
         weights = [-1e5] * config.num_heads
         weights[config.keep_ctx_in_decoder_with_head] = 1.0
         self.head_weights = torch.nn.Parameter(torch.tensor(weights), requires_grad=False)
+      if config.head_weights_norm_func == 'softmax':
+        self.head_weights_norm_func = lambda x: torch.softmax(x / self.keep_ctx_in_decoder_head_tau, 0)
+      elif config.head_weights_norm_func == 'sparsemax':
+        self.head_weights_norm_func = lambda x: sparsemax(x, 0)
+      else:
+        raise NotImplementedError
       self.combine_weight = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
   def get_kl_loss(self):
@@ -466,22 +495,35 @@ class DecoderWrapper(torch.nn.Module):
     num_q, dt, _ = encoder_hidden_states.size()  # (num_q, num_d * ctx_len, emb_size)
     assert dt % num_d == 0, 'encoder_hidden_states shape error'
     ctx_len = dt // num_d
+
+    # apply combine weight
+    encoder_imp = torch.exp(self.combine_weight) * encoder_imp
+    WandbLogger.log_w_step({'combine-weight': torch.exp(self.combine_weight).item()})
+
+    # softmax
+    if self.encoder_attention_pre_softmax:
+      encoder_imp = torch.nn.functional.log_softmax(encoder_imp, dim=1)
+
+    # combine multiple heads
+    hwn = self.head_weights_norm_func(self.head_weights)
+    WandbLogger.log_w_step({'head-weight': hwn})
     if self.layer_for_retrieval in {'first', 'emb'}:  # use the first layer
       encoder_imp = encoder_imp[:, :, 0, :]  # (num_q, num_d, num_head)
     elif self.layer_for_retrieval == 'emb-first':  # use the emb and first layer after bi-encoder
       assert encoder_imp.size(2) == 2, 'provide attn for emb and the first layer after bi-encoder'
       encoder_imp = encoder_imp.view(num_q, num_d, -1)  # (num_q, num_d, 2 * num_head)
+    elif self.layer_for_retrieval in {'prev-first', 'after-first'}:  # use all layers before first and after first
+      encoder_imp = encoder_imp.view(num_q, num_d, -1)  # (num_q, num_d, ? * num_head)
     else:
       raise NotImplementedError
-    # combine multiple heads
-    encoder_imp = (encoder_imp * torch.softmax(
-      self.head_weights / self.keep_ctx_in_decoder_head_tau, 0)[None, None, :]).sum(-1)  # (num_q, num_d)
-    WandbLogger.log_w_step({'head-weight': torch.softmax(
-      self.head_weights / self.keep_ctx_in_decoder_head_tau, 0)})
-    # apply combine weight
-    encoder_imp = torch.exp(self.combine_weight) * encoder_imp
-    WandbLogger.log_w_step({'combine-weight': torch.exp(self.combine_weight).item()})
-    self.encoder_imp = encoder_imp  # used for output
+    if self.encoder_attention_pre_softmax:
+      encoder_imp = torch.logsumexp(encoder_imp + torch.log(torch.clamp(hwn, min=1e-10))[None, None, :], dim=-1)
+    else:
+      encoder_imp = (encoder_imp * hwn[None, None, :]).sum(-1)  # (num_q, num_d)
+
+    # used for output
+    self.encoder_imp = encoder_imp
+
     if self.num_keep_ctx_in_decoder:
       # spasify
       assert self.num_keep_ctx_in_decoder <= num_d
@@ -505,7 +547,10 @@ class DecoderWrapper(torch.nn.Module):
       reg_point = self.decoder.block[-1].layer[1].EncDecAttention
       reg_point.encoder_imp = encoder_imp
       reg_point.encoder_decoder_kl = types.MethodType(
-        functools.partial(encoder_decoder_kl, n_context=num_d, use_softmax=True), reg_point)
+        functools.partial(encoder_decoder_kl,
+                          n_context=num_d,
+                          use_softmax=True,
+                          encoder_score_pre_softmaxed=self.encoder_attention_pre_softmax), reg_point)
     else:
       raise NotImplementedError
     # decode
@@ -549,16 +594,21 @@ class EncoderWrapper(torch.nn.Module):
         return outputs
 
     def apply_t5block_wrapper(self, config):
-      only_use_first_layer = lambda i: i == config.n_layer_two_tower
-      only_use_emb_layer = lambda i: i == 0
-      use_all_layers = lambda i: i >= config.n_layer_two_tower
-      only_use_emb_and_first_layer = lambda i: i == 0 or i == config.n_layer_two_tower
+      use_first_layer = lambda i: i == config.n_layer_two_tower
+      use_emb_layer = lambda i: i == 0
+      use_emb_and_first_layer = lambda i: i == 0 or i == config.n_layer_two_tower
+      use_prev_and_first_layers = lambda i: i <= config.n_layer_two_tower
+      use_after_and_first_layers = lambda i: i >= config.n_layer_two_tower
       if config.layer_for_retrieval == 'first':
-        use_for_retrieval_func = only_use_first_layer
+        use_for_retrieval_func = use_first_layer
       elif config.layer_for_retrieval == 'emb':
-        use_for_retrieval_func = only_use_emb_layer
+        use_for_retrieval_func = use_emb_layer
       elif config.layer_for_retrieval == 'emb-first':
-        use_for_retrieval_func = only_use_emb_and_first_layer
+        use_for_retrieval_func = use_emb_and_first_layer
+      elif config.layer_for_retrieval == 'prev-first':
+        use_for_retrieval_func = use_prev_and_first_layers
+      elif config.layer_for_retrieval == 'after-first':
+        use_for_retrieval_func = use_after_and_first_layers
       else:
         raise NotImplementedError
       layers = []
@@ -626,7 +676,7 @@ class T5blockWrapper(torch.nn.Module):
             # modify (potentially separate) attention mask to make it a full attention
             attention_mask = attention_mask.max(2, keepdim=True)[0]  # (bs, num_heads, 1, seq_len)
         # handle checkpointing
-        if self.use_checkpoint and self.training and not self.use_for_retrieval:
+        if self.use_checkpoint and self.training:
             kwargs = {k: v for k, v in kwargs.items() if v is not None}
             def custom_forward(*inputs):
                 output = self.module(*inputs, **kwargs)
@@ -692,7 +742,8 @@ def encoder_decoder_kl(
      decoder_mask: torch.BoolTensor,  # (bs, n_heads or 1, dec_seq_len, enc_seq_len)
      encoder_score: torch.FloatTensor,  # (bs, n_context)
      n_context: int,
-     use_softmax: bool = False):
+     use_softmax: bool = False,
+     encoder_score_pre_softmaxed: bool = False):
   # apply softmax
   if use_softmax:
     decoder_score = nn.functional.softmax(decoder_score.float(), dim=-1).type_as(decoder_score)
@@ -709,7 +760,10 @@ def encoder_decoder_kl(
   else:
     dec_attn = torch.softmax(s.detach(), dim=-1)  # no grad to decoder
   WandbLogger.log_w_step({'decoder-dist-kl': torch.sort(dec_attn[0], descending=True)[0][:10]})
-  enc_attn = torch.nn.functional.log_softmax(encoder_score, dim=-1)
+  if encoder_score_pre_softmaxed:
+    enc_attn = encoder_score  # already with log
+  else:
+    enc_attn = torch.nn.functional.log_softmax(encoder_score, dim=-1)
   kl = kl_loss(enc_attn, dec_attn)
   return kl
 
@@ -768,124 +822,6 @@ def collect_for_retrieval(
   else:
     raise NotImplementedError
   self.retrieval = {'two_tower_attn_score': scores}
-
-def cross_attention_forward_new(
-     self,
-     hidden_states,
-     mask=None,
-     key_value_states=None,
-     position_bias=None,
-     past_key_value=None,
-     layer_head_mask=None,
-     query_length=None,
-     use_cache=False,
-     output_attentions=False):
-  """
-  from: https://github.com/huggingface/transformers/blob/v4.15.0/src/transformers/models/t5/modeling_t5.py
-  Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
-  """
-  # Input is (batch_size, seq_length, dim)
-  # Mask is (batch_size, key_length) (non-causal) or (batch_size, key_length, key_length)
-  # past_key_value[0] is (batch_size, n_heads, q_len - 1, dim_per_head)
-  batch_size, seq_length = hidden_states.shape[:2]
-
-  real_seq_length = seq_length
-
-  if past_key_value is not None:
-    assert (
-         len(past_key_value) == 2
-    ), f"past_key_value should have 2 past states: keys and values. Got {len(past_key_value)} past states"
-    real_seq_length += past_key_value[0].shape[2] if query_length is None else query_length
-
-  key_length = real_seq_length if key_value_states is None else key_value_states.shape[1]
-
-  def shape(states):
-    """projection"""
-    return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
-
-  def unshape(states):
-    """reshape"""
-    return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
-
-  def project(hidden_states, proj_layer, key_value_states, past_key_value):
-    """projects hidden states correctly to key/query states"""
-    if key_value_states is None:
-      # self-attn
-      # (batch_size, n_heads, seq_length, dim_per_head)
-      hidden_states = shape(proj_layer(hidden_states))
-    elif past_key_value is None:
-      # cross-attn
-      # (batch_size, n_heads, seq_length, dim_per_head)
-      hidden_states = shape(proj_layer(key_value_states))
-
-    if past_key_value is not None:
-      if key_value_states is None:
-        # self-attn
-        # (batch_size, n_heads, key_length, dim_per_head)
-        hidden_states = torch.cat([past_key_value, hidden_states], dim=2)
-      else:
-        # cross-attn
-        hidden_states = past_key_value
-    return hidden_states
-
-  # get query states
-  query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
-
-  # get key/value states
-  key_states = project(
-    hidden_states, self.k, key_value_states, past_key_value[0] if past_key_value is not None else None
-  )
-  value_states = project(
-    hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
-  )
-
-  # compute scores
-  scores = torch.matmul(
-    query_states, key_states.transpose(3, 2)
-  )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
-
-  if position_bias is None:
-    if not self.has_relative_attention_bias:
-      position_bias = torch.zeros(
-        (1, self.n_heads, real_seq_length, key_length), device=scores.device, dtype=scores.dtype
-      )
-      if self.gradient_checkpointing and self.training:
-        position_bias.requires_grad = True
-    else:
-      position_bias = self.compute_bias(real_seq_length, key_length)
-
-    # if key and values are already calculated
-    # we want only the last query position bias
-    if past_key_value is not None:
-      position_bias = position_bias[:, :, -hidden_states.size(1):, :]
-
-    if mask is not None:
-      position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
-
-  scores += position_bias
-  if self.score_storage is None:
-    self.score_storage = scores
-
-  attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
-    scores
-  )  # (batch_size, n_heads, seq_length, key_length)
-  attn_weights = nn.functional.dropout(
-    attn_weights, p=self.dropout, training=self.training
-  )  # (batch_size, n_heads, seq_length, key_length)
-
-  # Mask heads if we want to
-  if layer_head_mask is not None:
-    attn_weights = attn_weights * layer_head_mask
-
-  attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
-  attn_output = self.o(attn_output)
-
-  present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
-  outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
-
-  if output_attentions:
-    outputs = outputs + (attn_weights,)
-  return outputs
 
 def cross_attention_forward(
         self,

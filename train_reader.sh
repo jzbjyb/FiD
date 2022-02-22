@@ -14,13 +14,14 @@ metric=em
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_step3k
+name=nq_reader_base_v11lm_separate_layer6_continue_afterfirst_kl1_tau0001
 init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
 n_layer_two_tower=6
-layer_for_retrieval=first
+layer_for_retrieval=after-first
 num_keep_ctx_in_decoder=0
 keep_ctx_in_decoder_with_head=3
 keep_ctx_in_decoder_head_tau=0.001
+head_weights_norm_func=softmax
 encoder_decoder_kl_ratio=1.0
 attention_mask=separate
 query_in_decoder=no
@@ -70,13 +71,14 @@ python ${prefix} train_reader.py \
   --layer_for_retrieval ${layer_for_retrieval} \
   --num_keep_ctx_in_decoder ${num_keep_ctx_in_decoder} \
   --keep_ctx_in_decoder_head_tau ${keep_ctx_in_decoder_head_tau} \
+  --head_weights_norm_func ${head_weights_norm_func} \
   --encoder_decoder_kl_ratio ${encoder_decoder_kl_ratio} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 3501 \
-  --warmup_step 250 \
-  --save_freq 500 \
-  --eval_freq 300 \
+  --total_step 1001 \
+  --warmup_step 100 \
+  --save_freq 1000 \
+  --eval_freq 200 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
@@ -84,6 +86,7 @@ python ${prefix} train_reader.py \
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
 # --decoder_attn_ctx_normalize \
+# --encoder_attention_pre_softmax \
 
 # NQ
 # 3501
@@ -94,14 +97,14 @@ python ${prefix} train_reader.py \
 
 # 1001
 # 100
-# 500
+# 1000
 # 200
 # 200
 
 # SciQ
 # 1001
 # 100
-# 500
+# 1000
 # 50
 # 100
 
