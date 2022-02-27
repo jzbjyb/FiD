@@ -337,6 +337,7 @@ if __name__ == '__main__':
     'aggregate_ctxs', 'eval', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
+  parser.add_argument('--other', type=str, nargs='+', help='additional arguments')
   args = parser.parse_args()
 
   if args.task == 'aggregate_ctxs':
@@ -369,8 +370,12 @@ if __name__ == '__main__':
     convert_quasar_to_beir_format(quasar_dir, beir_dir)
 
   elif args.task == 'eval_answer':
-    key = 'score'  # score two_tower_attn_score encoder_score
-    method = 'avg'
+    key, method = args.other[:2]
+    index = 3
+    if len(args.other) > 2:
+      index = int(args.other[2])
+    #key = 'score'  # score two_tower_attn_score encoder_score
+    #method = 'avg'
     n_two_tower_layers = 6
     num_heads = 12
 
@@ -394,7 +399,10 @@ if __name__ == '__main__':
         eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][11][i]))
       exit()
     elif method == 'specific':
-      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][-1][3]))
+      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][-1][index]))
+      exit()
+    elif method == 'flat':
+      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean([b for a in x[key] for b in a][index]))
       exit()
 
     for l in range(12 - n_two_tower_layers):

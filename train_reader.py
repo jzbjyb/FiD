@@ -211,6 +211,7 @@ if __name__ == "__main__":
           n_layer_two_tower=opt.n_layer_two_tower,
           layer_for_retrieval=opt.layer_for_retrieval,
           attention_mask=opt.attention_mask,
+          retrieval_aggregation_method=opt.retrieval_aggregation_method,
           query_in_decoder=opt.query_in_decoder,
           num_keep_ctx_in_decoder=opt.num_keep_ctx_in_decoder,
           keep_ctx_in_decoder_with_head=opt.keep_ctx_in_decoder_with_head,

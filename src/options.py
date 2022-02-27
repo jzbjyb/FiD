@@ -56,6 +56,8 @@ class Options():
         self.parser.add_argument('--attention_mask', type=str, default=None,
                                  choices=[None, 'separate', 'query-side', 'no-query'],
                                  help='how to generate attention for query/doc')
+        self.parser.add_argument('--retrieval_aggregation_method', type=str, default='all-avg-max',
+                                 choices=['all-avg-max', 'all-max-all'], help='how to generate a single score for retrieval')
         self.parser.add_argument('--query_in_decoder', type=str, default='no', choices=['no', 'all'],
                                  help='use query at the beginning of the decoder')
         self.parser.add_argument('--num_keep_ctx_in_decoder', type=int, default=0, help='num of ctx used in decoder')

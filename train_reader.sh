@@ -14,15 +14,16 @@ metric=em
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_afterfirst_kl1_tau0001
+name=nq_reader_base_v11lm_separate_layer6_continue_tok_kl1_tau0001
 init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
 n_layer_two_tower=6
-layer_for_retrieval=after-first
+layer_for_retrieval=first
 num_keep_ctx_in_decoder=0
 keep_ctx_in_decoder_with_head=3
 keep_ctx_in_decoder_head_tau=0.001
 head_weights_norm_func=softmax
 encoder_decoder_kl_ratio=1.0
+retrieval_aggregation_method=all-max-all
 attention_mask=separate
 query_in_decoder=no
 
@@ -73,6 +74,7 @@ python ${prefix} train_reader.py \
   --keep_ctx_in_decoder_head_tau ${keep_ctx_in_decoder_head_tau} \
   --head_weights_norm_func ${head_weights_norm_func} \
   --encoder_decoder_kl_ratio ${encoder_decoder_kl_ratio} \
+  --retrieval_aggregation_method ${retrieval_aggregation_method} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
   --total_step 1001 \
