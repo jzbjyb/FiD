@@ -1,4 +1,4 @@
-from typing import List, Tuple, Dict, Callable
+from typing import List, Tuple, Dict, Callable, Union, Set, Any
 import argparse
 import json
 import os
@@ -23,30 +23,46 @@ logging.basicConfig(level=logging.DEBUG)
 class BEIRDataset:
   def __init__(self, root_dir: str, name: str):
     self.name = name
-    self.qid2answer: Dict[str, str] = self.load_query(os.path.join(root_dir, 'queries.jsonl'))
+    self.qid2answer: Dict[str, Any] = self.load_query(os.path.join(root_dir, 'queries.jsonl'))
 
-  def get_answer_scifact(cls, metadata: Dict):
+  @classmethod
+  def get_answer_scifact(cls, metadata: Dict) -> List[str]:
     labels: List[str] = []
     for did, sents in metadata.items():
       for sent in sents:
         labels.append(sent['label'])
     if len(labels) == 0:
-      return 'uncertain'
-    return labels[0].lower()
+      return ['uncertain']
+    return [labels[0].lower()]
 
-  def get_answer_techqa(cls, metadata: Dict):
-    return metadata['answer']
+  @classmethod
+  def get_answer_techqa(cls, metadata: Dict) -> List[str]:
+    return [metadata['answer']]
 
-  def get_answer_sciq(cls, metadata: Dict):
-    return metadata['answer']
+  @classmethod
+  def get_answer_sciq(cls, metadata: Dict) -> List[str]:
+    return [metadata['answer']]
+
+  @classmethod
+  def get_answer_bioasq(cls, metadata: Dict) -> List[List[str]]:
+    if metadata['type'] == 'yesno':
+      return [[metadata['answer']]]
+    elif metadata['type'] in {'list', 'factoid'}:
+      return metadata['answer']
+    elif metadata['type'] == 'summary':
+      return metadata['answer']
+    else:
+      raise NotImplementedError
 
   def load_query(self, filename: str):
-    qid2answer: Dict[str, str] = {}
+    qid2answer: Dict[str, Any] = {}
     with open(filename, 'r') as fin:
       for l in fin:
         l = json.loads(l)
         id, text, metadata = l['_id'], l['text'], l['metadata']
         ans = getattr(self, f'get_answer_{self.name}')(metadata)
+        if ans is None:
+          continue
         qid2answer[id] = ans
     return qid2answer
 
@@ -97,6 +113,7 @@ def eval(beir_dir: str, ret_file: str, topks: List[int] = [1, 5, 10, 100]):
 
 def convert_beir_to_fid_format(beir_dir: str, out_dir: str, dataset_name: str, splits: List[str], topk: int = 100):
   bert_data = BEIRDataset(beir_dir, name=dataset_name)
+  clean_text = lambda x: '' if x is None else x.replace('\n', ' ').replace('\t', ' ')
 
   # build index
   hostname = 'localhost'
@@ -120,23 +137,25 @@ def convert_beir_to_fid_format(beir_dir: str, out_dir: str, dataset_name: str, s
     # output
     os.makedirs(out_dir, exist_ok=True)
     if split_ind == 0:
-      with open(os.path.join(out_dir, 'psgs.tsv'), 'w') as fout:
+      with open(os.path.join(out_dir, 'psgs.tsv'), 'w') as fout, \
+           open(os.path.join(out_dir, 'line2docid.tsv'), 'w') as l2dfout:
         fout.write('id\ttext\ttitle\n')
-        for did in corpus:
-          title = corpus[did].get('title')
-          text = corpus[did].get('text')
+        for lid, did in enumerate(corpus):
+          title = clean_text(corpus[did].get('title'))
+          text = clean_text(corpus[did].get('text'))
           fout.write(f'{did}\t{text}\t{title}\n')
+          l2dfout.write(f'{lid}\t{did}\n')
 
     examples: List[Dict] = []
     for qid, scores_dict in results.items():
       answer = bert_data.qid2answer[qid]
-      query = queries[qid]
-      example = {'question': query, 'answers': [answer], 'ctxs': []}
+      query = clean_text(queries[qid])
+      example = {'question': query, 'id': qid, 'answers': answer, 'ctxs': []}
       scores = sorted(scores_dict.items(), key=lambda item: item[1], reverse=True)[:topk]
       for rank in range(len(scores)):
         did = scores[rank][0]
-        title = corpus[did].get('title')
-        text = corpus[did].get('text')
+        title = clean_text(corpus[did].get('title'))
+        text = clean_text(corpus[did].get('text'))
         example['ctxs'].append({'id': did, 'title': title, 'text': text})
       examples.append(example)
     os.makedirs(out_dir, exist_ok=True)
@@ -262,6 +281,138 @@ def convert_quasar_to_beir_format(quasar_dir: str, beir_dir: str):
   print(f'#docs {len(text2did)}')
 
 
+def convert_bioasq_to_beir_format(bioasq_dir: str, beir_dir: str, sub_sample: int = None):
+  def extract_answer(question: Dict) -> Union[List[List[str]], str]:
+    if question['type'] == 'factoid':
+      ans = question['exact_answer']
+      if type(ans) is list and type(ans[0]) is str:  # multi alias of a single entity
+        ans = [ans]
+      elif type(ans) is list and type(ans[0]) is list and type(ans[0][0]) is str:  # multi alias of multi entities
+        pass
+      else:
+        raise ValueError
+      return ans
+    elif question['type'] == 'list':
+      ans = question['exact_answer']
+      assert type(ans) is list and type(ans[0]) is list and type(ans[0][0]) is str
+      return ans
+    elif question['type'] == 'yesno':
+      ans = question['exact_answer'].lower()
+      assert type(ans) is str and ans in {'yes', 'no'}
+      return ans
+    elif question['type'] == 'summary':
+      ans = question['ideal_answer']
+      assert 'exact_answer' not in question
+      assert type(ans) is list and type(ans[0]) is str, ans
+      return [ans]
+    else:
+      raise NotImplementedError
+
+  # load all docs
+  did2dict: Dict[str, Dict] = {}
+  seen_dids: Set[str] = set()
+  doc_duplicates = 0
+  with open(os.path.join(bioasq_dir, 'allMeSH_2020.json'), 'rb') as fin:
+    _ = fin.readline()  # skip the first line which has no article
+    for line_id, l in tqdm(enumerate(fin)):
+      l = l.decode('ISO-8859-1')
+      l = l.rstrip('\n')
+      if l.endswith('},'):
+        l = l.rstrip(',')
+      elif l.endswith('}]}'):
+        l = l[:-2]
+      else:
+        raise ValueError
+      l = json.loads(l)
+      title = l['title']
+      abs = l['abstractText']
+      did = l['pmid']
+      if did in seen_dids:
+        print(f'duplicate doc id {did}')
+        doc_duplicates += 1
+        continue
+      seen_dids.add(did)
+      did2dict[did] = {'_id': did, 'title': title, 'text': abs}
+  with open(os.path.join(bioasq_dir, 'BioASQ-Task8b-Manual-Fixes.tsv'), 'r') as fin:
+    for l in fin:
+      did, title, abs = l.rstrip('\n').split('\t')
+      if did in seen_dids:
+        print(f'duplicate doc id {did}')
+        doc_duplicates += 1
+        continue
+      seen_dids.add(did)
+      did2dict[did] = {'_id': did, 'title': title, 'text': abs}
+  all_dids = set(did2dict.keys())
+  print(f'#docs {len(all_dids)}, with {doc_duplicates} duplicates already removed')
+
+  qid2dict: Dict[str, Dict] = {}
+  qid = 0
+  split2qiddid: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+  split2stat: Dict[str, Dict] = defaultdict(lambda: {
+    '#query': 0, '#rel-doc-per-query': [], 'type2count': defaultdict(lambda: 0)})
+  all_rel_dids: Set[str] = set()
+  covered_rel_dids: Set[str] = set()
+  seen_query_ids: Set[str] = set()
+  seen_queries: Set[str] = set()
+  query_duplicates = query_without_rel = 0
+  for files, nsplit in [(['training8b.json'], 'train'),
+                        ([f'Task8BGoldenEnriched/8B{i + 1}_golden.json' for i in range(5)], 'test')]:
+    for file in files:
+      file = os.path.join(bioasq_dir, file)
+      with open(file, 'r') as fin:
+        questions = json.load(fin)['questions']
+        for question in questions:
+          raw_id = question['id']
+          assert '_' not in raw_id
+          assert raw_id not in seen_query_ids
+          seen_query_ids.add(raw_id)
+          ans_type = question['type']
+          assert ans_type in {'factoid', 'list', 'summary', 'yesno'}
+          query = question['body']
+          if query.lower() in seen_queries:
+            print(f'duplicate queries "{query}" in file: {file}')
+            query_duplicates += 1
+          else:
+            seen_queries.add(query.lower())
+          rel_docs: List[str] = []
+          for d in question['documents']:
+            did = d.rsplit('/', 1)[1]
+            all_rel_dids.add(did)
+            if did not in did2dict:
+              continue
+            rel_docs.append(did)
+            covered_rel_dids.add(did)
+          if len(rel_docs) <= 0:
+            query_without_rel += 1
+            continue
+          answers = extract_answer(question)
+          while str(qid) in did2dict or str(qid) in qid2dict:
+            qid += 1
+          qid2dict[str(qid)] = {'_id': str(qid), 'text': query, 'metadata':
+            {'raw_id': raw_id, 'type': ans_type, 'answer': answers}}
+          split2stat[nsplit]['#query'] += 1
+          split2stat[nsplit]['type2count'][ans_type] += 1
+          for did in rel_docs:
+            split2qiddid[nsplit].append((str(qid), did))
+          split2stat[nsplit]['#rel-doc-per-query'].append(len(rel_docs))
+  print(f'#duplcate queris {query_duplicates} #queries without relevant docs {query_without_rel}')
+  print(f'#uncovered relevant docs {len(all_rel_dids - all_dids)}')
+  for split, stat in split2stat.items():
+    print(split, {k: np.mean(v) if type(v) is list else v for k, v in stat.items()})
+
+  if sub_sample:
+    assert sub_sample >= len(covered_rel_dids)
+    all_unrel_dids = all_dids - covered_rel_dids
+    num_keep_unrel_dids = min(sub_sample - len(covered_rel_dids), len(all_unrel_dids))
+    subset_unrel_dids = set(np.random.choice(list(all_unrel_dids), num_keep_unrel_dids, replace=False))
+    remain_dids = subset_unrel_dids | covered_rel_dids
+    print(f'final #docs {len(remain_dids)}')
+    did2dict = {k: v for k, v in did2dict.items() if k in remain_dids}
+
+  # save
+  save_beir_format(beir_dir, qid2dict, did2dict, split2qiddid)
+
+
 def eval_answer(ret_file: str, sort: bool = False, shuffle: bool = False, topk: int = 100, key_func: Callable = lambda x: x['score']):
   #score_len_li: List[Tuple[float, int]] = []
   with open(ret_file, 'r') as fin:
@@ -330,10 +481,60 @@ def create_whole_test(data_dir: str, out_num: int = None, topk: int = 100):
     json.dump(new_data, fout, indent=2)
 
 
+def convert_fid_to_rag_format(fid_dir: str,
+                              rag_dir: str,
+                              splits: List[str] = ['train', 'dev', 'test'],
+                              entity_sep: str = '\t\t',
+                              alias_sep: str = '\t'):
+  clean_text = lambda x: x.replace('\t', ' ').replace('\n', ' ')
+  num_entities: List[int] = []
+  num_alias: List[int] = []
+  os.makedirs(rag_dir, exist_ok=True)
+  for split in splits:
+    with open(os.path.join(fid_dir, f'{split}.json'), 'r') as fin, \
+         open(os.path.join(rag_dir, f'{split}.id'), 'w') as ifout, \
+         open(os.path.join(rag_dir, f'{split}.source'), 'w') as sfout, \
+         open(os.path.join(rag_dir, f'{split}.target'), 'w') as tfout:
+      data = json.load(fin)
+      for example in data:
+        qid = example['id']
+        question = clean_text(example['question'])
+        answers = example['answers']
+        num_entities.append(len(answers))
+        for e in answers:
+          num_alias.append(len(e))
+        answers = entity_sep.join([alias_sep.join([clean_text(a) for a in e]) for e in answers])
+        ifout.write(f'{qid}\n')
+        sfout.write(f'{question}\n')
+        tfout.write(f'{answers}\n')
+  print(f'avg #entities per answer {np.mean(num_entities)}, avg #alias per entity {np.mean(num_alias)}')
+
+
+def filter_beir_query(beir_dir: str, out_dir: str, filter_func: Callable, splits: List[str] = ['train', 'dev', 'test']):
+  os.makedirs(out_dir, exist_ok=True)
+  kept_ids: Set[str] = set()
+  with open(os.path.join(beir_dir, 'queries.jsonl'), 'r') as fin, \
+       open(os.path.join(out_dir, 'queries.jsonl'), 'w') as fout:
+    for l in fin:
+      id = json.loads(l)['_id']
+      if filter_func(json.loads(l)):
+        fout.write(l)
+        kept_ids.add(id)
+  os.makedirs(os.path.join(out_dir, 'qrels'), exist_ok=True)
+  for split in splits:
+    with open(os.path.join(beir_dir, 'qrels', f'{split}.tsv'), 'r') as fin, \
+         open(os.path.join(out_dir, 'qrels', f'{split}.tsv'), 'w') as fout:
+      fout.write(fin.readline())  # tsv head
+      for l in fin:
+        if l.strip().split('\t', 1)[0] in kept_ids:
+          fout.write(l)
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
     'convert_sciq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
+    'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format',
     'aggregate_ctxs', 'eval', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
@@ -348,7 +549,7 @@ if __name__ == '__main__':
   elif args.task == 'convert_beir_to_fid_format':
     beir_dir = args.inp[0]
     out_dir = args.out[0]
-    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='techqa', splits=['dev', 'train'])
+    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='bioasq', splits=['test', 'train'])
 
   elif args.task == 'eval':
     beir_dir, ret_file = args.inp
@@ -368,6 +569,23 @@ if __name__ == '__main__':
     quasar_dir = args.inp[0]
     beir_dir = args.out[0]
     convert_quasar_to_beir_format(quasar_dir, beir_dir)
+
+  elif args.task == 'convert_bioasq_to_beir_format':
+    bioasq_dir = args.inp[0]
+    beir_dir = args.out[0]
+    convert_bioasq_to_beir_format(bioasq_dir, beir_dir, sub_sample=500000)
+
+  elif args.task == 'convert_fid_to_rag_format':
+    fid_dir = args.inp[0]
+    rag_dir = args.out[0]
+    convert_fid_to_rag_format(fid_dir, rag_dir, splits=['train', 'test'])
+
+  elif args.task == 'filter_beir_query':
+    # TODO: ln corpus manually
+    beir_dir = args.inp[0]
+    out_dir = args.out[0]
+    bioasq_remove_summary = lambda example: example['metadata']['type'] != 'summary'
+    filter_beir_query(beir_dir, out_dir, filter_func=bioasq_remove_summary, splits=['train', 'test'])
 
   elif args.task == 'eval_answer':
     key, method = args.other[:2]
