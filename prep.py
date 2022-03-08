@@ -485,12 +485,17 @@ def convert_fid_to_rag_format(fid_dir: str,
                               rag_dir: str,
                               splits: List[str] = ['train', 'dev', 'test'],
                               entity_sep: str = '\t\t',
-                              alias_sep: str = '\t'):
+                              alias_sep: str = '\t',
+                              with_context: str = None,
+                              beir_dir: str = None):
+  assert with_context in {None, 'all_relevant'}
   clean_text = lambda x: x.replace('\t', ' ').replace('\n', ' ')
   num_entities: List[int] = []
   num_alias: List[int] = []
   os.makedirs(rag_dir, exist_ok=True)
   for split in splits:
+    if beir_dir:
+      corpus, queries, qrels = GenericDataLoader(data_folder=beir_dir).load(split=split)
     with open(os.path.join(fid_dir, f'{split}.json'), 'r') as fin, \
          open(os.path.join(rag_dir, f'{split}.id'), 'w') as ifout, \
          open(os.path.join(rag_dir, f'{split}.source'), 'w') as sfout, \
@@ -504,9 +509,18 @@ def convert_fid_to_rag_format(fid_dir: str,
         for e in answers:
           num_alias.append(len(e))
         answers = entity_sep.join([alias_sep.join([clean_text(a) for a in e]) for e in answers])
-        ifout.write(f'{qid}\n')
-        sfout.write(f'{question}\n')
-        tfout.write(f'{answers}\n')
+        if with_context is None:  # only question
+          ifout.write(f'{qid}\n')
+          sfout.write(f'{question}\n')
+          tfout.write(f'{answers}\n')
+        elif with_context == 'all_relevant':  # add context of all relevant docs
+          for did in qrels[qid]:
+            title = clean_text(corpus[did].get('title'))
+            text = clean_text(corpus[did].get('text'))
+            ifout.write(f'{qid}\n')
+            sfout.write(f'{question}\t{title}\t{text}\n')
+            tfout.write(f'{answers}\n')
+
   print(f'avg #entities per answer {np.mean(num_entities)}, avg #alias per entity {np.mean(num_alias)}')
 
 
@@ -576,9 +590,10 @@ if __name__ == '__main__':
     convert_bioasq_to_beir_format(bioasq_dir, beir_dir, sub_sample=500000)
 
   elif args.task == 'convert_fid_to_rag_format':
-    fid_dir = args.inp[0]
+    fid_dir, beir_dir = args.inp
     rag_dir = args.out[0]
-    convert_fid_to_rag_format(fid_dir, rag_dir, splits=['train', 'test'])
+    convert_fid_to_rag_format(fid_dir, rag_dir, splits=['train', 'test'],
+                              with_context='all_relevant', beir_dir=beir_dir)
 
   elif args.task == 'filter_beir_query':
     # TODO: ln corpus manually
