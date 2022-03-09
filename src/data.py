@@ -37,7 +37,12 @@ class Dataset(torch.utils.data.Dataset):
             target = example['target']
             return target + (' </s>' if add_eos else '')
         elif 'answers' in example:
-            return random.choice(example['answers']) +  (' </s>' if add_eos else '')
+            assert type(example['answers']) is list
+            if type(example['answers'][0]) is list:  # has alias
+                ans_li = [a[0] for a in example['answers']]  # use the first alias as target
+            else:
+                ans_li = example['answers']
+            return random.choice(ans_li) + (' </s>' if add_eos else '')
         else:
             return None
 

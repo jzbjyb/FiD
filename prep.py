@@ -16,6 +16,7 @@ from beir.datasets.data_loader import GenericDataLoader
 from beir.retrieval.evaluation import EvaluateRetrieval
 from beir.retrieval.search.lexical import BM25Search as BM25
 from passage_retrieval import validate
+from src.util import clean_text_for_tsv
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -53,6 +54,10 @@ class BEIRDataset:
       return metadata['answer']
     else:
       raise NotImplementedError
+
+  @classmethod
+  def get_answer_msmarcoqa(cls, metadata: Dict) -> List[str]:
+    return metadata['answer']
 
   def load_query(self, filename: str):
     qid2answer: Dict[str, Any] = {}
@@ -113,7 +118,6 @@ def eval(beir_dir: str, ret_file: str, topks: List[int] = [1, 5, 10, 100]):
 
 def convert_beir_to_fid_format(beir_dir: str, out_dir: str, dataset_name: str, splits: List[str], topk: int = 100):
   bert_data = BEIRDataset(beir_dir, name=dataset_name)
-  clean_text = lambda x: '' if x is None else x.replace('\n', ' ').replace('\t', ' ')
 
   # build index
   hostname = 'localhost'
@@ -141,21 +145,21 @@ def convert_beir_to_fid_format(beir_dir: str, out_dir: str, dataset_name: str, s
            open(os.path.join(out_dir, 'line2docid.tsv'), 'w') as l2dfout:
         fout.write('id\ttext\ttitle\n')
         for lid, did in enumerate(corpus):
-          title = clean_text(corpus[did].get('title'))
-          text = clean_text(corpus[did].get('text'))
+          title = clean_text_for_tsv(corpus[did].get('title'))
+          text = clean_text_for_tsv(corpus[did].get('text'))
           fout.write(f'{did}\t{text}\t{title}\n')
           l2dfout.write(f'{lid}\t{did}\n')
 
     examples: List[Dict] = []
     for qid, scores_dict in results.items():
       answer = bert_data.qid2answer[qid]
-      query = clean_text(queries[qid])
+      query = clean_text_for_tsv(queries[qid])
       example = {'question': query, 'id': qid, 'answers': answer, 'ctxs': []}
       scores = sorted(scores_dict.items(), key=lambda item: item[1], reverse=True)[:topk]
       for rank in range(len(scores)):
         did = scores[rank][0]
-        title = clean_text(corpus[did].get('title'))
-        text = clean_text(corpus[did].get('text'))
+        title = clean_text_for_tsv(corpus[did].get('title'))
+        text = clean_text_for_tsv(corpus[did].get('text'))
         example['ctxs'].append({'id': did, 'title': title, 'text': text})
       examples.append(example)
     os.makedirs(out_dir, exist_ok=True)
@@ -279,6 +283,67 @@ def convert_quasar_to_beir_format(quasar_dir: str, beir_dir: str):
             split2qiddid[nsplit].append((qid, did))  # TODO: this annotation is noisy and also not complete
   save_beir_format(beir_dir, qid2dict, did2dict, split2qiddid)
   print(f'#docs {len(text2did)}')
+
+
+def convert_msmarcoqa_to_beir_fid_format(msmarcoqa_dir: str,
+                                         beir_dir: str,
+                                         fid_dir: str,
+                                         filter_func: Callable = None):
+  qid2dict: Dict[str, Dict] = {}
+  did2dict: Dict[str, Dict] = {}
+  url2count: Dict[str, int] = defaultdict(lambda: 0)
+  cum_did = 0
+  split2qiddid: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+  os.makedirs(fid_dir, exist_ok=True)
+  for split, nsplit in [('train', 'train'), ('dev', 'dev')]:
+    with open(os.path.join(msmarcoqa_dir, f'{split}_v2.1.jsonl'), 'r') as fin:
+      fid_examples: List[Dict] = []
+      for l in tqdm(fin):
+        example = json.loads(l)
+        if filter_func is not None and filter_func(example):  # skip examples satisfying certain conditions
+          continue
+        query = example['query']
+        answers = example['answers']
+        assert type(example['query_id']) is int
+        query_id = str(example['query_id'])
+        query_type = example['query_type']
+        qid2dict[query_id] = {'_id': query_id, 'text': query, 'metadata': {'answer': answers, 'type': query_type}}
+        ctxs: List[Dict] = []
+        for passage in example['passages']:
+          url = passage['url'].strip()
+          text = passage['passage_text'].strip()
+          select = passage['is_selected']
+          url2count[url] += 1
+          while str(cum_did) in qid2dict or str(cum_did) in did2dict:
+            cum_did += 1
+          did = str(cum_did)
+          did2dict[did] = {'_id': did, 'title': '', 'text': text, 'select': select, 'url': url}
+          ctxs.append({'id': did, 'title': '', 'text': text, 'select': select, 'url': url})
+          if select:
+            split2qiddid[nsplit].append((query_id, did))  # TODO: this annotation is not complete
+        fid_examples.append({
+          'question': query,
+          'id': query_id,
+          'answers': answers,
+          'ctxs': ctxs
+        })
+    with open(os.path.join(fid_dir, f'{nsplit}.json'), 'w') as fout:
+      json.dump(fid_examples, fout, indent=2)
+    with open(os.path.join(fid_dir, f'{nsplit}.1000.json'), 'w') as fout:
+      fid_examples = [fid_examples[i] for i in np.random.choice(len(fid_examples), min(1000, len(fid_examples)), replace=False)]
+      json.dump(fid_examples, fout, indent=2)
+
+  with open(os.path.join(fid_dir, 'psgs.tsv'), 'w') as fout, \
+       open(os.path.join(fid_dir, 'line2docid.tsv'), 'w') as l2dfout:
+    fout.write('id\ttext\ttitle\n')
+    for lid, (did, doc) in enumerate(did2dict.items()):
+      title = clean_text_for_tsv(doc['title'])
+      text = clean_text_for_tsv(doc['text'])
+      fout.write(f'{did}\t{text}\t{title}\n')
+      l2dfout.write(f'{lid}\t{did}\n')
+
+  save_beir_format(beir_dir, qid2dict, did2dict, split2qiddid)
+  print(f'#quries {len(qid2dict)}, #docs {len(did2dict)}')
 
 
 def convert_bioasq_to_beir_format(bioasq_dir: str, beir_dir: str, sub_sample: int = None):
@@ -489,7 +554,6 @@ def convert_fid_to_rag_format(fid_dir: str,
                               with_context: str = None,
                               beir_dir: str = None):
   assert with_context in {None, 'all_relevant'}
-  clean_text = lambda x: x.replace('\t', ' ').replace('\n', ' ')
   num_entities: List[int] = []
   num_alias: List[int] = []
   os.makedirs(rag_dir, exist_ok=True)
@@ -503,20 +567,20 @@ def convert_fid_to_rag_format(fid_dir: str,
       data = json.load(fin)
       for example in data:
         qid = example['id']
-        question = clean_text(example['question'])
+        question = clean_text_for_tsv(example['question'])
         answers = example['answers']
         num_entities.append(len(answers))
         for e in answers:
           num_alias.append(len(e))
-        answers = entity_sep.join([alias_sep.join([clean_text(a) for a in e]) for e in answers])
+        answers = entity_sep.join([alias_sep.join([clean_text_for_tsv(a) for a in e]) for e in answers])
         if with_context is None:  # only question
           ifout.write(f'{qid}\n')
           sfout.write(f'{question}\n')
           tfout.write(f'{answers}\n')
         elif with_context == 'all_relevant':  # add context of all relevant docs
           for did in qrels[qid]:
-            title = clean_text(corpus[did].get('title'))
-            text = clean_text(corpus[did].get('text'))
+            title = clean_text_for_tsv(corpus[did].get('title'))
+            text = clean_text_for_tsv(corpus[did].get('text'))
             ifout.write(f'{qid}\n')
             sfout.write(f'{question}\t{title}\t{text}\n')
             tfout.write(f'{answers}\n')
@@ -548,6 +612,7 @@ if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
     'convert_sciq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
+    'convert_msmarcoqa_to_beir_fid_format',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format',
     'aggregate_ctxs', 'eval', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
@@ -563,7 +628,7 @@ if __name__ == '__main__':
   elif args.task == 'convert_beir_to_fid_format':
     beir_dir = args.inp[0]
     out_dir = args.out[0]
-    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='bioasq', splits=['test', 'train'])
+    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='msmarcoqa', splits=['dev', 'train'])
 
   elif args.task == 'eval':
     beir_dir, ret_file = args.inp
@@ -583,6 +648,24 @@ if __name__ == '__main__':
     quasar_dir = args.inp[0]
     beir_dir = args.out[0]
     convert_quasar_to_beir_format(quasar_dir, beir_dir)
+
+  elif args.task == 'convert_msmarcoqa_to_beir_fid_format':
+    msmarcoqa_dir = args.inp[0]
+    beir_dir, fid_dir = args.out
+    def has_ans_no_desc_with10_50char_filter_func(example: Dict):
+      if len(example['answers']) == 0 and example['answers'][0].strip() == 'No Answer Present.':
+        return True
+      if example['query_type'] == 'DESCRIPTION':
+        return True
+      if len(example['passages']) != 10:
+        return True
+      if np.sum([passage['is_selected'] for passage in example['passages']]) == 0:
+        return True
+      if len(example['answers'][0]) > 50:
+        return True
+      return False
+    convert_msmarcoqa_to_beir_fid_format(
+      msmarcoqa_dir, beir_dir, fid_dir, filter_func=has_ans_no_desc_with10_50char_filter_func)
 
   elif args.task == 'convert_bioasq_to_beir_format':
     bioasq_dir = args.inp[0]

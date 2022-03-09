@@ -84,6 +84,8 @@ def calculate_matches(data: List, workers_num: int):
 def check_answer(example, tokenizer) -> List[bool]:
     """Search through all the top docs to see if they have any of the answers."""
     answers = example['answers']
+    if len(answers) > 0 and type(answers[0]) is list:  # has alias
+      answers = [a for e in answers for a in e]  # flatten
     ctxs = example['ctxs']
 
     hits = []
@@ -141,10 +143,14 @@ def exact_match_score(prediction, ground_truth):
     return normalize_answer(prediction) == normalize_answer(ground_truth)
 
 def ems(prediction, ground_truths):
-    return max([exact_match_score(prediction, gt) for gt in ground_truths])
+  if len(ground_truths) > 0 and type(ground_truths[0]) is list:  # has alias
+    ground_truths = [a for e in ground_truths for a in e]
+  return max([exact_match_score(prediction, gt) for gt in ground_truths])
 
 def rougels(prediction, ground_truths):
-    return max([rouge_inst.score(gt, prediction)['rougeL'][2] for gt in ground_truths])
+  if len(ground_truths) > 0 and type(ground_truths[0]) is list:  # has alias
+    ground_truths = [a for e in ground_truths for a in e]
+  return max([rouge_inst.score(gt, prediction)['rougeL'][2] for gt in ground_truths])
 
 ####################################################
 ########        RETRIEVER EVALUATION        ########

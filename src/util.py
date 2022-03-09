@@ -19,6 +19,8 @@ import wandb
 
 logger = logging.getLogger(__name__)
 
+clean_text_for_tsv = lambda x: '' if x is None else x.replace('\n', ' ').replace('\t', ' ')
+
 class WandbLogger:
   _wandb_logger = None
   _step = None
