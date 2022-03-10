@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
 
-model=trained_reader/nq_reader_base_v11lm_separate_layer6_continue/checkpoint/latest
+model=trained_reader/t5_base_v11lm/checkpoint/latest
 #model=pretrained_models/nq_reader_base
+
 #data=open_domain_data/NQ/test.json
 #ckpt_dir=${model}.allhead_softmax.nq_test
+#text_maxlength=250
+#per_gpu_batch_size=12
+
 #data=open_domain_data/SciQ/test.json
 #ckpt_dir=${model}.allhead_softmax.sciq_test
+#text_maxlength=250
+#per_gpu_batch_size=12
+
 #data=open_domain_data/quasar_s/dev.json
 #ckpt_dir=${model}.allhead_softmax.quasars_dev
-#data=open_domain_data/bioasq_500k.nosummary/test.json
-#ckpt_dir=${model}.allhead_softmax.bioasq_test
-data=open_domain_data/msmarco_qa/dev.1000.json
-ckpt_dir=${model}.allhead_softmax.msmarcoqa_dev
+#text_maxlength=250
+#per_gpu_batch_size=12
 
-n_context=10
+data=open_domain_data/bioasq_500k.nosummary/test.json
+ckpt_dir=${model}.allhead_softmax.bioasq_test
+text_maxlength=1024
+per_gpu_batch_size=1
+
+#data=open_domain_data/msmarco_qa/dev.1000.json
+#ckpt_dir=${model}.allhead_softmax.msmarcoqa_dev
+#text_maxlength=250
+#per_gpu_batch_size=12
+
+n_context=100
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
 attention_mask=separate
@@ -31,7 +46,8 @@ if (( ${num_gpu} == 1 )); then
 elif (( ${num_gpu} <= ${MAX_NUM_GPU_PER_NODE} )); then
   echo 'single-node'
   export NGPU=${num_gpu}
-  prefix="-m torch.distributed.launch --nproc_per_node=${num_gpu}"
+  random_port=$(shuf -i 10000-65000 -n 1)
+  prefix="-m torch.distributed.launch --nproc_per_node=${num_gpu} --master_port=${random_port}"
 else
   echo 'multi-node'
   prefix=""
@@ -41,9 +57,9 @@ fi
 python ${prefix} test_reader.py \
   --model_path ${model} \
   --eval_data ${data} \
-  --per_gpu_batch_size 12 \
+  --per_gpu_batch_size ${per_gpu_batch_size} \
   --n_context ${n_context} \
-  --text_maxlength 250 \
+  --text_maxlength ${text_maxlength} \
   --answer_maxlength ${answer_maxlength} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \

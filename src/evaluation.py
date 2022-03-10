@@ -12,7 +12,7 @@ import string
 import unicodedata
 from functools import partial
 from multiprocessing import Pool as ProcessPool
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Union
 import numpy as np
 from rouge_score import rouge_scorer
 rouge_inst = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
@@ -142,14 +142,19 @@ def normalize_answer(s):
 def exact_match_score(prediction, ground_truth):
     return normalize_answer(prediction) == normalize_answer(ground_truth)
 
-def ems(prediction, ground_truths):
+def check_type(ground_truths: Union[str, List, List[List]]) -> List[str]:
+  if type(ground_truths) is str:
+    ground_truths = [ground_truths]
   if len(ground_truths) > 0 and type(ground_truths[0]) is list:  # has alias
     ground_truths = [a for e in ground_truths for a in e]
+  return ground_truths
+
+def ems(prediction, ground_truths: Union[str, List, List[List]]):
+  ground_truths = check_type(ground_truths)
   return max([exact_match_score(prediction, gt) for gt in ground_truths])
 
-def rougels(prediction, ground_truths):
-  if len(ground_truths) > 0 and type(ground_truths[0]) is list:  # has alias
-    ground_truths = [a for e in ground_truths for a in e]
+def rougels(prediction, ground_truths: Union[str, List, List[List]]):
+  ground_truths = check_type(ground_truths)
   return max([rouge_inst.score(gt, prediction)['rougeL'][2] for gt in ground_truths])
 
 ####################################################

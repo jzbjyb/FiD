@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 
-inp=$1
-other="${@:2}"
+use_annotation=$1
 
-python prep.py --task eval_answer --inp ${inp} --other ${other}
+if [[ ${use_annotation} == 'true' ]]; then
+  ret_file=$2
+  beir_dir=$3
+  split=$4
+  other="${@:5}"
+  python prep.py --task eval_answer --inp ${ret_file} ${beir_dir} ${split} --other ${other}
+else
+  ret_file=$2
+  other="${@:3}"
+  python prep.py --task eval_answer --inp ${ret_file} --other ${other}
+fi

@@ -730,6 +730,9 @@ class T5blockWrapper(torch.nn.Module):
             output = tuple(x if x.size() != 0 else None for x in output)
         else:
             output = self.module(hidden_states, attention_mask, position_bias, **kwargs)
+        if self.use_for_retrieval and (not self.training or self.collect_for_decoder):  # make the reg dynamic
+            reg_point = self.module.layer[0].SelfAttention
+            del reg_point.collect_for_retrieval
         return output
 
     def get_collected_for_retrieval(self):

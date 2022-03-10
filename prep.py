@@ -17,6 +17,7 @@ from beir.retrieval.evaluation import EvaluateRetrieval
 from beir.retrieval.search.lexical import BM25Search as BM25
 from passage_retrieval import validate
 from src.util import clean_text_for_tsv
+import src.evaluation
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -88,32 +89,6 @@ def aggregate_ctxs(json_files: List[str], out_file: str):
     fout.write(f'id\ttext\ttitle\n')
     for id, (title, text) in id2ctx.items():
       fout.write(f'{id}\t{text}\t{title}\n')
-
-
-def eval(beir_dir: str, ret_file: str, topks: List[int] = [1, 5, 10, 100]):
-  qid2dids: Dict[str, List[str]] = defaultdict(list)
-  ret = json.load(open(ret_file, 'r'))
-  for example in ret:
-    for d in example['ctxs']:
-      qid2dids[example['question']].append(d['id'])
-  corpus, queries, qrels = GenericDataLoader(data_folder=beir_dir).load(split='test')
-  qid2dids_gold: Dict[str, List[str]] = defaultdict(list)
-  for qid in qrels:
-    query = queries[qid]
-    qid2dids_gold[query].extend([did for did in qrels[qid]])
-    # print(qid, query, qid2dids_gold[query], corpus[qid2dids_gold[query][0]])
-    # input()
-
-  topk2has = defaultdict(list)
-  for qid in qid2dids:
-    for topk in topks:
-      preds = set(qid2dids[qid][:topk])
-      gold = set(qid2dids_gold[qid])
-      has = len(preds & gold) > 0
-      topk2has[topk].append(has)
-
-  for topk in topks:
-    print(topk, np.mean(topk2has[topk]))
 
 
 def convert_beir_to_fid_format(beir_dir: str, out_dir: str, dataset_name: str, splits: List[str], topk: int = 100):
@@ -478,8 +453,52 @@ def convert_bioasq_to_beir_format(bioasq_dir: str, beir_dir: str, sub_sample: in
   save_beir_format(beir_dir, qid2dict, did2dict, split2qiddid)
 
 
-def eval_answer(ret_file: str, sort: bool = False, shuffle: bool = False, topk: int = 100, key_func: Callable = lambda x: x['score']):
-  #score_len_li: List[Tuple[float, int]] = []
+def eval_retrieval(data: List[Dict], beir_dir: str, split: str = 'test', topks: List[int] = [1, 3, 5, 10, 100]):
+  use_qid = False
+  qid2dids: Dict[str, List[str]] = defaultdict(list)
+  for example in data:
+    qid = example['id'] if 'id' in example else example['question']
+    use_qid = True if 'id' in example else use_qid
+    for d in example['ctxs']:
+      qid2dids[qid].append(d['id'])
+  corpus, queries, qrels = GenericDataLoader(data_folder=beir_dir).load(split=split)
+  qid2dict: Dict[str, Dict] = {}
+  with open(os.path.join(beir_dir, 'queries.jsonl'), 'r') as fin:
+    for l in fin:
+      l = json.loads(l)
+      qid2dict[l['_id']] = l
+  qid2dids_gold: Dict[str, List[str]] = defaultdict(list)
+  qid2type: Dict[str, str] = {}
+  for qid in qrels:
+    qid = qid if use_qid else queries[qid]
+    qid2dids_gold[qid].extend([did for did in qrels[qid]])
+    qid2type[qid] = qid2dict[qid]['metadata']['type']
+  topk2has = defaultdict(list)
+  type2topk2has = defaultdict(lambda: defaultdict(list))
+  for qid in qid2dids:
+    for topk in topks:
+      preds = set(qid2dids[qid][:topk])
+      gold = set(qid2dids_gold[qid])
+      has = len(preds & gold) > 0
+      topk2has[topk].append(has)
+      type2topk2has[qid2type[qid]][topk].append(has)
+
+  print(f'use qid {use_qid}')
+  for topk in topks:
+    print(topk, np.mean(topk2has[topk]), sep='\t')
+  for qtype in type2topk2has:
+    print(qtype)
+    for topk in topks:
+      print(topk, np.mean(type2topk2has[qtype][topk]), sep='\t')
+
+
+def eval_answer(ret_file: str,
+                beir_dir: str = None,
+                split: str = 'test',
+                sort: bool = False,
+                shuffle: bool = False,
+                topk: int = 100,
+                key_func: Callable = lambda x: x['score']):
   with open(ret_file, 'r') as fin:
     data = json.load(fin)
     # aggregate ctx of the same query
@@ -491,15 +510,15 @@ def eval_answer(ret_file: str, sort: bool = False, shuffle: bool = False, topk: 
       query2example[example['question']]['ctxs'].extend(example['ctxs'])
     data = list(query2example.values())
     for example in data:
-      #for ctx in example['ctxs']:
-      #  score_len_li.append((float(key_func(ctx)), len(ctx['text'])))
       if sort:
         example['ctxs'] = sorted(example['ctxs'], key=lambda x: float(key_func(x)), reverse=True)
       if shuffle:
         random.shuffle(example['ctxs'])
       example['ctxs'] = example['ctxs'][:topk]
-    #print('score length correlation', scipy.stats.pearsonr(*list(zip(*score_len_li))))
-    validate(data, 32)
+    if beir_dir is not None:
+      eval_retrieval(data, beir_dir, split=split)
+    else:
+      validate(data, 32)
 
 
 def eval_variance(ret_file: str, key_func: Callable = lambda x: x['score']):
@@ -608,13 +627,39 @@ def filter_beir_query(beir_dir: str, out_dir: str, filter_func: Callable, splits
           fout.write(l)
 
 
+def eval_qa(pred_file: str, gold_file_beir: str, metric: str = 'src.evaluation.ems'):
+  qid2pred: Dict[str, str] = {}
+  with open(pred_file, 'r') as fin:
+    for l in fin:
+      qid, pred = l.rstrip('\n').split('\t')
+      assert qid not in qid2pred, 'duplicate qid'
+      qid2pred[qid] = pred
+  qid2dict: Dict[str, Dict] = {}
+  with open(gold_file_beir, 'r') as fin:
+    for l in fin:
+      l = json.loads(l)
+      qid2dict[l['_id']] = l
+  scores: List[Any] = []
+  type2scores: Dict[str, List[Any]] = defaultdict(list)
+  metric_func: Callable = eval(metric)
+  for qid, pred in qid2pred.items():
+    gold = qid2dict[qid]['metadata']['answer']
+    qtype = qid2dict[qid]['metadata']['type'] if 'type' in qid2dict[qid]['metadata'] else None
+    score = metric_func(pred, gold)
+    scores.append(score)
+    type2scores[qtype].append(score)
+  print(f'{np.mean(scores)}')
+  for qtype, scores in type2scores.items():
+    print(f'{qtype}\t{np.mean(scores)}')
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
     'convert_sciq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
-    'convert_msmarcoqa_to_beir_fid_format',
+    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format',
-    'aggregate_ctxs', 'eval', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
+    'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   parser.add_argument('--other', type=str, nargs='+', help='additional arguments')
@@ -629,10 +674,6 @@ if __name__ == '__main__':
     beir_dir = args.inp[0]
     out_dir = args.out[0]
     convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='msmarcoqa', splits=['dev', 'train'])
-
-  elif args.task == 'eval':
-    beir_dir, ret_file = args.inp
-    eval(beir_dir, ret_file)
 
   elif args.task == 'convert_sciq_to_beir_format':
     sciq_dir = args.inp[0]
@@ -696,38 +737,48 @@ if __name__ == '__main__':
     num_heads = 12
 
     ret_file = args.inp[0]
+    beir_dir = args.inp[1] if len(args.inp) > 1 else None
+    split = args.inp[2] if len(args.inp) > 2 else None
+
+    sort = False
+    shuffle = False
+    key_func = None
     if method == 'default':
-      eval_answer(ret_file, sort=False)
-      exit()
+      pass
     elif method == 'shuffle':
-      eval_answer(ret_file, shuffle=True)
-      exit()
+      shuffle = True
     elif method == 'raw':
-      eval_answer(ret_file, sort=True, key_func=lambda x: x[key])
-      exit()
+      sort = True
+      key_func = lambda x: x[key]
     elif method == 'avg':
-      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key]))
-      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][-1]))
+      eval_answer(ret_file, beir_dir=beir_dir, split=split, sort=True, key_func=lambda x: np.mean(x[key]))
+      eval_answer(ret_file, beir_dir=beir_dir, split=split, sort=True, key_func=lambda x: np.mean(x[key][-1]))
       exit()
     elif method == 'avg_head':
       for i in range(num_heads):
         print(f'head {i}')
-        eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][11][i]))
+        eval_answer(ret_file, beir_dir=beir_dir, split=split, sort=True, key_func=lambda x: np.mean(x[key][11][i]))
       exit()
     elif method == 'specific':
-      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][-1][index]))
-      exit()
+      sort = True
+      key_func = lambda x: np.mean(x[key][-1][index])
     elif method == 'flat':
-      eval_answer(ret_file, sort=True, key_func=lambda x: np.mean([b for a in x[key] for b in a][index]))
+      sort = True
+      key_func = lambda x: np.mean([b for a in x[key] for b in a][index])
+    else:
+      for l in range(12 - n_two_tower_layers):
+        if method == 'avg_layer':
+          eval_answer(ret_file, beir_dir=beir_dir, split=split, sort=True, key_func=lambda x: np.mean(x[key][l]))
+          continue
+        for i in range(num_heads):
+          print(f'layer {l}, head {i}')
+          eval_answer(ret_file, beir_dir=beir_dir, split=split, sort=True, key_func=lambda x: np.mean(x[key][l][i]))
       exit()
+    eval_answer(ret_file, beir_dir=beir_dir, split=split, sort=sort, key_func=key_func)
 
-    for l in range(12 - n_two_tower_layers):
-      if method == 'avg_layer':
-        eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][l]))
-        continue
-      for i in range(num_heads):
-        print(f'layer {l}, head {i}')
-        eval_answer(ret_file, sort=True, key_func=lambda x: np.mean(x[key][l][i]))
+  elif args.task == 'eval_qa':
+    pred_file, gold_file_beir = args.inp
+    eval_qa(pred_file, gold_file_beir)
 
   elif args.task == 'eval_variance':
     ret_file = args.inp[0]

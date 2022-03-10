@@ -11,6 +11,7 @@ import torch
 import sys
 import logging
 import json
+import contextlib
 from pathlib import Path
 import torch.distributed as dist
 from fairscale.optim.oss import OSS
@@ -20,6 +21,14 @@ import wandb
 logger = logging.getLogger(__name__)
 
 clean_text_for_tsv = lambda x: '' if x is None else x.replace('\n', ' ').replace('\t', ' ')
+
+@contextlib.contextmanager
+def open_file(path_to_file: str, mode: str = 'r'):
+    if path_to_file is None:
+      yield None
+    else:
+      with open(path_to_file, mode) as fin:
+        yield fin
 
 class WandbLogger:
   _wandb_logger = None
@@ -223,6 +232,7 @@ def weighted_average(x, count, opt):
 def write_output(glob_path, output_path):
     files = list(glob_path.glob('*.txt'))
     files.sort()
+    print(f'merge predictions from {len(files)} files')
     with open(output_path, 'w') as outfile:
         for path in files:
             with open(path, 'r') as f:

@@ -30,10 +30,9 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
         model.reset_score_storage() 
     total = 0
     exactmatch = []
-    if opt.write_results:
-        write_path = Path(opt.checkpoint_dir) / opt.name / 'test_results'
-        fw = open(write_path / ('%d.txt'%opt.global_rank), 'a')
-    with torch.no_grad():
+    write_path = (Path(opt.checkpoint_dir) / opt.name / 'test_results' / ('%d.txt' % opt.global_rank)) \
+      if opt.write_results else None
+    with src.util.open_file(write_path, 'a') as fw, torch.no_grad():
         for i, batch in tqdm(enumerate(dataloader), disable=not opt.is_main):
             (idx, labels, _, context_ids, context_mask, context_sep_mask) = batch
 
@@ -66,7 +65,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                     #score = src.evaluation.ems(queries[k].strip('question:').strip().lower(), [example['question'].strip().lower()])
                     exactmatch.append(score)
 
-                if opt.write_results:
+                if fw is not None:
                     fw.write(str(example['id']) + "\t" + ans + '\n')
                 if opt.write_crossattention_scores:
                     for j in range(context_ids.size(1)):
@@ -110,7 +109,7 @@ if __name__ == "__main__":
     src.slurm.init_signal_handler()
     opt.train_batch_size = opt.per_gpu_batch_size * max(1, opt.world_size)
 
-    dir_path = Path(opt.checkpoint_dir)/opt.name
+    dir_path = Path(opt.checkpoint_dir) / opt.name
     directory_exists = dir_path.exists()
     if opt.is_distributed:
         torch.distributed.barrier()
