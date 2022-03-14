@@ -1,34 +1,38 @@
 #!/usr/bin/env bash
 
-model=trained_reader/t5_base_v11lm/checkpoint/latest
+model=trained_reader/nq_reader_base_v11lm_separate_layer6_continue_from_afterfirst_encoderkl_lastfirst_h3h10/checkpoint/latest
 #model=pretrained_models/nq_reader_base
 
-#data=open_domain_data/NQ/test.json
-#ckpt_dir=${model}.allhead_softmax.nq_test
-#text_maxlength=250
-#per_gpu_batch_size=12
+data=open_domain_data/NQ/test.json
+ckpt_dir=${model}.allhead_softmax.nq_test
+text_maxlength=250
+per_gpu_batch_size=8
+n_context=100
 
 #data=open_domain_data/SciQ/test.json
 #ckpt_dir=${model}.allhead_softmax.sciq_test
 #text_maxlength=250
 #per_gpu_batch_size=12
+#n_context=100
 
 #data=open_domain_data/quasar_s/dev.json
 #ckpt_dir=${model}.allhead_softmax.quasars_dev
 #text_maxlength=250
 #per_gpu_batch_size=12
+#n_context=100
 
-data=open_domain_data/bioasq_500k.nosummary/test.json
-ckpt_dir=${model}.allhead_softmax.bioasq_test
-text_maxlength=1024
-per_gpu_batch_size=1
+#data=open_domain_data/bioasq_500k.nosummary/test.json
+#ckpt_dir=${model}.allhead_softmax.bioasq_test
+#text_maxlength=1024
+#per_gpu_batch_size=1
+#n_context=100
 
-#data=open_domain_data/msmarco_qa/dev.1000.json
+#data=open_domain_data/msmarco_qa/dev.json
 #ckpt_dir=${model}.allhead_softmax.msmarcoqa_dev
 #text_maxlength=250
 #per_gpu_batch_size=12
+#n_context=10
 
-n_context=100
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
 attention_mask=separate

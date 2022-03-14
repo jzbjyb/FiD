@@ -218,6 +218,8 @@ if __name__ == "__main__":
           keep_ctx_in_decoder_head_tau=opt.keep_ctx_in_decoder_head_tau,
           head_weights_norm_func=opt.head_weights_norm_func,
           encoder_decoder_kl_ratio=opt.encoder_decoder_kl_ratio,
+          encoder_encoder_kl_ratio=opt.encoder_encoder_kl_ratio,
+          encoder_encoder_kl=opt.encoder_encoder_kl,
           decoder_attn_ctx_normalize=opt.decoder_attn_ctx_normalize,
           encoder_attention_pre_softmax=opt.encoder_attention_pre_softmax)
         if opt.init_from:

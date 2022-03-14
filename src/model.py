@@ -174,6 +174,8 @@ class FiDT5Config(transformers.T5Config):
                head_weights_norm_func: str = 'softmax',
                encoder_attention_pre_softmax: bool = False,
                encoder_decoder_kl_ratio: float = 0,
+               encoder_encoder_kl_ratio: float = 0,
+               encoder_encoder_kl: str = None,
                decoder_attn_ctx_normalize: bool = False,
                **kwargs):
     super().__init__(*args, **kwargs)
@@ -188,6 +190,8 @@ class FiDT5Config(transformers.T5Config):
     self.head_weights_norm_func = head_weights_norm_func
     self.encoder_attention_pre_softmax = encoder_attention_pre_softmax
     self.encoder_decoder_kl_ratio = encoder_decoder_kl_ratio
+    self.encoder_encoder_kl_ratio = encoder_encoder_kl_ratio
+    self.encoder_encoder_kl = encoder_encoder_kl
     self.decoder_attn_ctx_normalize = decoder_attn_ctx_normalize
 
 class FiDT5(transformers.T5ForConditionalGeneration):
@@ -199,6 +203,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         self.wrap_encoder(config)
         self.wrap_decoder(config)
         self.collect_kl_loss_from_decoder = bool(config.encoder_decoder_kl_ratio)
+        self.collect_kl_loss_from_encoder = bool(config.encoder_encoder_kl_ratio)
 
     @classmethod
     def from_t5(cls,
@@ -214,6 +219,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 head_weights_norm_func: str = 'softmax',
                 encoder_attention_pre_softmax: bool = False,
                 encoder_decoder_kl_ratio: float = 0,
+                encoder_encoder_kl_ratio: float = 0,
+                encoder_encoder_kl: str = None,
                 decoder_attn_ctx_normalize: bool = False):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
@@ -228,6 +235,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           head_weights_norm_func=head_weights_norm_func,
           encoder_attention_pre_softmax=encoder_attention_pre_softmax,
           encoder_decoder_kl_ratio=encoder_decoder_kl_ratio,
+          encoder_encoder_kl_ratio=encoder_encoder_kl_ratio,
+          encoder_encoder_kl=encoder_encoder_kl,
           decoder_attn_ctx_normalize=decoder_attn_ctx_normalize,
           **t5.config.to_dict())
         model = cls(config)
@@ -265,12 +274,15 @@ class FiDT5(transformers.T5ForConditionalGeneration):
             attention_mask=attention_mask,
             **kwargs
         )
+        kl_loss = 0
         if self.collect_kl_loss_from_decoder:
-          kl_loss = self.decoder.get_kl_loss()
-          if 'return_dict' in kwargs and kwargs['return_dict'] and result.loss is not None:
-            result.loss = result.loss + kl_loss
-          elif 'labels' in kwargs and kwargs['labels'] is not None:
-            result = (result[0] + kl_loss,) + result[1:]
+          kl_loss += self.decoder.get_kl_loss()
+        if self.collect_kl_loss_from_encoder:
+          kl_loss += self.encoder.get_kl_loss()
+        if 'return_dict' in kwargs and kwargs['return_dict'] and result.loss is not None:
+          result.loss = result.loss + kl_loss
+        elif 'labels' in kwargs and kwargs['labels'] is not None:
+          result = (result[0] + kl_loss,) + result[1:]
         self.reset_attention_separate_mask()  # always reset separate mask to clean it up
         return result
 
@@ -469,6 +481,8 @@ class DecoderWrapper(torch.nn.Module):
           nw = (self.n_layer_two_tower + 1) * config.num_heads
         elif self.layer_for_retrieval == 'after-first':
           nw = (config.num_layers - self.n_layer_two_tower) * config.num_heads
+        elif self.layer_for_retrieval == 'last-first':
+          nw = 2 * config.num_heads
         else:
           raise NotImplementedError
         self.head_weights = torch.nn.Parameter(torch.zeros(nw), requires_grad=True)
@@ -516,14 +530,14 @@ class DecoderWrapper(torch.nn.Module):
     # softmax
     if self.encoder_attention_pre_softmax:
       assert not has_token, 'pre softmax might not be good for token-level loss'
-      encoder_imp = torch.nn.functional.log_softmax(encoder_imp, dim=1)
+      encoder_imp = torch.log_softmax(encoder_imp, dim=1)
 
     # combine multiple heads
     hwn = self.head_weights_norm_func(self.head_weights)
     WandbLogger.log_w_step({'head-weight': hwn})
     if self.layer_for_retrieval in {'first', 'emb'}:  # use the first layer
       encoder_imp = encoder_imp[:, :, 0]  # (num_q, num_d, num_head, [num_toks])
-    elif self.layer_for_retrieval == 'emb-first':  # use the emb and first layer after bi-encoder
+    elif self.layer_for_retrieval in {'emb-first', 'last-first'}:  # use the emb/last layer and first layer after bi-encoder
       assert encoder_imp.size(2) == 2, 'provide attn for emb and the first layer after bi-encoder'
       v = (num_q, num_d, -1) if not has_token else (num_q, num_d, -1, num_toks)
       encoder_imp = encoder_imp.view(*v)  # (num_q, num_d, 2 * num_head, [num_toks])
@@ -542,7 +556,7 @@ class DecoderWrapper(torch.nn.Module):
         encoder_imp = (encoder_imp * hwn[None, None, :, None]).sum(-2)  # (num_q, num_d, num_toks)
         # softmax over all toks in all context
         encoder_imp = encoder_imp * encoder_imp_tok_mask - ~encoder_imp_tok_mask * 1e5
-        encoder_imp = torch.nn.functional.log_softmax(encoder_imp.view(num_q, -1), dim=-1).view(num_q, num_d, num_toks)
+        encoder_imp = torch.log_softmax(encoder_imp.view(num_q, -1), dim=-1).view(num_q, num_d, num_toks)
 
     # used for output
     if not has_token:
@@ -598,6 +612,8 @@ class EncoderWrapper(torch.nn.Module):
         self.use_checkpoint = use_checkpoint
         self.n_layer_two_tower = config.n_layer_two_tower
         self.layer_for_retrieval = config.layer_for_retrieval
+        self.encoder_encoder_kl_ratio = config.encoder_encoder_kl_ratio
+        self.encoder_encoder_kl = config.encoder_encoder_kl
         self.apply_t5block_wrapper(config)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
@@ -615,18 +631,72 @@ class EncoderWrapper(torch.nn.Module):
         else:
           attention_mask = attention_mask.view(bsz * n_passages, passage_length)  # (bs * n_passage, seq_len)
         outputs = self.encoder(input_ids, attention_mask, **kwargs)
+        if bool(self.encoder_encoder_kl_ratio):
+          merge = self.get_collected_for_retrieval()
+          # (num_query, n_context, num_layers, [num_heads, seq_len, seq_len])
+          ttas = merge['two_tower_attn_score_full'] if 'two_tower_attn_score_full' in merge else merge['two_tower_attn_score']
+          # (num_query, n_context, seq_len, seq_len)
+          ttasfm = merge['two_tower_attn_score_full_mask'] if 'two_tower_attn_score_full' in merge else None
+          self.compute_encoder_encoder_kl(ttas, ttasfm)
         if kwargs['return_dict']:
           outputs.last_hidden_state = outputs.last_hidden_state.view(bsz, n_passages*passage_length, -1)
         else:
           outputs = (outputs[0].view(bsz, n_passages*passage_length, -1), ) + outputs[1:]
         return outputs
 
+    def compute_encoder_encoder_kl(self,
+                                   encoder_attn: torch.FloatTensor, # (num_query, n_context, num_layers, [num_heads, seq_len, seq_len])
+                                   encoder_attn_mask: torch.BoolTensor):  # (num_query, n_context, seq_len, seq_len)
+      layers, heads = self.encoder_encoder_kl.split('=')
+      num_query, num_layers = encoder_attn.size(0), encoder_attn.size(2)
+      if layers == 'first|last':
+        assert num_layers == 2
+        pred_attn = encoder_attn[:, :, 0]  # (num_query, n_context, num_heads, [seq_len, seq_len])
+        gold_attn = encoder_attn[:, :, -1]  # (num_query, n_context, num_heads, [seq_len, seq_len])
+      else:
+        raise NotImplementedError
+      pred_head, gold_head = heads.split('|')
+      if pred_head.isnumeric() and gold_head.isnumeric():  # specified head
+        pred_head, gold_head = int(pred_head), int(gold_head)
+        pred_attn = pred_attn[:, :, pred_head]  # (num_query, n_context, [seq_len, seq_len])
+        gold_attn = gold_attn[:, :, gold_head]  # (num_query, n_context, [seq_len, seq_len])
+      else:
+        raise NotImplementedError
+
+      pred_attn = pred_attn.contiguous().view(num_query, -1)  # (num_query, n_context * [seq_len * seq_len])
+      gold_attn = gold_attn.contiguous().view(num_query, -1)  # (num_query, n_context * [seq_len * seq_len])
+
+      if encoder_attn_mask is not None:
+        encoder_attn_mask = encoder_attn_mask.view(num_query, -1)  # (num_query, n_context * seq_len * seq_len)
+        pred_attn = pred_attn - (~encoder_attn_mask * 1e5)
+        gold_attn = gold_attn - (~encoder_attn_mask * 1e5)
+
+      pred_attn_logprob = torch.log_softmax(pred_attn, dim=-1)
+      gold_attn_prob = torch.softmax(gold_attn, dim=-1)
+
+      kl_loss_func = torch.nn.KLDivLoss(reduction='none')
+      if encoder_attn_mask is not None:
+        pred_attn_logprob = torch.masked_select(pred_attn_logprob, encoder_attn_mask)  # (?)
+        gold_attn_prob = torch.masked_select(gold_attn_prob, encoder_attn_mask)  # (?)
+      kl = kl_loss_func(pred_attn_logprob, gold_attn_prob.detach())  # (?)
+      kl = kl.sum() / num_query  # bachmean
+      self.kl_loss = kl
+
+    def get_kl_loss(self):
+      assert self.encoder_encoder_kl_ratio
+      kl_loss = self.kl_loss * self.encoder_encoder_kl_ratio
+      WandbLogger.log_w_step({'encoder-kl-loss': kl_loss.item()})
+      return kl_loss
+
     def apply_t5block_wrapper(self, config):
-      use_first_layer = lambda i: i == config.n_layer_two_tower
+      nl_total = len(self.encoder.block)
+      nl_twotower = config.n_layer_two_tower
+      use_first_layer = lambda i: i == nl_twotower
       use_emb_layer = lambda i: i == 0
-      use_emb_and_first_layer = lambda i: i == 0 or i == config.n_layer_two_tower
-      use_prev_and_first_layers = lambda i: i <= config.n_layer_two_tower
-      use_after_and_first_layers = lambda i: i >= config.n_layer_two_tower
+      use_emb_and_first_layer = lambda i: i == 0 or i == nl_twotower
+      use_prev_and_first_layers = lambda i: i <= nl_twotower
+      use_after_and_first_layers = lambda i: i >= nl_twotower
+      use_last_and_first_layers = lambda i: i == nl_twotower or i == nl_total - 1
       if config.layer_for_retrieval == 'first':
         use_for_retrieval_func = use_first_layer
       elif config.layer_for_retrieval == 'emb':
@@ -637,6 +707,8 @@ class EncoderWrapper(torch.nn.Module):
         use_for_retrieval_func = use_prev_and_first_layers
       elif config.layer_for_retrieval == 'after-first':
         use_for_retrieval_func = use_after_and_first_layers
+      elif config.layer_for_retrieval == 'last-first':
+        use_for_retrieval_func = use_last_and_first_layers
       else:
         raise NotImplementedError
       layers = []
@@ -690,11 +762,11 @@ class T5blockWrapper(torch.nn.Module):
         self.use_full_attention = use_full_attention
         self.use_for_retrieval = use_for_retrieval
         self.retrieval_aggregation_method = config.retrieval_aggregation_method
-        self.collect_for_decoder = FiDT5.need_wrap_decoder(config)
+        self.need_collect = FiDT5.need_wrap_decoder(config) or bool(config.encoder_encoder_kl_ratio)
 
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
         # register callback for retrieval
-        if self.use_for_retrieval and (not self.training or self.collect_for_decoder):
+        if self.use_for_retrieval and (not self.training or self.need_collect):
             reg_point = self.module.layer[0].SelfAttention
             reg_point.collect_for_retrieval = types.MethodType(
               functools.partial(
@@ -730,7 +802,7 @@ class T5blockWrapper(torch.nn.Module):
             output = tuple(x if x.size() != 0 else None for x in output)
         else:
             output = self.module(hidden_states, attention_mask, position_bias, **kwargs)
-        if self.use_for_retrieval and (not self.training or self.collect_for_decoder):  # make the reg dynamic
+        if self.use_for_retrieval and (not self.training or self.need_collect):  # make the reg dynamic
             reg_point = self.module.layer[0].SelfAttention
             del reg_point.collect_for_retrieval
         return output
@@ -818,7 +890,7 @@ def encoder_decoder_kl(
   if encoder_score_pre_softmaxed:
     enc_attn = encoder_score  # already with log
   else:
-    enc_attn = torch.nn.functional.log_softmax(encoder_score, dim=-1)
+    enc_attn = torch.log_softmax(encoder_score, dim=-1)
   kl = kl_loss_func(enc_attn, dec_attn.detach())
   return kl
 
@@ -851,6 +923,7 @@ def collect_for_retrieval(
     raise NotImplementedError
   cross_mask = (~attention_mask & pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)).unsqueeze(1)  # (bs, 1, seq_len, seq_len)
 
+  self.retrieval = {}
   if aggregation_method == 'all-max-all':
     # max over tokens paying attention
     scores_full = (scores - (~cross_mask * 1e5)).max(2)[0]  # (bs, n_heads, seq_len)
@@ -859,6 +932,12 @@ def collect_for_retrieval(
                       'two_tower_attn_score_full': scores_full,
                       'two_tower_attn_score_full_mask': doc_field_mask.contiguous()}
     return
+
+  if aggregation_method == 'all-all-all':
+    scores_full = scores * cross_mask  # (bs, n_heads, seq_len, seq_len)
+    self.retrieval = {'two_tower_attn_score_full': scores_full,
+                      'two_tower_attn_score_full_mask': cross_mask[:, 0] & field_mask[:, :, None]}  # (bs, seq_len, seq_len)
+    aggregation_method = 'all-avg-max'
 
   head_agg, query_agg, key_agg = aggregation_method.split('-')
   if key_agg == 'max':
@@ -887,7 +966,7 @@ def collect_for_retrieval(
     pass
   else:
     raise NotImplementedError
-  self.retrieval = {'two_tower_attn_score': scores}
+  self.retrieval['two_tower_attn_score'] = scores
 
 def cross_attention_forward(
         self,
@@ -1071,7 +1150,7 @@ class RetrieverMixin:
 
     def kldivloss(self, score, gold_score):
         gold_score = torch.softmax(gold_score, dim=-1)
-        score = torch.nn.functional.log_softmax(score, dim=-1)
+        score = torch.log_softmax(score, dim=-1)
         return self.loss_fct(score, gold_score)
 
 

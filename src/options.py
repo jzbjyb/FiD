@@ -51,13 +51,14 @@ class Options():
         self.parser.add_argument('--n_layer_two_tower', type=int, default=0,
                                  help='number of layers used for two tower representation')
         self.parser.add_argument('--layer_for_retrieval', type=str, default='first',
-                                 choices=['first', 'emb-first', 'emb', 'prev-first', 'after-first'],
+                                 choices=['first', 'emb-first', 'emb', 'prev-first', 'after-first', 'last-first'],
                                  help='layers used for retrieval')
         self.parser.add_argument('--attention_mask', type=str, default=None,
                                  choices=[None, 'separate', 'query-side', 'no-query'],
                                  help='how to generate attention for query/doc')
         self.parser.add_argument('--retrieval_aggregation_method', type=str, default='all-avg-max',
-                                 choices=['all-avg-max', 'all-max-all'], help='how to generate a single score for retrieval')
+                                 choices=['all-avg-max', 'all-max-all', 'all-all-all'],
+                                 help='how to generate a single score for retrieval')
         self.parser.add_argument('--query_in_decoder', type=str, default='no', choices=['no', 'all'],
                                  help='use query at the beginning of the decoder')
         self.parser.add_argument('--num_keep_ctx_in_decoder', type=int, default=0, help='num of ctx used in decoder')
@@ -70,6 +71,10 @@ class Options():
                                  help='only use a specific head to keep ctx in decoder')
         self.parser.add_argument('--encoder_decoder_kl_ratio', type=float, default=0,
                                  help='the ratio of KL divergence between encoder and decoder attn')
+        self.parser.add_argument('--encoder_encoder_kl_ratio', type=float, default=0,
+                                 help='the ratio of KL divergence between encoder and encoder attn of different layers')
+        self.parser.add_argument('--encoder_encoder_kl', type=str, default=None,
+                                 help='specify the two layers and two heads to compute kl')
         self.parser.add_argument('--decoder_attn_ctx_normalize', action='store_true',
                                  help='normalize decoder attention for each context')
         self.parser.add_argument('--encoder_attention_pre_softmax', action='store_true',
