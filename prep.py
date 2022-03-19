@@ -728,9 +728,9 @@ if __name__ == '__main__':
 
   elif args.task == 'eval_answer':
     key, method = args.other[:2]
-    index = 3
+    layer_index, head_index = -1, 3
     if len(args.other) > 2:
-      index = int(args.other[2])
+      layer_index, head_index = int(args.other[2]), int(args.other[3])
     #key = 'score'  # score two_tower_attn_score encoder_score
     #method = 'avg'
     n_two_tower_layers = 6
@@ -761,10 +761,10 @@ if __name__ == '__main__':
       exit()
     elif method == 'specific':
       sort = True
-      key_func = lambda x: np.mean(x[key][-1][index])
+      key_func = lambda x: np.mean(x[key][layer_index][head_index])
     elif method == 'flat':
       sort = True
-      key_func = lambda x: np.mean([b for a in x[key] for b in a][index])
+      key_func = lambda x: np.mean([b for a in x[key] for b in a][head_index])
     else:
       for l in range(12 - n_two_tower_layers):
         if method == 'avg_layer':

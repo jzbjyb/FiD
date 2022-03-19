@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-model=trained_reader/nq_reader_base_v11lm_separate_layer6_continue_from_afterfirst_encoderkl_lastfirst_h3h10/checkpoint/latest
+model=trained_reader/nq_reader_base_v11lm_separate_layer6_continue_decoder100_head3_combineweight1/checkpoint/latest
 #model=pretrained_models/nq_reader_base
 
 data=open_domain_data/NQ/test.json

@@ -62,6 +62,8 @@ class Options():
         self.parser.add_argument('--query_in_decoder', type=str, default='no', choices=['no', 'all'],
                                  help='use query at the beginning of the decoder')
         self.parser.add_argument('--num_keep_ctx_in_decoder', type=int, default=0, help='num of ctx used in decoder')
+        self.parser.add_argument('--combine_weight', type=float, default=0,
+                                 help='weight (before exp) to combine bi-encoder attn and decoder attn')
         self.parser.add_argument('--keep_ctx_in_decoder_head_tau', type=float, default=1.0,
                                  help='tau for head weight softmax')
         self.parser.add_argument('--head_weights_norm_func', type=str, default='softmax',
@@ -73,6 +75,7 @@ class Options():
                                  help='the ratio of KL divergence between encoder and decoder attn')
         self.parser.add_argument('--encoder_encoder_kl_ratio', type=float, default=0,
                                  help='the ratio of KL divergence between encoder and encoder attn of different layers')
+        self.parser.add_argument('--encoder_encoder_kl_sparsity', type=int, default=0, help='topk doc tokens per query token')
         self.parser.add_argument('--encoder_encoder_kl', type=str, default=None,
                                  help='specify the two layers and two heads to compute kl')
         self.parser.add_argument('--decoder_attn_ctx_normalize', action='store_true',

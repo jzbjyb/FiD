@@ -169,6 +169,7 @@ class FiDT5Config(transformers.T5Config):
                retrieval_aggregation_method: str = 'all-avg-max',
                query_in_decoder: str = 'no',
                num_keep_ctx_in_decoder: int = 0,
+               combine_weight: float = 0.0,
                keep_ctx_in_decoder_with_head: int = None,
                keep_ctx_in_decoder_head_tau: float = 1.0,
                head_weights_norm_func: str = 'softmax',
@@ -176,6 +177,7 @@ class FiDT5Config(transformers.T5Config):
                encoder_decoder_kl_ratio: float = 0,
                encoder_encoder_kl_ratio: float = 0,
                encoder_encoder_kl: str = None,
+               encoder_encoder_kl_sparsity: int = 0,
                decoder_attn_ctx_normalize: bool = False,
                **kwargs):
     super().__init__(*args, **kwargs)
@@ -185,6 +187,7 @@ class FiDT5Config(transformers.T5Config):
     self.retrieval_aggregation_method = retrieval_aggregation_method
     self.query_in_decoder = query_in_decoder
     self.num_keep_ctx_in_decoder = num_keep_ctx_in_decoder
+    self.combine_weight = combine_weight
     self.keep_ctx_in_decoder_with_head = keep_ctx_in_decoder_with_head
     self.keep_ctx_in_decoder_head_tau = keep_ctx_in_decoder_head_tau
     self.head_weights_norm_func = head_weights_norm_func
@@ -192,6 +195,7 @@ class FiDT5Config(transformers.T5Config):
     self.encoder_decoder_kl_ratio = encoder_decoder_kl_ratio
     self.encoder_encoder_kl_ratio = encoder_encoder_kl_ratio
     self.encoder_encoder_kl = encoder_encoder_kl
+    self.encoder_encoder_kl_sparsity = encoder_encoder_kl_sparsity
     self.decoder_attn_ctx_normalize = decoder_attn_ctx_normalize
 
 class FiDT5(transformers.T5ForConditionalGeneration):
@@ -214,6 +218,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 retrieval_aggregation_method: str = 'all-avg-max',
                 query_in_decoder: str = 'no',
                 num_keep_ctx_in_decoder: int = 0,
+                combine_weight: float = 0.0,
                 keep_ctx_in_decoder_with_head: int = None,
                 keep_ctx_in_decoder_head_tau: float = 1.0,
                 head_weights_norm_func: str = 'softmax',
@@ -221,6 +226,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 encoder_decoder_kl_ratio: float = 0,
                 encoder_encoder_kl_ratio: float = 0,
                 encoder_encoder_kl: str = None,
+                encoder_encoder_kl_sparsity: int = 0,
                 decoder_attn_ctx_normalize: bool = False):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
@@ -230,6 +236,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           retrieval_aggregation_method=retrieval_aggregation_method,
           query_in_decoder=query_in_decoder,
           num_keep_ctx_in_decoder=num_keep_ctx_in_decoder,
+          combine_weight=combine_weight,
           keep_ctx_in_decoder_with_head=keep_ctx_in_decoder_with_head,
           keep_ctx_in_decoder_head_tau=keep_ctx_in_decoder_head_tau,
           head_weights_norm_func=head_weights_norm_func,
@@ -237,6 +244,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           encoder_decoder_kl_ratio=encoder_decoder_kl_ratio,
           encoder_encoder_kl_ratio=encoder_encoder_kl_ratio,
           encoder_encoder_kl=encoder_encoder_kl,
+          encoder_encoder_kl_sparsity=encoder_encoder_kl_sparsity,
           decoder_attn_ctx_normalize=decoder_attn_ctx_normalize,
           **t5.config.to_dict())
         model = cls(config)
@@ -498,7 +506,8 @@ class DecoderWrapper(torch.nn.Module):
         self.head_weights_norm_func = lambda x: sparsemax(x, 0)
       else:
         raise NotImplementedError
-      self.combine_weight = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
+      self.init_combine_weight = config.combine_weight
+      self.combine_weight = torch.nn.Parameter(torch.tensor(self.init_combine_weight), requires_grad=True)
 
   def get_kl_loss(self):
     assert self.encoder_decoder_kl_ratio
@@ -614,6 +623,7 @@ class EncoderWrapper(torch.nn.Module):
         self.layer_for_retrieval = config.layer_for_retrieval
         self.encoder_encoder_kl_ratio = config.encoder_encoder_kl_ratio
         self.encoder_encoder_kl = config.encoder_encoder_kl
+        self.encoder_encoder_kl_sparsity = config.encoder_encoder_kl_sparsity
         self.apply_t5block_wrapper(config)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
@@ -662,6 +672,20 @@ class EncoderWrapper(torch.nn.Module):
         gold_attn = gold_attn[:, :, gold_head]  # (num_query, n_context, [seq_len, seq_len])
       else:
         raise NotImplementedError
+
+      if self.encoder_encoder_kl_sparsity:  # choose topk doc token per query
+        seq_len = pred_attn.size(2)
+        pred_attn = pred_attn - (~encoder_attn_mask * 1e5)
+        gold_attn = gold_attn - (~encoder_attn_mask * 1e5)
+        topk = min(self.encoder_encoder_kl_sparsity, seq_len)
+        pred_topk_ind = pred_attn.topk(topk, -1)[1]  # (num_query, n_context, seq_len, topk)
+        gold_topk_ind = gold_attn.topk(topk, -1)[1]  # (num_query, n_context, seq_len, topk)
+        sparsity_mask = torch.zeros_like(encoder_attn_mask).bool()  # (num_query, n_context, seq_len, seq_len)
+        sparsity_mask.scatter_(-1, pred_topk_ind, True)
+        sparsity_mask.scatter_(-1, gold_topk_ind, True)
+        encoder_attn_mask = encoder_attn_mask & sparsity_mask
+        WandbLogger.log_w_step({
+          'encoder-kl-sparsity': (encoder_attn_mask.sum([2, 3]) / encoder_attn_mask.max(-1)[0].sum(-1)).mean().item()})
 
       pred_attn = pred_attn.contiguous().view(num_query, -1)  # (num_query, n_context * [seq_len * seq_len])
       gold_attn = gold_attn.contiguous().view(num_query, -1)  # (num_query, n_context * [seq_len * seq_len])
@@ -802,7 +826,8 @@ class T5blockWrapper(torch.nn.Module):
             output = tuple(x if x.size() != 0 else None for x in output)
         else:
             output = self.module(hidden_states, attention_mask, position_bias, **kwargs)
-        if self.use_for_retrieval and (not self.training or self.need_collect):  # make the reg dynamic
+        if self.use_for_retrieval and not self.training:
+            # make the reg dynamic (only use in eval since training use checkpointing)
             reg_point = self.module.layer[0].SelfAttention
             del reg_point.collect_for_retrieval
         return output
