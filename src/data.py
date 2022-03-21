@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import List
+from typing import List, Tuple
 import torch
 import random
 import json
@@ -261,28 +261,46 @@ class RetrieverCollator(object):
 
         return (index, question_ids, question_mask, passage_ids, passage_masks, scores)
 
-class TextDataset(torch.utils.data.Dataset):
+class ContextDataset(torch.utils.data.Dataset):
     def __init__(self,
-                 data,
-                 title_prefix='title:',
-                 passage_prefix='context:',
+                 data: List[Tuple[str, str, str]],
+                 title_prefix: str = 'title:',
+                 passage_prefix: str = 'context:',
                  add_eos: bool = False):
         self.data = data
         self.title_prefix = title_prefix
         self.passage_prefix = passage_prefix
-        self.eos = (' </s>' if add_eos else '')
+        self.eos = ' </s>' if add_eos else ''
 
     def __len__(self):
         return len(self.data)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index) -> Tuple[str, str]:
         example = self.data[index]
-        text = self.title_prefix + " " + example[2] + " " + \
-            self.passage_prefix + " " + example[1] + self.eos
-        return example[0], text
+        id = example[0]
+        text = f'{self.title_prefix} {example[2]} {self.passage_prefix} {example[1]}{self.eos}'
+        return id, text
+
+class QuestionDataset(torch.utils.data.Dataset):
+  def __init__(self,
+               data: List[Tuple[str, str]],
+               question_prefix: str = 'question:',
+               add_eos: bool = False):
+    self.data = data
+    self.question_prefix = question_prefix
+    self.eos = ' </s>' if add_eos else ''
+
+  def __len__(self):
+    return len(self.data)
+
+  def __getitem__(self, index) -> Tuple[str, str]:
+    example = self.data[index]
+    id = example[0]
+    text = f'{self.question_prefix} {example[1]}{self.eos}'
+    return id, text
 
 class TextCollator(object):
-    def __init__(self, tokenizer, maxlength=200):
+    def __init__(self, tokenizer, maxlength: int = 200):
         self.tokenizer = tokenizer
         self.maxlength = maxlength
 
@@ -293,9 +311,7 @@ class TextCollator(object):
             padding='max_length',
             return_tensors='pt',
             max_length=self.maxlength,
-            truncation=True
-        )
+            truncation=True)
         text_ids = encoded_batch['input_ids']
         text_mask = encoded_batch['attention_mask'].bool()
-
         return index, text_ids, text_mask

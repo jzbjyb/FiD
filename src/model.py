@@ -112,7 +112,7 @@ def t5attention_forward(
 
   # collect encoder attn (before applying mask)
   if hasattr(self, 'collect_for_retrieval'):
-    self.collect_for_retrieval(scores, hidden_states)
+    self.collect_for_retrieval(scores, hidden_states, key_states, value_states)
 
   if mask is not None:
     # apply token-leve mask
@@ -293,6 +293,28 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           result = (result[0] + kl_loss,) + result[1:]
         self.reset_attention_separate_mask()  # always reset separate mask to clean it up
         return result
+
+    def encode_context(self,
+                       input_ids,  # (num_docs, seq_len)
+                       attention_mask):  # (num_docs, seq_len)
+        self.encoder(input_ids=input_ids, attention_mask=attention_mask, direct=True)
+        # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head)
+        context_embedding = self.encoder.get_collected_for_retrieval()['key_states']
+        if self.config.keep_ctx_in_decoder_with_head is not None:
+          hi = self.config.keep_ctx_in_decoder_with_head
+          context_embedding = context_embedding[:, :, hi:hi + 1]  # (num_docs, n_layer, 1 (n_heads), seq_len, emb_size_per_head)
+        return context_embedding
+
+    def encode_query(self,
+                     input_ids,  # (num_queries, seq_len)
+                     attention_mask):  # (num_queries, seq_len)
+        self.encoder(input_ids=input_ids, attention_mask=attention_mask, direct=True)
+        # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head)
+        query_embedding = self.encoder.get_collected_for_retrieval()['query_states']
+        if self.config.keep_ctx_in_decoder_with_head is not None:
+          hi = self.config.keep_ctx_in_decoder_with_head
+          query_embedding = query_embedding[:, :, hi:hi + 1]  # (num_queries, n_layer, 1 (n_heads), seq_len, emb_size_per_head)
+        return query_embedding
 
     # We need to resize the inputs here, as the generate method expect 2D tensors
     def generate(self, input_ids, attention_mask, attention_separate_mask=None, max_length=None, **kwargs):
@@ -765,8 +787,9 @@ class EncoderWrapper(torch.nn.Module):
       for k in merge:
         if not k.endswith('mask'):
           merge[k] = torch.stack(merge[k], 1)  # (bs, num_layers, num_heads, ...)
-        # (num_query, n_context, num_layers, num_heads, ...)
-        merge[k] = merge[k].view(*((-1, self.n_passages) + merge[k].size()[1:]))
+        if hasattr(self, 'n_passages'):
+          # (num_query, n_context, num_layers, num_heads, ...)
+          merge[k] = merge[k].view(*((-1, self.n_passages) + merge[k].size()[1:]))
       return merge
 
 class T5blockWrapper(torch.nn.Module):
@@ -793,13 +816,13 @@ class T5blockWrapper(torch.nn.Module):
         if self.use_for_retrieval and (not self.training or self.need_collect):
             reg_point = self.module.layer[0].SelfAttention
             reg_point.collect_for_retrieval = types.MethodType(
-              functools.partial(
-                collect_for_retrieval,
-                attention_mask=attention_mask[:, 0].eq(0),
-                aggregation_method=self.retrieval_aggregation_method,
-                field='query',
-                use_hidden_states=False,
-              ), reg_point)
+                functools.partial(
+                    collect_for_retrieval,
+                    attention_mask=attention_mask[:, 0].eq(0),
+                    aggregation_method=self.retrieval_aggregation_method,
+                    field='query',
+                    use_hidden_states=False,
+                ), reg_point)
         # handle separate/full attention
         if self.use_full_attention:
             # modify (potentially separate) attention mask to make it a full attention
@@ -923,6 +946,8 @@ def collect_for_retrieval(
      self,
      scores: torch.FloatTensor,  # (bs, n_heads, seq_len, seq_len)
      hidden_states: torch.FloatTensor,  # (bs, seq_len, emb_size)
+     key_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
+     value_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
      attention_mask: torch.BoolTensor,  # (bs, seq_len, seq_len)
      aggregation_method: str,  # 'head-query-key'
      field: str,
@@ -948,7 +973,7 @@ def collect_for_retrieval(
     raise NotImplementedError
   cross_mask = (~attention_mask & pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)).unsqueeze(1)  # (bs, 1, seq_len, seq_len)
 
-  self.retrieval = {}
+  self.retrieval = {'key_states': key_states, 'value_states': value_states}
   if aggregation_method == 'all-max-all':
     # max over tokens paying attention
     scores_full = (scores - (~cross_mask * 1e5)).max(2)[0]  # (bs, n_heads, seq_len)

@@ -267,7 +267,7 @@ def save_distributed_dataset(data, opt):
             json.dump(alldata, fout, indent=4)
         write_path.rmdir()
 
-def load_passages(path):
+def load_passages(path) -> List[Tuple[str, str, str]]:  # id, text, title
     if not os.path.exists(path):
         logger.info(f'{path} does not exist')
         return
@@ -275,12 +275,17 @@ def load_passages(path):
     passages = []
     with open(path) as fin:
         reader = csv.reader(fin, delimiter='\t')
+        header = next(reader)
+        assert len(header) == 3 and header[0] == 'id', 'header format error'
+        textfirst = header[1] == 'text'
         for k, row in enumerate(reader):
-            if not row[0] == 'id':
-                try:
+            try:
+                if textfirst:
                     passages.append((row[0], row[1], row[2]))
-                except:
-                    logger.warning(f'The following input line has not been correctly loaded: {row}')
+                else:
+                    passages.append((row[0], row[2], row[1]))
+            except:
+                logger.warning(f'The following input line has not been correctly loaded: {row}')
     return passages
 
 def extract_query_answer(output: List[int], tokenizer, query_in_decoder: bool = False) -> Tuple[str, str, int]:

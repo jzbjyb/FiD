@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+#SBATCH --mem=32000
+#SBATCH --gres=gpu:3090:1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=0
+#SBATCH --output=slurm_out/%j.out
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
@@ -16,12 +21,12 @@ MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
 batch_size=2
 accum=$2
-num_keep_ctx_in_decoder=$3
-combine_weight=$4
+num_keep_ctx_in_decoder=0
+combine_weight=0
 
 init_model=google/t5-base-lm-adapt
-ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_decoder${num_keep_ctx_in_decoder}_head3_combineweight${combine_weight}
+ckpt_dir=trained_reader2
+name=nq_reader_base_v11lm_separate_layer6_accum8
 init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
 n_layer_two_tower=6
 layer_for_retrieval=first
@@ -76,7 +81,6 @@ python ${prefix} train_reader.py \
   --layer_for_retrieval ${layer_for_retrieval} \
   --num_keep_ctx_in_decoder ${num_keep_ctx_in_decoder} \
   --combine_weight ${combine_weight} \
-  --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
   --keep_ctx_in_decoder_head_tau ${keep_ctx_in_decoder_head_tau} \
   --head_weights_norm_func ${head_weights_norm_func} \
   --encoder_decoder_kl_ratio ${encoder_decoder_kl_ratio} \
@@ -86,14 +90,14 @@ python ${prefix} train_reader.py \
   --retrieval_aggregation_method ${retrieval_aggregation_method} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 1001 \
+  --total_step 1000 \
   --warmup_step 100 \
-  --save_freq 1000 \
-  --eval_freq 200 \
+  --save_freq 500 \
+  --eval_freq 100 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
-  --init_from ${init_from}
+  #--init_from ${init_from}
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
 # --decoder_attn_ctx_normalize \

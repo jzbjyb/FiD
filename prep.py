@@ -653,11 +653,26 @@ def eval_qa(pred_file: str, gold_file_beir: str, metric: str = 'src.evaluation.e
     print(f'{qtype}\t{np.mean(scores)}')
 
 
+def aggregate_ctx(query_files: List[str], tsv_file: str):
+  seen_ids: Set[str] = set()
+  with open(tsv_file, 'w') as fout:
+    fout.write('id\ttext\ttitle\n')
+    for query_file in query_files:
+      with open(query_file, 'r') as fin:
+        data = json.load(fin)
+        for q in data:
+          for ctx in q['ctxs']:
+            if ctx['id'] not in seen_ids:
+              fout.write(f"{ctx['id']}\t{clean_text_for_tsv(ctx['text'])}\t{clean_text_for_tsv(ctx['title'])}\n")
+            seen_ids.add(ctx['id'])
+  print(f'total #ctx {len(seen_ids)}')
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
     'convert_sciq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
-    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa',
+    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
@@ -792,3 +807,8 @@ if __name__ == '__main__':
   elif args.task == 'create_whole_test':
     data_dir = args.inp[0]
     create_whole_test(data_dir, out_num=100)
+
+  elif args.task == 'aggregate_ctx':
+    query_files = args.inp
+    tsv_file = args.out[0]
+    aggregate_ctx(query_files, tsv_file)

@@ -41,7 +41,7 @@ def init_signal_handler():
     #logger.warning("Signal handler installed.")
 
 
-def init_distributed_mode(params):
+def init_distributed_mode(params, is_slurm_job: bool = False):
     """
     Handle single and multi-GPU / multi-node / SLURM jobs.
     Initialize the following variables:
@@ -51,7 +51,7 @@ def init_distributed_mode(params):
         - global_rank
         - world_size
     """
-    params.is_slurm_job = 'SLURM_JOB_ID' in os.environ 
+    params.is_slurm_job = 'SLURM_JOB_ID' in os.environ and is_slurm_job
     has_local_rank = hasattr(params, 'local_rank')
 
     # SLURM job

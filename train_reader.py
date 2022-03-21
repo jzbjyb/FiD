@@ -47,15 +47,21 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
     )
 
     loss, curr_loss = 0.0, 0.0
-    epoch = 1
+    epoch = 0
     model.train()
     pbar = tqdm(total=opt.total_steps, disable=not opt.is_main)
-    while step < opt.total_steps:
+    _step = step * opt.accumulation_steps  # the "real" step used for gradient accumulation
+    while step <= opt.total_steps:
         epoch += 1
         for i, batch in enumerate(train_dataloader):
-            step += 1
-            WandbLogger.step(step)
-            pbar.update(1)
+            _step += 1
+            if opt.accumulation_steps == 1 or _step % opt.accumulation_steps == 1:  # increase the optimization step
+                step += 1
+                WandbLogger.step(step)
+                pbar.update(1)
+            if step > opt.total_steps:
+                break
+
             (idx, labels, _, context_ids, context_mask, context_sep_mask) = batch
             context_sep_mask = context_sep_mask.cuda() if context_sep_mask is not None else context_sep_mask
             train_loss = model(
@@ -64,45 +70,38 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
                 attention_separate_mask=context_sep_mask,
                 labels=labels.cuda(),
             )[0]
-
             train_loss.backward()
 
-            if step % opt.accumulation_steps == 0:
+            if _step % opt.accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), opt.clip)
                 optimizer.step()
                 scheduler.step()
                 model.zero_grad()
 
-            train_loss = src.util.average_main(train_loss, opt)
-            curr_loss += train_loss.item()
-
-            if step % opt.accumulation_steps == 0:
+                train_loss = src.util.average_main(train_loss, opt)
+                curr_loss += train_loss.item()
                 WandbLogger.log_w_step({'train-loss': train_loss.item()})
 
-            if step % opt.eval_freq == 0:
-                dev_metric = evaluate(model, eval_dataset, tokenizer, collator, opt)
-                model.train()
-                if opt.is_main:
-                    if dev_metric > best_dev_metric:
-                        best_dev_metric = dev_metric
-                        src.util.save(model, optimizer, scheduler, step, best_dev_metric,
-                                  opt, checkpoint_path, 'best_dev')
-                    log = f"{step} / {opt.total_steps} |"
-                    log += f"train: {curr_loss/opt.eval_freq:.3f} |"
-                    log += f"evaluation: {100*dev_metric:.2f}EM |"
-                    log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
-                    logger.info(log)
-                    WandbLogger.log_w_step({f'dev-{opt.metric}': dev_metric})
-                    if tb_logger is not None:
-                        tb_logger.add_scalar("Evaluation", dev_metric, step)
-                        tb_logger.add_scalar("Training", curr_loss / (opt.eval_freq), step)
-                    curr_loss = 0.
+                if step % opt.eval_freq == 0:
+                    dev_metric = evaluate(model, eval_dataset, tokenizer, collator, opt)
+                    model.train()
+                    if opt.is_main:
+                        if dev_metric > best_dev_metric:
+                            best_dev_metric = dev_metric
+                            src.util.save(model, optimizer, scheduler, step, best_dev_metric, opt, checkpoint_path, 'best_dev')
+                        log = f"{step} / {opt.total_steps} |"
+                        log += f"train: {curr_loss/opt.eval_freq:.3f} |"
+                        log += f"evaluation: {100*dev_metric:.2f}EM |"
+                        log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
+                        logger.info(log)
+                        WandbLogger.log_w_step({f'dev-{opt.metric}': dev_metric})
+                        if tb_logger is not None:
+                            tb_logger.add_scalar("Evaluation", dev_metric, step)
+                            tb_logger.add_scalar("Training", curr_loss / (opt.eval_freq), step)
+                        curr_loss = 0.
 
-            if opt.is_main and step % opt.save_freq == 0:
-                src.util.save(model, optimizer, scheduler, step, best_dev_metric,
-                          opt, checkpoint_path, f"step-{step}")
-            if step > opt.total_steps:
-                break
+                if opt.is_main and step % opt.save_freq == 0:
+                    src.util.save(model, optimizer, scheduler, step, best_dev_metric, opt, checkpoint_path, f"step-{step}")
 
     if opt.is_main and opt.total_steps == 0:  # save the original model
         src.util.save(model, optimizer, scheduler, step, best_dev_metric, opt, checkpoint_path, f'step-{step}')
