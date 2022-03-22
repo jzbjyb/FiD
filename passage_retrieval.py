@@ -85,9 +85,9 @@ def validate(data, workers_num):
     match_stats = calculate_matches(data, workers_num)
     top_k_hits = match_stats.top_k_hits
 
-    logger.info('Validation results: top k documents hits %s', top_k_hits)
+    print('Validation results: top k documents hits %s', top_k_hits)
     top_k_hits = [v / len(data) for v in top_k_hits] 
-    logger.info('Validation results: top k documents hits accuracy %s', top_k_hits)
+    print('Validation results: top k documents hits accuracy %s', top_k_hits)
     return match_stats.questions_doc_hits
 
 

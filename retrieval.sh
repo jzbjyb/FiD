@@ -3,12 +3,18 @@
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
-passages=open_domain_data2/NQ/psgs_w100.test_aggregate.tsv
-model_path=trained_reader2/t5_base_v11lm/checkpoint/latest
-output_path=${model_path}.index/nq_test
+#model_path=trained_reader/t5_base_v11lm/checkpoint/latest
+#model_path=trained_reader/nq_reader_base_v11lm_separate_layer6_continue/checkpoint/latest
+model_path=trained_reader/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001/checkpoint/latest
+head_idx=3
+
+passages=open_domain_data/NQ/psgs_w100.test_top10_aggregate.tsv
+index_short_name=nq_test_top10
+output_path=${model_path}.index/${index_short_name}
+
 shard_id=0
 num_shards=1
-per_gpu_batch_size=32
+per_gpu_batch_size=128
 
 if (( ${num_gpu} == 1 )); then
   echo 'single-GPU'
@@ -33,3 +39,4 @@ python ${prefix} retrieval.py \
   --per_gpu_batch_size ${per_gpu_batch_size} \
   --passage_maxlength 200 \
   --indexing_dimension 64 \
+  --head_idx ${head_idx}

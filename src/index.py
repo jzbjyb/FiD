@@ -5,24 +5,37 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Union
 import time
 import glob
 from pathlib import Path
-
+from tqdm import tqdm
+import torch
 import faiss
 import numpy as np
 
-logger = logging.getLogger()
+from src.util import logger
 
 class Indexer(object):
-  def __init__(self, vector_sz: int, n_subquantizers: int = 0, n_bits: int = 8, hnsw_m: int = 0):
+  def __init__(self,
+               vector_sz: int,
+               n_subquantizers: int = 0,
+               n_bits: int = 8,
+               hnsw_m: int = 0,
+               cuda_device: int = -1):
+    self.cuda_device = cuda_device
+    self.use_gpu = cuda_device >= 0
+    if self.use_gpu:
+      self.res = faiss.StandardGpuResources()
     if n_subquantizers > 0:
       self.index = faiss.IndexPQ(vector_sz, n_subquantizers, n_bits, faiss.METRIC_INNER_PRODUCT)
     elif hnsw_m > 0:
       self.index = faiss.IndexHNSWFlat(vector_sz, hnsw_m, faiss.METRIC_INNER_PRODUCT)
     else:
       self.index = faiss.IndexFlatIP(vector_sz)
+    if self.use_gpu:
+      logger.info('Move FAISS index to gpu')
+      self.index = faiss.index_cpu_to_gpu(self.res, self.cuda_device, self.index)
     self.ids = np.empty((0), dtype=str)
     self.texts = np.empty((0), dtype=str)
 
@@ -46,13 +59,20 @@ class Indexer(object):
       if save_or_load_index:
         self.serialize(embeddings_dir)
 
-  def index_data(self, ids: np.ndarray, embeddings: np.ndarray, texts: np.ndarray = None):
+  def index_data(self,
+                 ids: np.ndarray,
+                 embeddings: np.ndarray,
+                 texts: np.ndarray = None,
+                 indexing_batch_size: int = 50000):
       self._update_id_mapping(ids)
       self._update_texts(texts)
       embeddings = embeddings.astype('float32')
+      if self.use_gpu:
+        embeddings = torch.Tensor(embeddings)
       if not self.index.is_trained:
           self.index.train(embeddings)
-      self.index.add(embeddings)
+      for b in tqdm(range(0, len(embeddings), indexing_batch_size), desc='indexing'):
+        self.index.add(embeddings[b:b + indexing_batch_size])
       logger.info(f'total data indexed {len(self.ids)}')
 
   def search_knn(self,
@@ -68,10 +88,9 @@ class Indexer(object):
       q = query_vectors[start_idx:end_idx]
       scores, indexes = self.index.search(q, top_docs)
       # convert to external ids
-      ids = [[str(self.ids[i]) for i in query_top_idxs] for query_top_idxs in indexes]
+      ids = [self.ids[query_top_idxs] for query_top_idxs in indexes]
       # get text
-      texts = [[(str(self.texts[i]) if i < len(self.texts) else '')
-                for i in query_top_idxs] for query_top_idxs in indexes]
+      texts = [(self.texts[query_top_idxs] if len(self.texts) else None) for query_top_idxs in indexes]
       result.extend([(ids[i], scores[i], texts[i]) for i in range(len(ids))])
     return result
 
@@ -90,6 +109,9 @@ class Indexer(object):
     logger.info(f'Loading index from {index_file}, meta data from {meta_file}')
 
     self.index = faiss.read_index(str(index_file))
+    if self.use_gpu:
+      logger.info('Move FAISS index to gpu')
+      self.index = faiss.index_cpu_to_gpu(self.res, self.cuda_device, self.index)
     logger.info('Loaded index of type %s and size %d', type(self.index), self.index.ntotal)
 
     with open(meta_file, 'rb') as reader:

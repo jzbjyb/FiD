@@ -74,6 +74,9 @@ def init_logger(is_main=True, is_distributed=False, filename=None):
         format="[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s",
         handlers=handlers,
     )
+    for h in handlers:
+      logger.addHandler(h)
+    logger.setLevel(logging.INFO if is_main else logging.WARN)
     logging.getLogger('transformers.tokenization_utils').setLevel(logging.ERROR)
     logging.getLogger('transformers.tokenization_utils_base').setLevel(logging.ERROR)
     return logger

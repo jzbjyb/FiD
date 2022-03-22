@@ -3,10 +3,15 @@
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
+model_path=trained_reader/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001/checkpoint/latest
+head_idx=3
+
+token_topk=1000
 queries=open_domain_data/NQ/test.json
-model_path=pretrained_models/nq_reader_base
-passages=${model_path}.index/nq/embedding_*.npz
-output_path=${model_path}.index/nq
+index_short_name=nq_test_top10
+passages=${model_path}.index/${index_short_name}/embedding_*.npz
+output_path=${model_path}.index/${index_short_name}
+
 per_gpu_batch_size=128
 
 if (( ${num_gpu} == 1 )); then
@@ -31,5 +36,8 @@ python ${prefix} retrieval.py \
   --per_gpu_batch_size ${per_gpu_batch_size} \
   --query_maxlength 50 \
   --hnsw_m 0 \
-  --topk 100 \
-  --save_or_load_index
+  --token_topk ${token_topk} \
+  --doc_topk 10 \
+  --head_idx ${head_idx} \
+  --save_or_load_index \
+  --use_faiss_gpu

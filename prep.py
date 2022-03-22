@@ -7,7 +7,7 @@ import numpy as np
 import time
 import random
 import logging
-import copy
+import pickle
 import statistics
 from tqdm import tqdm
 import scipy.stats
@@ -653,7 +653,7 @@ def eval_qa(pred_file: str, gold_file_beir: str, metric: str = 'src.evaluation.e
     print(f'{qtype}\t{np.mean(scores)}')
 
 
-def aggregate_ctx(query_files: List[str], tsv_file: str):
+def aggregate_ctx(query_files: List[str], tsv_file: str, topk: int = None):
   seen_ids: Set[str] = set()
   with open(tsv_file, 'w') as fout:
     fout.write('id\ttext\ttitle\n')
@@ -661,18 +661,41 @@ def aggregate_ctx(query_files: List[str], tsv_file: str):
       with open(query_file, 'r') as fin:
         data = json.load(fin)
         for q in data:
-          for ctx in q['ctxs']:
+          ctxs = q['ctxs']
+          if topk:
+            ctxs = ctxs[:topk]
+          for ctx in ctxs:
             if ctx['id'] not in seen_ids:
               fout.write(f"{ctx['id']}\t{clean_text_for_tsv(ctx['text'])}\t{clean_text_for_tsv(ctx['title'])}\n")
             seen_ids.add(ctx['id'])
   print(f'total #ctx {len(seen_ids)}')
 
 
+def rank2json(rank_file: str, query_json_file: str, psge_tsv_file: str, out_json_file: str):
+  with open(rank_file, 'rb') as fin:
+    qid2rank = pickle.load(fin)
+  docs = src.util.load_passages(psge_tsv_file)
+  did2doc: Dict[str, Tuple] = {doc[0]: doc for doc in docs}
+  with open(query_json_file, 'r') as fin, open(out_json_file, 'w') as fout:
+    queries = json.load(fin)
+    queries_with_newctx: List[Dict] = []
+    for i, query in enumerate(queries):
+      qid = query['id'] if 'id' in query else str(i)
+      rank = qid2rank[qid]
+      query['ctxs'] = [{
+        'id': did,
+        'text': did2doc[did][1],
+        'title': did2doc[did][2],
+      } for did, score in rank]
+      queries_with_newctx.append(query)
+    json.dump(queries_with_newctx, fout, indent=2)
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
     'convert_sciq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
-    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx',
+    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx', 'rank2json',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
@@ -811,4 +834,9 @@ if __name__ == '__main__':
   elif args.task == 'aggregate_ctx':
     query_files = args.inp
     tsv_file = args.out[0]
-    aggregate_ctx(query_files, tsv_file)
+    aggregate_ctx(query_files, tsv_file, topk=None)
+
+  elif args.task == 'rank2json':
+    rank_file, query_json_file, psgs_tsv_file = args.inp
+    out_json_file = args.out[0]
+    rank2json(rank_file, query_json_file, psgs_tsv_file, out_json_file)

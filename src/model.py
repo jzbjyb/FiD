@@ -112,7 +112,7 @@ def t5attention_forward(
 
   # collect encoder attn (before applying mask)
   if hasattr(self, 'collect_for_retrieval'):
-    self.collect_for_retrieval(scores, hidden_states, key_states, value_states)
+    self.collect_for_retrieval(scores, hidden_states, query_states, key_states)
 
   if mask is not None:
     # apply token-leve mask
@@ -946,8 +946,8 @@ def collect_for_retrieval(
      self,
      scores: torch.FloatTensor,  # (bs, n_heads, seq_len, seq_len)
      hidden_states: torch.FloatTensor,  # (bs, seq_len, emb_size)
+     query_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
      key_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
-     value_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
      attention_mask: torch.BoolTensor,  # (bs, seq_len, seq_len)
      aggregation_method: str,  # 'head-query-key'
      field: str,
@@ -973,7 +973,7 @@ def collect_for_retrieval(
     raise NotImplementedError
   cross_mask = (~attention_mask & pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)).unsqueeze(1)  # (bs, 1, seq_len, seq_len)
 
-  self.retrieval = {'key_states': key_states, 'value_states': value_states}
+  self.retrieval = {'query_states': query_states, 'key_states': key_states}
   if aggregation_method == 'all-max-all':
     # max over tokens paying attention
     scores_full = (scores - (~cross_mask * 1e5)).max(2)[0]  # (bs, n_heads, seq_len)

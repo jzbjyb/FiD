@@ -29,63 +29,74 @@ def flatten_embedding(
      input_ids,  # (bs, seq_len)
      attention_mask,  # (bs, seq_len)
      ids,  # (bs,)
-     tokenizer,
      results: Dict[str, List],
      head_idx: int = 0):
-  bs, seq_len = input_ids.size()
+  bs, _, _, seq_len, emb_size_ph = embeddings.size()
+  # TODO: add support for multi-layer and multi-heads
+  # (num_tokens, emb_size_per_head)
+  results['embeddings'].append(torch.masked_select(embeddings[:, 0, head_idx], attention_mask.unsqueeze(-1)).view(-1, emb_size_ph).cpu())
+  results['words'].append(torch.masked_select(input_ids, attention_mask).cpu())  # (num_tokens,)
   for i in range(bs):
-    for j in range(seq_len):
-      if not attention_mask[i, j]:
-        break
+    for j in range(attention_mask[i].sum()):
       results['ids'].append(ids[i])
-      results['embeddings'].append(embeddings[i, 0, head_idx, j])  # TODO: add support for multi-layer and multi-heads
-      results['words'].append(tokenizer.convert_ids_to_tokens([input_ids[i, j].item()])[0])
 
-def encode_context(opt, passages: List[Tuple[str, str, str]], model, tokenizer) -> Dict[str, np.ndarray]:
+def encode_context(
+     opt,
+     passages: List[Tuple[str, str, str]],
+     model,
+     tokenizer) -> Dict[str, np.ndarray]:
   batch_size = opt.per_gpu_batch_size
   collator = src.data.TextCollator(tokenizer, opt.passage_maxlength)
   dataset = src.data.ContextDataset(passages)
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=8, collate_fn=collator)
-  total = 0
   results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': []}
   with torch.no_grad():
     for k, (ids, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
-      embeddings = model.encode_context(
-        input_ids=input_ids.cuda(),
-        attention_mask=attention_mask.cuda())  # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head)
-      flatten_embedding(embeddings, input_ids, attention_mask, ids, tokenizer, results=results, head_idx=opt.head_idx)
-      total += len(ids)
-      if k % 100 == 0:
-        logger.info(f'encoded passages {total}')
-  results['embeddings']: np.ndarray = torch.stack(results['embeddings'], dim=0).cpu().numpy()
+      input_ids = input_ids.cuda()
+      attention_mask = attention_mask.cuda()
+      # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head)
+      embeddings = model.encode_context(input_ids=input_ids, attention_mask=attention_mask)
+      flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
+  results['embeddings']: np.ndarray = torch.cat(results['embeddings'], dim=0).numpy()
+  results['words']: np.ndarray = torch.cat(results['words'], dim=0).numpy()
   results['ids']: np.ndarray = np.array(results['ids'], dtype=str)
-  results['words']: np.ndarray = np.array(results['words'], dtype=str)
   return results
 
-def encode_query_and_search(opt, queries: List[Tuple[str, str]], model, tokenizer, index) -> Dict[str, List[Tuple[str, float]]]:
+def encode_query_and_search(
+     opt,
+     queries: List[Tuple[str, str]],
+     model,
+     tokenizer,
+     index,
+     debug: bool = False) -> Dict[str, List[Tuple[str, float]]]:
   batch_size = opt.per_gpu_batch_size
   collator = src.data.TextCollator(tokenizer, opt.query_maxlength)
   dataset = src.data.QuestionDataset(queries)
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=8, collate_fn=collator)
-  total = 0
   qid2tokens2did2score: Dict[str, List[Dict[str, float]]] = defaultdict(list)
   with torch.no_grad():
     for k, (ids, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
       results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': []}
-      embeddings = model.encode_context(
-        input_ids=input_ids.cuda(),
-        attention_mask=attention_mask.cuda())  # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head)
-      flatten_embedding(embeddings, input_ids, attention_mask, ids, tokenizer, results=results, head_idx=opt.head_idx)
-      results['embeddings']: np.ndarray = torch.stack(results['embeddings'], dim=0).cpu().numpy()
-      top_ids_and_scores = index.search_knn(results['embeddings'], opt.topk)
+      input_ids = input_ids.cuda()
+      attention_mask = attention_mask.cuda()
+      # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head)
+      embeddings = model.encode_query(input_ids=input_ids, attention_mask=attention_mask)
+      flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
+      results['embeddings']: np.ndarray = torch.cat(results['embeddings'], dim=0).numpy()
+      results['words']: np.ndarray = torch.cat(results['words'], dim=0).numpy()
+      results['ids']: np.ndarray = np.array(results['ids'], dtype=str)
+      top_ids_and_scores = index.search_knn(results['embeddings'], opt.token_topk)
       assert len(top_ids_and_scores) == len(results['ids'])
       for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
         qid = results['ids'][i]
         qid2tokens2did2score[qid].append(defaultdict(lambda: -1e10))
         for did, score, text in zip(docids, scores, texts):
+          if debug:
+            qword = tokenizer.convert_ids_to_tokens([results['words'][i]])[0]
+            dword = tokenizer.convert_ids_to_tokens([text])[0]
+            print(qword, dword, score, did)
+            input()
           qid2tokens2did2score[qid][-1][did] = max(score, qid2tokens2did2score[qid][-1][did])
-      if k % 100 == 0:
-        logger.info(f'encoded queries {total}')
   qid2did2score: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(lambda: 0))
   for qid, tokens in qid2tokens2did2score.items():
     for token in tokens:
@@ -93,7 +104,7 @@ def encode_query_and_search(opt, queries: List[Tuple[str, str]], model, tokenize
         qid2did2score[qid][did] += score
   qid2rank: Dict[str, List[Tuple[str, float]]] = {}
   for qid, did2score in qid2did2score.items():
-    qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))
+    qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))[:opt.doc_topk]
   return qid2rank
 
 def main(opt):
@@ -118,11 +129,12 @@ def main(opt):
       opt.indexing_dimension,
       n_subquantizers=opt.n_subquantizers,
       n_bits=opt.n_bits,
-      hnsw_m=opt.hnsw_m)
+      hnsw_m=opt.hnsw_m,
+      cuda_device=0 if opt.use_faiss_gpu else -1)
     index.load_from_npz(args.passages, args.save_or_load_index)
     # query
     qid2rank = encode_query_and_search(opt, queries, model, tokenizer, index)
-    with open(output_path / f'qid2rank.pkl', mode='wb') as f:
+    with open(output_path / f'qid2rank_{opt.token_topk}.pkl', mode='wb') as f:
       pickle.dump(qid2rank, f)
 
   elif args.passages is not None:  # indexing
@@ -161,8 +173,10 @@ if __name__ == '__main__':
   parser.add_argument('--n_bits', type=int, default=8, help='number of bits per subquantizer')
   parser.add_argument('--hnsw_m', type=int, default=8, help='number of bits per subquantizer')
   parser.add_argument('--save_or_load_index', action='store_true', help='if enabled, save index and load index if it exists')
-  parser.add_argument('--topk', type=int, help='return top-k retrieved results')
+  parser.add_argument('--token_topk', type=int, help='return top-k retrieved tokens')
+  parser.add_argument('--doc_topk', type=int, help='return top-k retrieved documents')
   parser.add_argument('--head_idx', type=int, default=0, help='head idx used in retrieval')
+  parser.add_argument('--use_faiss_gpu', action='store_true', help='use faiss gpu')
   args = parser.parse_args()
 
   src.slurm.init_distributed_mode(args)
