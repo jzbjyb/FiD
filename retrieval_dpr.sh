@@ -3,16 +3,15 @@
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
-model_path=trained_reader/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001/checkpoint/latest
-head_idx=3
+model_path=facebook/dpr-ctx_encoder-multiset-base
 
-token_topk=1000
-queries=open_domain_data/NQ/test.json
+passages=open_domain_data/NQ/psgs_w100.test_top10_aggregate.tsv
 index_short_name=nq_test_top10
-passages=${model_path}.index/${index_short_name}/embedding_*.npz
-output_path=${model_path}.index/${index_short_name}
+output_path=pretrained_models/dpr.index/${index_short_name}
 
-per_gpu_batch_size=128
+shard_id=0
+num_shards=1
+per_gpu_batch_size=512
 
 if (( ${num_gpu} == 1 )); then
   echo 'single-GPU'
@@ -29,17 +28,11 @@ else
 fi
 
 python ${prefix} retrieval.py \
-  --model_type fid \
-  --queries ${queries} \
-  --passages ${passages} \
+  --model_type dpr \
   --model_path ${model_path} \
+  --passages ${passages} \
   --output_path ${output_path} \
+  --shard_id ${shard_id} \
+  --num_shards ${num_shards} \
   --per_gpu_batch_size ${per_gpu_batch_size} \
-  --indexing_dimension 64 \
-  --query_maxlength 50 \
-  --hnsw_m 0 \
-  --token_topk ${token_topk} \
-  --doc_topk 10 \
-  --head_idx ${head_idx} \
-  --save_or_load_index \
-  --use_faiss_gpu
+  --passage_maxlength 200

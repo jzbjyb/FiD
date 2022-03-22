@@ -14,7 +14,8 @@ import pickle
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
-import transformers
+from transformers import T5Tokenizer, DPRContextEncoderTokenizer, DPRContextEncoder, \
+  DPRQuestionEncoderTokenizer, DPRQuestionEncoder
 
 import src.model
 import src.data
@@ -54,9 +55,18 @@ def encode_context(
     for k, (ids, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
       input_ids = input_ids.cuda()
       attention_mask = attention_mask.cuda()
-      # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head)
-      embeddings = model.encode_context(input_ids=input_ids, attention_mask=attention_mask)
-      flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
+      if opt.model_type == 'fid':
+        # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head)
+        embeddings = model.encode_context(input_ids=input_ids, attention_mask=attention_mask)
+        flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
+      elif opt.model_type == 'dpr':
+        # (num_docs, emb_size)
+        embeddings = model(input_ids=input_ids, attention_mask=attention_mask).pooler_output
+        results['embeddings'].append(embeddings.cpu())
+        results['words'].append(input_ids[:, 0].cpu())  # TODO: store text
+        results['ids'].extend(ids)
+      else:
+        raise NotImplementedError
   results['embeddings']: np.ndarray = torch.cat(results['embeddings'], dim=0).numpy()
   results['words']: np.ndarray = torch.cat(results['words'], dim=0).numpy()
   results['ids']: np.ndarray = np.array(results['ids'], dtype=str)
@@ -74,34 +84,55 @@ def encode_query_and_search(
   dataset = src.data.QuestionDataset(queries)
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=8, collate_fn=collator)
   qid2tokens2did2score: Dict[str, List[Dict[str, float]]] = defaultdict(list)
+  qid2did2score: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(lambda: 0))
   with torch.no_grad():
     for k, (ids, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
       results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': []}
       input_ids = input_ids.cuda()
       attention_mask = attention_mask.cuda()
-      # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head)
-      embeddings = model.encode_query(input_ids=input_ids, attention_mask=attention_mask)
-      flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
+      if opt.model_type == 'fid':
+        # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head)
+        embeddings = model.encode_query(input_ids=input_ids, attention_mask=attention_mask)
+        flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
+      elif opt.model_type == 'dpr':
+        # (num_queries, emb_size)
+        embeddings = model(input_ids=input_ids, attention_mask=attention_mask).pooler_output
+        results['embeddings'].append(embeddings.cpu())
+        results['words'].append(input_ids[:, 0].cpu())  # TODO: store text
+        results['ids'].extend(ids)
+      else:
+        raise NotImplementedError
       results['embeddings']: np.ndarray = torch.cat(results['embeddings'], dim=0).numpy()
       results['words']: np.ndarray = torch.cat(results['words'], dim=0).numpy()
       results['ids']: np.ndarray = np.array(results['ids'], dtype=str)
-      top_ids_and_scores = index.search_knn(results['embeddings'], opt.token_topk)
-      assert len(top_ids_and_scores) == len(results['ids'])
-      for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
-        qid = results['ids'][i]
-        qid2tokens2did2score[qid].append(defaultdict(lambda: -1e10))
-        for did, score, text in zip(docids, scores, texts):
-          if debug:
-            qword = tokenizer.convert_ids_to_tokens([results['words'][i]])[0]
-            dword = tokenizer.convert_ids_to_tokens([text])[0]
-            print(qword, dword, score, did)
-            input()
-          qid2tokens2did2score[qid][-1][did] = max(score, qid2tokens2did2score[qid][-1][did])
-  qid2did2score: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(lambda: 0))
-  for qid, tokens in qid2tokens2did2score.items():
-    for token in tokens:
-      for did, score in token.items():
-        qid2did2score[qid][did] += score
+
+      if opt.model_type == 'fid':
+        top_ids_and_scores = index.search_knn(results['embeddings'], opt.token_topk)
+        for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
+          qid = results['ids'][i]
+          qid2tokens2did2score[qid].append(defaultdict(lambda: -1e10))
+          for did, score, text in zip(docids, scores, texts):
+            if debug:
+              qword = tokenizer.convert_ids_to_tokens([results['words'][i]])[0]
+              dword = tokenizer.convert_ids_to_tokens([text])[0]
+              print(qword, dword, score, did)
+              input()
+            qid2tokens2did2score[qid][-1][did] = max(score, qid2tokens2did2score[qid][-1][did])
+      elif opt.model_type == 'dpr':
+        top_ids_and_scores = index.search_knn(results['embeddings'], opt.doc_topk)
+        for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
+          qid = results['ids'][i]
+          for did, score, text in zip(docids, scores, texts):
+            qid2did2score[qid][did] = score
+      else:
+        raise NotImplementedError
+
+  if opt.model_type == 'fid':  # aggregate token-level scores
+    for qid, tokens in qid2tokens2did2score.items():
+      for token in tokens:
+        for did, score in token.items():
+          qid2did2score[qid][did] += score
+
   qid2rank: Dict[str, List[Tuple[str, float]]] = {}
   for qid, did2score in qid2did2score.items():
     qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))[:opt.doc_topk]
@@ -110,15 +141,26 @@ def encode_query_and_search(
 def main(opt):
   output_path = Path(args.output_path)
   output_path.mkdir(parents=True, exist_ok=True)
+  is_querying = args.queries is not None
 
-  tokenizer = transformers.T5Tokenizer.from_pretrained('t5-base', return_dict=False)
-  model = src.model.FiDT5.from_pretrained(opt.model_path)
+  if opt.model_type == 'fid':
+    tokenizer = T5Tokenizer.from_pretrained('t5-base', return_dict=False)
+    model = src.model.FiDT5.from_pretrained(opt.model_path)
+  elif opt.model_type == 'dpr':
+    if is_querying:
+      tokenizer = DPRQuestionEncoderTokenizer.from_pretrained(opt.model_path, return_dict=False)
+      model = DPRQuestionEncoder.from_pretrained(opt.model_path)
+    else:
+      tokenizer = DPRContextEncoderTokenizer.from_pretrained(opt.model_path, return_dict=False)
+      model = DPRContextEncoder.from_pretrained(opt.model_path)
+  else:
+    raise NotImplementedError
   model.eval()
   model = model.to(opt.device)
   if opt.fp16:  # this could be dangerous for certain models
     model = model.half()
 
-  if args.queries is not None:  # querying
+  if is_querying:  # querying
     logger = src.util.init_logger(opt.is_main, opt.is_distributed, output_path / 'query.log')
     # load data
     queries = src.data.load_data(args.queries)
@@ -134,10 +176,16 @@ def main(opt):
     index.load_from_npz(args.passages, args.save_or_load_index)
     # query
     qid2rank = encode_query_and_search(opt, queries, model, tokenizer, index)
-    with open(output_path / f'qid2rank_{opt.token_topk}.pkl', mode='wb') as f:
+    if opt.model_type == 'fid':
+      rank_file = output_path / f'qid2rank_{opt.token_topk}.pkl'
+    elif opt.model_type == 'dpr':
+      rank_file = output_path / f'qid2rank_{opt.doc_topk}.pkl'
+    else:
+      raise NotImplementedError
+    with open(rank_file, mode='wb') as f:
       pickle.dump(qid2rank, f)
 
-  elif args.passages is not None:  # indexing
+  else:  # indexing
     logger = src.util.init_logger(opt.is_main, opt.is_distributed, output_path / 'index.log')
     # load data
     passages = src.util.load_passages(args.passages)
@@ -158,6 +206,7 @@ def main(opt):
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
+  parser.add_argument('--model_type', type=str, default='fid', help='type of models', choices=['fid', 'dpr'])
   parser.add_argument('--queries', type=str, default=None, help='path to queries (.json file)')
   parser.add_argument('--passages', type=str, default=None, help='path to passages (.tsv file)')
   parser.add_argument('--output_path', type=str, default=None, help='prefix path to save embeddings')

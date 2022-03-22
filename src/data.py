@@ -270,7 +270,7 @@ class ContextDataset(torch.utils.data.Dataset):
         self.data = data
         self.title_prefix = title_prefix
         self.passage_prefix = passage_prefix
-        self.eos = ' </s>' if add_eos else ''
+        self.eos = ' </s>' if add_eos else ''  # TODO: add tokenizer-specific eos
 
     def __len__(self):
         return len(self.data)

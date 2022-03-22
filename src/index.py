@@ -67,8 +67,6 @@ class Indexer(object):
       self._update_id_mapping(ids)
       self._update_texts(texts)
       embeddings = embeddings.astype('float32')
-      if self.use_gpu:
-        embeddings = torch.Tensor(embeddings)
       if not self.index.is_trained:
           self.index.train(embeddings)
       for b in tqdm(range(0, len(embeddings), indexing_batch_size), desc='indexing'):
@@ -98,8 +96,10 @@ class Indexer(object):
     index_file = dir_path / 'index.faiss'
     meta_file = dir_path / 'index.meta'
     logger.info(f'Serializing index to {index_file}, meta data to {meta_file}')
-
-    faiss.write_index(self.index, str(index_file))
+    if self.use_gpu:
+      faiss.write_index(faiss.index_gpu_to_cpu(self.index), str(index_file))
+    else:
+      faiss.write_index(self.index, str(index_file))
     with open(meta_file, mode='wb') as f:
       np.savez(f, ids=self.ids, texts=self.texts)
 

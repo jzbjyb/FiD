@@ -31,6 +31,7 @@ else
 fi
 
 python ${prefix} retrieval.py \
+  --model_type fid \
   --model_path ${model_path} \
   --passages ${passages} \
   --output_path ${output_path} \
@@ -38,5 +39,4 @@ python ${prefix} retrieval.py \
   --num_shards ${num_shards} \
   --per_gpu_batch_size ${per_gpu_batch_size} \
   --passage_maxlength 200 \
-  --indexing_dimension 64 \
   --head_idx ${head_idx}

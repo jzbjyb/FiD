@@ -3,14 +3,12 @@
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
-model_path=trained_reader/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001/checkpoint/latest
-head_idx=3
+model_path=facebook/dpr-question_encoder-multiset-base
 
-token_topk=1000
 queries=open_domain_data/NQ/test.json
 index_short_name=nq_test_top10
-passages=${model_path}.index/${index_short_name}/embedding_*.npz
-output_path=${model_path}.index/${index_short_name}
+passages=pretrained_models/dpr.index/${index_short_name}/embedding_*.npz
+output_path=pretrained_models/dpr.index/${index_short_name}
 
 per_gpu_batch_size=128
 
@@ -29,17 +27,15 @@ else
 fi
 
 python ${prefix} retrieval.py \
-  --model_type fid \
+  --model_type dpr \
   --queries ${queries} \
   --passages ${passages} \
   --model_path ${model_path} \
   --output_path ${output_path} \
   --per_gpu_batch_size ${per_gpu_batch_size} \
-  --indexing_dimension 64 \
+  --indexing_dimension 768 \
   --query_maxlength 50 \
   --hnsw_m 0 \
-  --token_topk ${token_topk} \
   --doc_topk 10 \
-  --head_idx ${head_idx} \
   --save_or_load_index \
   --use_faiss_gpu
