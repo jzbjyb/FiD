@@ -3,18 +3,35 @@
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
-#model_path=trained_reader/t5_base_v11lm/checkpoint/latest
-#model_path=trained_reader/nq_reader_base_v11lm_separate_layer6_continue/checkpoint/latest
-model_path=trained_reader/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001/checkpoint/latest
-head_idx=3
+index_short_name=$1
 
-passages=open_domain_data/NQ/psgs_w100.test_top10_aggregate.tsv
-index_short_name=nq_test_top10
+#trained_reader/t5_base_v11lm
+#trained_reader/nq_reader_base_v11lm_separate_layer6_continue
+#trained_reader/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001
+#trained_reader/nq_reader_base_v11lm_separate_layer6_continue_decoder50_decattnnorm_tau0001
+model_path=$2/checkpoint/latest
+head_idx=$3
+
+if [[ ${index_short_name} == 'nq_test_top10' ]]; then
+  passages=open_domain_data/NQ/psgs_w100.test_top10_aggregate.tsv
+  passage_maxlength=200
+  per_gpu_batch_size=128
+elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
+  passages=open_domain_data/msmarco_qa/psgs_w100.dev_aggregate.tsv
+  passage_maxlength=200
+  per_gpu_batch_size=128
+elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
+  passages=open_domain_data/bioasq_500k.nosummary/psgs_w100.test_aggregate.tsv
+  passage_maxlength=1024
+  per_gpu_batch_size=32
+else
+  exit
+fi
+
 output_path=${model_path}.index/${index_short_name}
 
 shard_id=0
 num_shards=1
-per_gpu_batch_size=128
 
 if (( ${num_gpu} == 1 )); then
   echo 'single-GPU'
@@ -38,5 +55,5 @@ python ${prefix} retrieval.py \
   --shard_id ${shard_id} \
   --num_shards ${num_shards} \
   --per_gpu_batch_size ${per_gpu_batch_size} \
-  --passage_maxlength 200 \
+  --passage_maxlength ${passage_maxlength} \
   --head_idx ${head_idx}

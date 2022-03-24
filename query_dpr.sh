@@ -4,9 +4,18 @@ export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
 model_path=facebook/dpr-question_encoder-multiset-base
+index_short_name=bioasq_500k_test
 
-queries=open_domain_data/NQ/test.json
-index_short_name=nq_test_top10
+if [[ ${index_short_name} == 'nq_test_top10' ]]; then
+  queries=open_domain_data/NQ/test.json
+elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
+  queries=open_domain_data/msmarco_qa/dev.json
+elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
+  queries=open_domain_data/bioasq_500k.nosummary/test.json
+else
+  exit
+fi
+
 passages=pretrained_models/dpr.index/${index_short_name}/embedding_*.npz
 output_path=pretrained_models/dpr.index/${index_short_name}
 

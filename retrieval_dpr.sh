@@ -4,14 +4,28 @@ export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
 model_path=facebook/dpr-ctx_encoder-multiset-base
+index_short_name=bioasq_500k_test
 
-passages=open_domain_data/NQ/psgs_w100.test_top10_aggregate.tsv
-index_short_name=nq_test_top10
+if [[ ${index_short_name} == 'nq_test_top10' ]]; then
+  passages=open_domain_data/NQ/psgs_w100.test_top10_aggregate.tsv
+  passage_maxlength=200
+  per_gpu_batch_size=512
+elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
+  passages=open_domain_data/msmarco_qa/psgs_w100.dev_aggregate.tsv
+  passage_maxlength=200
+  per_gpu_batch_size=512
+elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
+  passages=open_domain_data/bioasq_500k.nosummary/psgs_w100.test_aggregate.tsv
+  passage_maxlength=512
+  per_gpu_batch_size=256
+else
+  exit
+fi
+
 output_path=pretrained_models/dpr.index/${index_short_name}
 
 shard_id=0
 num_shards=1
-per_gpu_batch_size=512
 
 if (( ${num_gpu} == 1 )); then
   echo 'single-GPU'
@@ -35,4 +49,4 @@ python ${prefix} retrieval.py \
   --shard_id ${shard_id} \
   --num_shards ${num_shards} \
   --per_gpu_batch_size ${per_gpu_batch_size} \
-  --passage_maxlength 200
+  --passage_maxlength ${passage_maxlength}

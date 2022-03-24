@@ -453,26 +453,46 @@ def convert_bioasq_to_beir_format(bioasq_dir: str, beir_dir: str, sub_sample: in
   save_beir_format(beir_dir, qid2dict, did2dict, split2qiddid)
 
 
-def eval_retrieval(data: List[Dict], beir_dir: str, split: str = 'test', topks: List[int] = [1, 3, 5, 10, 100]):
+def load_query2dids_gold(bioasq_raw_dir: str) -> Dict[str, List[str]]:
+  query2dids_gold: Dict[str, List[str]] = defaultdict(list)
+  for root, _, files in os.walk(bioasq_raw_dir):
+    for file in files:
+      with open(os.path.join(root, file), 'r') as fin:
+        data = json.load(fin)
+        for q in data['questions']:
+          query2dids_gold[q['body']] = [d.rsplit('/', 1)[1] for d in q['documents']]
+  return query2dids_gold
+
+
+def eval_retrieval(
+     data: List[Dict],
+     beir_dir: str,
+     split: str = 'test',
+     topks: List[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100],
+     use_raw_bioasq: bool = False):
   use_qid = False
   qid2dids: Dict[str, List[str]] = defaultdict(list)
   for example in data:
-    qid = example['id'] if 'id' in example else example['question']
-    use_qid = True if 'id' in example else use_qid
+    qid = example['id'] if ('id' in example and not use_raw_bioasq) else example['question']
+    use_qid = True if ('id' in example and not use_raw_bioasq) else use_qid
     for d in example['ctxs']:
       qid2dids[qid].append(d['id'])
-  corpus, queries, qrels = GenericDataLoader(data_folder=beir_dir).load(split=split)
-  qid2dict: Dict[str, Dict] = {}
-  with open(os.path.join(beir_dir, 'queries.jsonl'), 'r') as fin:
-    for l in fin:
-      l = json.loads(l)
-      qid2dict[l['_id']] = l
-  qid2dids_gold: Dict[str, List[str]] = defaultdict(list)
-  qid2type: Dict[str, str] = {}
-  for qid in qrels:
-    qid = qid if use_qid else queries[qid]
-    qid2dids_gold[qid].extend([did for did in qrels[qid]])
-    qid2type[qid] = qid2dict[qid]['metadata']['type']
+  if use_raw_bioasq:
+    qid2dids_gold: Dict[str, List[str]] = load_query2dids_gold(beir_dir)
+    qid2type: Dict[str, str] = defaultdict(lambda: None)
+  else:
+    corpus, queries, qrels = GenericDataLoader(data_folder=beir_dir).load(split=split)
+    qid2dict: Dict[str, Dict] = {}
+    with open(os.path.join(beir_dir, 'queries.jsonl'), 'r') as fin:
+      for l in fin:
+        l = json.loads(l)
+        qid2dict[l['_id']] = l
+    qid2dids_gold: Dict[str, List[str]] = defaultdict(list)
+    qid2type: Dict[str, str] = {}
+    for qid in qrels:
+      qid = qid if use_qid else queries[qid]
+      qid2dids_gold[qid].extend([did for did in qrels[qid]])
+      qid2type[qid] = qid2dict[qid]['metadata']['type']
   topk2has = defaultdict(list)
   type2topk2has = defaultdict(lambda: defaultdict(list))
   for qid in qid2dids:

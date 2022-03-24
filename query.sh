@@ -3,15 +3,24 @@
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
-model_path=trained_reader/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001/checkpoint/latest
-head_idx=3
 
-token_topk=1000
-queries=open_domain_data/NQ/test.json
-index_short_name=nq_test_top10
+index_short_name=$1
+model_path=$2/checkpoint/latest
+head_idx=$3
+token_topk=$4
+
+if [[ ${index_short_name} == 'nq_test_top10' ]]; then
+  queries=open_domain_data/NQ/test.json
+elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
+  queries=open_domain_data/msmarco_qa/dev.json
+elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
+  queries=open_domain_data/bioasq_500k.nosummary/test.json
+else
+  exit
+fi
+
 passages=${model_path}.index/${index_short_name}/embedding_*.npz
 output_path=${model_path}.index/${index_short_name}
-
 per_gpu_batch_size=128
 
 if (( ${num_gpu} == 1 )); then
