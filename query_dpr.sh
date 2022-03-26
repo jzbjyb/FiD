@@ -4,7 +4,7 @@ export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
 model_path=facebook/dpr-question_encoder-multiset-base
-index_short_name=bioasq_500k_test
+index_short_name=$1
 
 if [[ ${index_short_name} == 'nq_test_top10' ]]; then
   queries=open_domain_data/NQ/test.json
@@ -12,6 +12,14 @@ elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
   queries=open_domain_data/msmarco_qa/dev.json
 elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
   queries=open_domain_data/bioasq_500k.nosummary/test.json
+elif [[ ${index_short_name} == 'fiqa' ]]; then
+  queries=open_domain_data/fiqa/test.json
+elif [[ ${index_short_name} == 'cqadupstack_mathematica' ]]; then
+  queries=open_domain_data/cqadupstack/mathematica/test.json
+elif [[ ${index_short_name} == 'cqadupstack_physics' ]]; then
+  queries=open_domain_data/cqadupstack/physics/test.json
+elif [[ ${index_short_name} == 'cqadupstack_programmers' ]]; then
+  queries=open_domain_data/cqadupstack/programmers/test.json
 else
   exit
 fi
@@ -46,5 +54,4 @@ python ${prefix} retrieval.py \
   --query_maxlength 50 \
   --hnsw_m 0 \
   --doc_topk 10 \
-  --save_or_load_index \
-  --use_faiss_gpu
+  --save_or_load_index

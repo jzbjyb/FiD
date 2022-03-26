@@ -60,6 +60,14 @@ class BEIRDataset:
   def get_answer_msmarcoqa(cls, metadata: Dict) -> List[str]:
     return metadata['answer']
 
+  @classmethod
+  def get_answer_fiqa(cls, metadata: Dict) -> List[str]:
+    return ['']  # TODO: use the raw long answer?
+
+  @classmethod
+  def get_answer_cqadupstack(cls, metadata: Dict) -> List[str]:
+    return ['']  # TODO: use what for answer?
+
   def load_query(self, filename: str):
     qid2answer: Dict[str, Any] = {}
     with open(filename, 'r') as fin:
@@ -492,7 +500,7 @@ def eval_retrieval(
     for qid in qrels:
       qid = qid if use_qid else queries[qid]
       qid2dids_gold[qid].extend([did for did in qrels[qid]])
-      qid2type[qid] = qid2dict[qid]['metadata']['type']
+      qid2type[qid] = qid2dict[qid]['metadata']['type'] if 'type' in qid2dict[qid]['metadata'] else None
   topk2has = defaultdict(list)
   type2topk2has = defaultdict(lambda: defaultdict(list))
   for qid in qid2dids:
@@ -731,7 +739,7 @@ if __name__ == '__main__':
   elif args.task == 'convert_beir_to_fid_format':
     beir_dir = args.inp[0]
     out_dir = args.out[0]
-    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='msmarcoqa', splits=['dev', 'train'])
+    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='cqadupstack', splits=['test'])
 
   elif args.task == 'convert_sciq_to_beir_format':
     sciq_dir = args.inp[0]

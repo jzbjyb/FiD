@@ -4,7 +4,7 @@ export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
 model_path=facebook/dpr-ctx_encoder-multiset-base
-index_short_name=bioasq_500k_test
+index_short_name=$1
 
 if [[ ${index_short_name} == 'nq_test_top10' ]]; then
   passages=open_domain_data/NQ/psgs_w100.test_top10_aggregate.tsv
@@ -16,6 +16,22 @@ elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
   per_gpu_batch_size=512
 elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
   passages=open_domain_data/bioasq_500k.nosummary/psgs_w100.test_aggregate.tsv
+  passage_maxlength=512
+  per_gpu_batch_size=256
+elif [[ ${index_short_name} == 'fiqa' ]]; then
+  passages=open_domain_data/fiqa/psgs.tsv
+  passage_maxlength=512
+  per_gpu_batch_size=256
+elif [[ ${index_short_name} == 'cqadupstack_mathematica' ]]; then
+  passages=open_domain_data/cqadupstack/mathematica/psgs.tsv
+  passage_maxlength=512
+  per_gpu_batch_size=256
+elif [[ ${index_short_name} == 'cqadupstack_physics' ]]; then
+  passages=open_domain_data/cqadupstack/physics/psgs.tsv
+  passage_maxlength=512
+  per_gpu_batch_size=256
+elif [[ ${index_short_name} == 'cqadupstack_programmers' ]]; then
+  passages=open_domain_data/cqadupstack/programmers/psgs.tsv
   passage_maxlength=512
   per_gpu_batch_size=256
 else

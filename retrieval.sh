@@ -22,8 +22,24 @@ elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
   per_gpu_batch_size=128
 elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
   passages=open_domain_data/bioasq_500k.nosummary/psgs_w100.test_aggregate.tsv
-  passage_maxlength=1024
+  passage_maxlength=1024  # TODO use 512?
   per_gpu_batch_size=32
+elif [[ ${index_short_name} == 'fiqa' ]]; then
+  passages=open_domain_data/fiqa/psgs.tsv
+  passage_maxlength=512
+  per_gpu_batch_size=64
+elif [[ ${index_short_name} == 'cqadupstack_mathematica' ]]; then
+  passages=open_domain_data/cqadupstack/mathematica/psgs.tsv
+  passage_maxlength=512
+  per_gpu_batch_size=64
+elif [[ ${index_short_name} == 'cqadupstack_physics' ]]; then
+  passages=open_domain_data/cqadupstack/physics/psgs.tsv
+  passage_maxlength=512
+  per_gpu_batch_size=64
+elif [[ ${index_short_name} == 'cqadupstack_programmers' ]]; then
+  passages=open_domain_data/cqadupstack/programmers/psgs.tsv
+  passage_maxlength=512
+  per_gpu_batch_size=64
 else
   exit
 fi
