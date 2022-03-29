@@ -48,6 +48,8 @@ class Options():
         self.parser.add_argument('--no_title', action='store_true', 
                         help='article titles not included in passages')
         self.parser.add_argument('--n_context', type=int, default=1)
+        self.parser.add_argument('--only_topk_n_context', type=int, default=None,
+                                 help='mimic in-batch negatives in encoder')
         self.parser.add_argument('--n_layer_two_tower', type=int, default=0,
                                  help='number of layers used for two tower representation')
         self.parser.add_argument('--layer_for_retrieval', type=str, default='first',
@@ -83,6 +85,8 @@ class Options():
         self.parser.add_argument('--encoder_attention_pre_softmax', action='store_true',
                                  help='softmax encoder attention before KL or adding to decoder attention')
         self.parser.add_argument('--metric', type=str, default='em', choices=['em', 'rougel'])
+        self.parser.add_argument('--in_batch_negative', action='store_true',
+                                 help='activate in-batch negative in KL divergence')
 
     def add_retriever_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')

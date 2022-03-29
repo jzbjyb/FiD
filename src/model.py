@@ -15,6 +15,7 @@ import numpy as np
 from transformers.models.t5.modeling_t5 import T5Attention
 from entmax import sparsemax
 from .util import max_sparsify, WandbLogger
+from .dist_utils import all_gather_list
 
 def t5attention_forward(
      self,
@@ -86,6 +87,9 @@ def t5attention_forward(
     hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
   )
 
+  if hasattr(self, 'in_batch_negative'):  # collect q and k from all gpus
+    _query_states, _key_states = self.in_batch_negative(query_states, key_states)  # (b * num_gpu, n, q/k, d)
+
   # compute scores
   scores = torch.matmul(
     query_states, key_states.transpose(3, 2)
@@ -110,9 +114,14 @@ def t5attention_forward(
   # TODO: any better workaround?
   scores += position_bias
 
+  if hasattr(self, 'in_batch_negative'):
+    _scores = torch.matmul(_query_states, _key_states.transpose(3, 2))
+    _scores += position_bias
+
   # collect encoder attn (before applying mask)
   if hasattr(self, 'collect_for_retrieval'):
-    self.collect_for_retrieval(scores, hidden_states, query_states, key_states)
+    self.collect_for_retrieval(
+      _scores if hasattr(self, 'in_batch_negative') else scores, hidden_states, query_states, key_states)
 
   if mask is not None:
     # apply token-leve mask
@@ -170,11 +179,13 @@ class FiDT5Config(transformers.T5Config):
                query_in_decoder: str = 'no',
                num_keep_ctx_in_decoder: int = 0,
                combine_weight: float = 0.0,
+               only_topk_n_context: int = 0,
                keep_ctx_in_decoder_with_head: int = None,
                keep_ctx_in_decoder_head_tau: float = 1.0,
                head_weights_norm_func: str = 'softmax',
                encoder_attention_pre_softmax: bool = False,
                encoder_decoder_kl_ratio: float = 0,
+               in_batch_negative: bool = False,
                encoder_encoder_kl_ratio: float = 0,
                encoder_encoder_kl: str = None,
                encoder_encoder_kl_sparsity: int = 0,
@@ -188,11 +199,13 @@ class FiDT5Config(transformers.T5Config):
     self.query_in_decoder = query_in_decoder
     self.num_keep_ctx_in_decoder = num_keep_ctx_in_decoder
     self.combine_weight = combine_weight
+    self.only_topk_n_context = only_topk_n_context
     self.keep_ctx_in_decoder_with_head = keep_ctx_in_decoder_with_head
     self.keep_ctx_in_decoder_head_tau = keep_ctx_in_decoder_head_tau
     self.head_weights_norm_func = head_weights_norm_func
     self.encoder_attention_pre_softmax = encoder_attention_pre_softmax
     self.encoder_decoder_kl_ratio = encoder_decoder_kl_ratio
+    self.in_batch_negative = in_batch_negative
     self.encoder_encoder_kl_ratio = encoder_encoder_kl_ratio
     self.encoder_encoder_kl = encoder_encoder_kl
     self.encoder_encoder_kl_sparsity = encoder_encoder_kl_sparsity
@@ -219,11 +232,13 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 query_in_decoder: str = 'no',
                 num_keep_ctx_in_decoder: int = 0,
                 combine_weight: float = 0.0,
+                only_topk_n_context: int = 0,
                 keep_ctx_in_decoder_with_head: int = None,
                 keep_ctx_in_decoder_head_tau: float = 1.0,
                 head_weights_norm_func: str = 'softmax',
                 encoder_attention_pre_softmax: bool = False,
                 encoder_decoder_kl_ratio: float = 0,
+                in_batch_negative: bool = False,
                 encoder_encoder_kl_ratio: float = 0,
                 encoder_encoder_kl: str = None,
                 encoder_encoder_kl_sparsity: int = 0,
@@ -237,11 +252,13 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           query_in_decoder=query_in_decoder,
           num_keep_ctx_in_decoder=num_keep_ctx_in_decoder,
           combine_weight=combine_weight,
+          only_topk_n_context=only_topk_n_context,
           keep_ctx_in_decoder_with_head=keep_ctx_in_decoder_with_head,
           keep_ctx_in_decoder_head_tau=keep_ctx_in_decoder_head_tau,
           head_weights_norm_func=head_weights_norm_func,
           encoder_attention_pre_softmax=encoder_attention_pre_softmax,
           encoder_decoder_kl_ratio=encoder_decoder_kl_ratio,
+          in_batch_negative=in_batch_negative,
           encoder_encoder_kl_ratio=encoder_encoder_kl_ratio,
           encoder_encoder_kl=encoder_encoder_kl,
           encoder_encoder_kl_sparsity=encoder_encoder_kl_sparsity,
@@ -490,6 +507,7 @@ class DecoderWrapper(torch.nn.Module):
     self.keep_ctx_in_decoder_head_tau = config.keep_ctx_in_decoder_head_tau
     self.encoder_decoder_kl_ratio = config.encoder_decoder_kl_ratio
     self.decoder_attn_ctx_normalize = config.decoder_attn_ctx_normalize
+    self.only_topk_n_context = config.only_topk_n_context
     self.layer_for_retrieval = config.layer_for_retrieval
     self.n_layer_two_tower = config.n_layer_two_tower
     self.encoder_attention_pre_softmax = config.encoder_attention_pre_softmax
@@ -622,6 +640,7 @@ class DecoderWrapper(torch.nn.Module):
                           encoder_score=encoder_imp,
                           encoder_score_mask=encoder_imp_tok_mask,
                           n_context=num_d,
+                          only_topk_n_context=self.only_topk_n_context,
                           use_softmax=True,
                           encoder_score_pre_softmaxed=self.encoder_attention_pre_softmax), reg_point)
     else:
@@ -809,6 +828,7 @@ class T5blockWrapper(torch.nn.Module):
         self.use_full_attention = use_full_attention
         self.use_for_retrieval = use_for_retrieval
         self.retrieval_aggregation_method = config.retrieval_aggregation_method
+        self.in_batch_negative = config.in_batch_negative
         self.need_collect = FiDT5.need_wrap_decoder(config) or bool(config.encoder_encoder_kl_ratio)
 
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
@@ -823,6 +843,8 @@ class T5blockWrapper(torch.nn.Module):
                     field='query',
                     use_hidden_states=False,
                 ), reg_point)
+            if self.in_batch_negative:  # TODO: add rank
+              reg_point.in_batch_negative = types.MethodType(functools.partial(in_batch_negative, rank=0), reg_point)
         # handle separate/full attention
         if self.use_full_attention:
             # modify (potentially separate) attention mask to make it a full attention
@@ -899,10 +921,15 @@ def encoder_decoder_kl(
      encoder_score: torch.FloatTensor,  # (bs, n_context, [text_len])
      encoder_score_mask: torch.BoolTensor,  # (bs, n_context, text_len)
      n_context: int,
+     only_topk_n_context: int = 0,
      use_softmax: bool = False,
      encoder_score_pre_softmaxed: bool = False):
-  bs = decoder_score.size(0)
+  bs, _, _, enc_seq_len = decoder_score.size()
   has_token = encoder_score.dim() == 3
+
+  if only_topk_n_context:  # only consider the topk context to mimic in-batch negative
+    only_topk_enc_tok = (enc_seq_len // n_context) * only_topk_n_context
+    decoder_score[:, :, :, only_topk_enc_tok:] = -1e5
 
   # apply softmax
   if use_softmax:
@@ -1017,6 +1044,26 @@ def collect_for_retrieval(
   else:
     raise NotImplementedError
   self.retrieval['two_tower_attn_score'] = scores
+
+def in_batch_negative(self,
+                      query_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
+                      key_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
+                      rank: int):
+  global_qk = all_gather_list([query_states.cpu().detach(), key_states.cpu().detach()], max_size=592000)
+  global_q = []
+  global_k = []
+  for i, item in enumerate(global_qk):
+    q, k = item
+    if i != rank:
+      # TODO: we nned to recombine query and docs
+      global_q.append(q.to(query_states.device))
+      global_k.append(k.to(key_states.device))
+    else:
+      global_q.append(query_states)
+      global_k.append(key_states)
+  global_q = torch.cat(global_q, dim=0)
+  global_k = torch.cat(global_k, dim=0)
+  return global_q, global_k
 
 def cross_attention_forward(
         self,

@@ -719,11 +719,32 @@ def rank2json(rank_file: str, query_json_file: str, psge_tsv_file: str, out_json
     json.dump(queries_with_newctx, fout, indent=2)
 
 
+def add_negative(query_file: str, out_file: str, raw_count: int = 100, add_count: int = 100):
+  did2dict: Dict[str, Dict] = {}
+  with open(query_file, 'r') as fin, open(out_file, 'w') as fout:
+    data = json.load(fin)
+    for q in tqdm(data):
+      for ctx in q['ctxs']:
+        did2dict[ctx['id']] = ctx
+    alldids: List[str] = list(set(did2dict.keys()))
+    for q in tqdm(data):
+      returned = [ctx['id'] for ctx in q['ctxs'][:raw_count]]
+      sampled_dids = random.sample(range(len(alldids)), raw_count + add_count)
+      sampled_dids = set(alldids[i] for i in sampled_dids)
+      sampled_dids = list(sampled_dids - set(returned))[:add_count]
+      assert len(returned) == raw_count
+      assert len(sampled_dids) == add_count, f'{len(returned)} {len(sampled_dids)}'
+      q['ctxs'] = []
+      for did in returned + sampled_dids:
+        q['ctxs'].append(did2dict[did])
+    json.dump(data, fout, indent=2)
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
     'convert_sciq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
-    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx', 'rank2json',
+    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx', 'rank2json', 'add_negative',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
@@ -868,3 +889,8 @@ if __name__ == '__main__':
     rank_file, query_json_file, psgs_tsv_file = args.inp
     out_json_file = args.out[0]
     rank2json(rank_file, query_json_file, psgs_tsv_file, out_json_file)
+
+  elif args.task == 'add_negative':
+    query_file = args.inp[0]
+    out_file = args.out[0]
+    add_negative(query_file, out_file, raw_count=50, add_count=50)
