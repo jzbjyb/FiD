@@ -8,6 +8,9 @@ index_short_name=$1
 model_path=$2/checkpoint/latest
 head_idx=$3
 token_topk=$4
+use_position_bias=$5
+per_gpu_batch_size=128
+query_maxlength=50
 
 if [[ ${index_short_name} == 'nq_test_top10' ]]; then
   queries=open_domain_data/NQ/test.json
@@ -27,9 +30,17 @@ else
   exit
 fi
 
-passages=${model_path}.index/${index_short_name}/embedding_*.npz
-output_path=${model_path}.index/${index_short_name}
-per_gpu_batch_size=128
+if [[ ${use_position_bias} == 'true' ]]; then
+  passages=${model_path}.index/${index_short_name}.position/embedding_*.npz
+  output_path=${model_path}.index/${index_short_name}.position
+  indexing_dimension=$((64 + ${query_maxlength}))
+  extra="--use_position_bias"
+else
+  passages=${model_path}.index/${index_short_name}/embedding_*.npz
+  output_path=${model_path}.index/${index_short_name}
+  indexing_dimension=64
+  extra=""
+fi
 
 if (( ${num_gpu} == 1 )); then
   echo 'single-GPU'
@@ -52,10 +63,11 @@ python ${prefix} retrieval.py \
   --model_path ${model_path} \
   --output_path ${output_path} \
   --per_gpu_batch_size ${per_gpu_batch_size} \
-  --indexing_dimension 64 \
-  --query_maxlength 50 \
+  --indexing_dimension ${indexing_dimension} \
+  --query_maxlength ${query_maxlength} \
   --hnsw_m 0 \
   --token_topk ${token_topk} \
   --doc_topk 10 \
   --head_idx ${head_idx} \
-  --save_or_load_index
+  --save_or_load_index \
+  ${extra}

@@ -1,13 +1,35 @@
 #!/usr/bin/env bash
 
-model=trained_reader/nq_reader_base_v11lm_separate_layer6_continue_decoder100_head3_combineweight1/checkpoint/latest
+MAX_NUM_GPU_PER_NODE=8
+num_gpu=$1
+
+model=$2/checkpoint/latest
 #model=pretrained_models/nq_reader_base
 
-data=open_domain_data/NQ/test.json
-ckpt_dir=${model}.allhead_softmax.nq_test
-text_maxlength=250
-per_gpu_batch_size=8
-n_context=100
+dataname=$3
+data=$4
+n_context=$5
+#ckpt_dir=${model}.allhead_softmax.${dataname}_test
+ckpt_dir=${data}.rerank
+
+if [[ ${dataname} == 'nq' ]]; then
+  text_maxlength=250
+  per_gpu_batch_size=8
+elif [[ ${dataname} == 'bioasq' ]]; then
+  text_maxlength=1024
+  per_gpu_batch_size=1
+elif [[ ${dataname} == 'msmarcoqa' ]]; then
+  text_maxlength=250
+  per_gpu_batch_size=8
+else
+  exit
+fi
+
+#data=open_domain_data/NQ/test.json
+#ckpt_dir=${model}.allhead_softmax.nq_test
+#text_maxlength=250
+#per_gpu_batch_size=8
+#n_context=100
 
 #data=open_domain_data/SciQ/test.json
 #ckpt_dir=${model}.allhead_softmax.sciq_test
@@ -33,8 +55,6 @@ n_context=100
 #per_gpu_batch_size=12
 #n_context=10
 
-MAX_NUM_GPU_PER_NODE=8
-num_gpu=$1
 attention_mask=separate
 query_in_decoder=no
 

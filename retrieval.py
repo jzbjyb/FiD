@@ -57,7 +57,10 @@ def encode_context(
       attention_mask = attention_mask.cuda()
       if opt.model_type == 'fid':
         # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head)
-        embeddings = model.encode_context(input_ids=input_ids, attention_mask=attention_mask)
+        embeddings = model.encode_context(
+          input_ids=input_ids,
+          attention_mask=attention_mask,
+          max_query_len=opt.query_maxlength if opt.use_position_bias else None)
         flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
       elif opt.model_type == 'dpr':
         # (num_docs, emb_size)
@@ -92,7 +95,10 @@ def encode_query_and_search(
       attention_mask = attention_mask.cuda()
       if opt.model_type == 'fid':
         # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head)
-        embeddings = model.encode_query(input_ids=input_ids, attention_mask=attention_mask)
+        embeddings = model.encode_query(
+          input_ids=input_ids,
+          attention_mask=attention_mask,
+          max_query_len=opt.query_maxlength if opt.use_position_bias else None)
         flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
       elif opt.model_type == 'dpr':
         # (num_queries, emb_size)
@@ -226,6 +232,7 @@ if __name__ == '__main__':
   parser.add_argument('--doc_topk', type=int, help='return top-k retrieved documents')
   parser.add_argument('--head_idx', type=int, default=0, help='head idx used in retrieval')
   parser.add_argument('--use_faiss_gpu', action='store_true', help='use faiss gpu')
+  parser.add_argument('--use_position_bias', action='store_true', help='use position bias')
   args = parser.parse_args()
 
   src.slurm.init_distributed_mode(args)

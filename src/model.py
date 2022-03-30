@@ -313,24 +313,55 @@ class FiDT5(transformers.T5ForConditionalGeneration):
 
     def encode_context(self,
                        input_ids,  # (num_docs, seq_len)
-                       attention_mask):  # (num_docs, seq_len)
+                       attention_mask,  # (num_docs, seq_len)
+                       max_query_len: int = None):
         self.encoder(input_ids=input_ids, attention_mask=attention_mask, direct=True)
         # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head)
         context_embedding = self.encoder.get_collected_for_retrieval()['key_states']
+        # (n_heads, max_seq_len, max_seq_len)
+        position_bias = self.encoder.encoder.block[0].module.layer[0].SelfAttention.compute_bias(1500, 1500)[0]  # larger than 1024 to avoid overflow
         if self.config.keep_ctx_in_decoder_with_head is not None:
           hi = self.config.keep_ctx_in_decoder_with_head
           context_embedding = context_embedding[:, :, hi:hi + 1]  # (num_docs, n_layer, 1 (n_heads), seq_len, emb_size_per_head)
+          position_bias = position_bias[hi:hi + 1]  # (1 (n_heads), max_seq_len, max_seq_len)
+        if max_query_len:  # use position bias as additional "embedding"
+          num_docs, n_layer, n_heads, seq_len = context_embedding.size()[:4]
+          # (n_heads, seq_len, max_query_len)
+          position_bias = position_bias[:, :max_query_len, max_query_len:max_query_len + seq_len].permute([0, 2, 1])
+          assert position_bias.size(1) == seq_len
+          # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head + max_query_len)
+          context_embedding = torch.cat(
+            [context_embedding, position_bias.unsqueeze(0).unsqueeze(0).repeat(num_docs, n_layer, 1, 1, 1)], dim=-1)
         return context_embedding
 
     def encode_query(self,
                      input_ids,  # (num_queries, seq_len)
-                     attention_mask):  # (num_queries, seq_len)
+                     attention_mask,  # (num_queries, seq_len)
+                     max_query_len: int = None,
+                     random_position: bool = False):
         self.encoder(input_ids=input_ids, attention_mask=attention_mask, direct=True)
         # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head)
         query_embedding = self.encoder.get_collected_for_retrieval()['query_states']
         if self.config.keep_ctx_in_decoder_with_head is not None:
           hi = self.config.keep_ctx_in_decoder_with_head
           query_embedding = query_embedding[:, :, hi:hi + 1]  # (num_queries, n_layer, 1 (n_heads), seq_len, emb_size_per_head)
+        if max_query_len:
+          num_queries, n_layer, n_heads, seq_len = query_embedding.size()[:4]
+          assert seq_len <= max_query_len
+          # get index
+          if random_position:
+            offset_to_last_adj = torch.randint(0, max_query_len, (num_queries, seq_len)).to(input_ids.device)
+          else:
+            pos_ind = torch.cumsum(attention_mask, dim=-1) - 1  # [0, 1, 2, 3, 3, ..., 3] a 4-token query
+            query_len = torch.sum(attention_mask, dim=-1)  # 4
+            offset_to_last = pos_ind - query_len.unsqueeze(-1)  # [-4, -3, -2, -1, -1, ..., -1]
+            offset_to_last_adj = max_query_len + offset_to_last
+          # convert to one-hot and concat
+          one_hot = torch.zeros_like(input_ids).unsqueeze(-1).repeat(1, 1, max_query_len)  # (num_queries, seq_len, max_query_len)
+          one_hot.scatter_(-1, offset_to_last_adj.unsqueeze(-1), 1)
+          # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head + max_query_len)
+          query_embedding = torch.cat(
+            [query_embedding, one_hot.unsqueeze(1).unsqueeze(1).repeat(1, n_layer, n_heads, 1, 1)], dim=-1)
         return query_embedding
 
     # We need to resize the inputs here, as the generate method expect 2D tensors

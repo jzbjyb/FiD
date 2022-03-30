@@ -6,7 +6,6 @@
 #SBATCH --output=slurm_out/%j.out
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
-WANDB_MODE='offline'
 
 train_data=open_domain_data/NQ/train.raw50randneg50.json
 eval_data=open_domain_data/NQ/dev.raw50randneg50.json
@@ -27,9 +26,9 @@ combine_weight=0
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_raw50randneg0
+name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_raw50randneg50all
 init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
-n_context=50
+n_context=100
 only_topk_n_context=0
 n_layer_two_tower=6
 layer_for_retrieval=first
@@ -101,7 +100,7 @@ python ${prefix} train_reader.py \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
-  #--init_from ${init_from}
+  --init_from ${init_from}
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
 # --decoder_attn_ctx_normalize \

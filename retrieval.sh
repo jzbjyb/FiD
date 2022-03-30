@@ -11,7 +11,9 @@ index_short_name=$1
 #trained_reader/nq_reader_base_v11lm_separate_layer6_continue_decoder50_decattnnorm_tau0001
 model_path=$2/checkpoint/latest
 head_idx=$3
+use_position_bias=$4
 
+query_maxlength=50
 if [[ ${index_short_name} == 'nq_test_top10' ]]; then
   passages=open_domain_data/NQ/psgs_w100.test_top10_aggregate.tsv
   passage_maxlength=200
@@ -44,7 +46,13 @@ else
   exit
 fi
 
-output_path=${model_path}.index/${index_short_name}
+if [[ ${use_position_bias} == 'true' ]]; then
+  output_path=${model_path}.index/${index_short_name}.position
+  extra="--use_position_bias"
+else
+  output_path=${model_path}.index/${index_short_name}
+  extra=""
+fi
 
 shard_id=0
 num_shards=1
@@ -72,4 +80,6 @@ python ${prefix} retrieval.py \
   --num_shards ${num_shards} \
   --per_gpu_batch_size ${per_gpu_batch_size} \
   --passage_maxlength ${passage_maxlength} \
-  --head_idx ${head_idx}
+  --query_maxlength ${query_maxlength} \
+  --head_idx ${head_idx} \
+  ${extra}
