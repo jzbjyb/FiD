@@ -9,13 +9,14 @@ import types
 import torch
 import transformers
 import functools
+import math
 import torch.nn.functional as F
 from torch import nn
 import numpy as np
 from transformers.models.t5.modeling_t5 import T5Attention
 from entmax import sparsemax
 from .util import max_sparsify, WandbLogger
-from .dist_utils import all_gather_list
+from .dist_utils import gather_tensors, get_rank
 
 def t5attention_forward(
      self,
@@ -87,9 +88,6 @@ def t5attention_forward(
     hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
   )
 
-  if hasattr(self, 'in_batch_negative'):  # collect q and k from all gpus
-    _query_states, _key_states = self.in_batch_negative(query_states, key_states)  # (b * num_gpu, n, q/k, d)
-
   # compute scores
   scores = torch.matmul(
     query_states, key_states.transpose(3, 2)
@@ -114,14 +112,9 @@ def t5attention_forward(
   # TODO: any better workaround?
   scores += position_bias
 
-  if hasattr(self, 'in_batch_negative'):
-    _scores = torch.matmul(_query_states, _key_states.transpose(3, 2))
-    _scores += position_bias
-
   # collect encoder attn (before applying mask)
   if hasattr(self, 'collect_for_retrieval'):
-    self.collect_for_retrieval(
-      _scores if hasattr(self, 'in_batch_negative') else scores, hidden_states, query_states, key_states)
+    self.collect_for_retrieval(scores, hidden_states, query_states, key_states, position_bias)
 
   if mask is not None:
     # apply token-leve mask
@@ -542,6 +535,7 @@ class DecoderWrapper(torch.nn.Module):
     self.layer_for_retrieval = config.layer_for_retrieval
     self.n_layer_two_tower = config.n_layer_two_tower
     self.encoder_attention_pre_softmax = config.encoder_attention_pre_softmax
+    self.in_batch_negative = config.in_batch_negative
     if self.encoder_attention_pre_softmax and self.num_keep_ctx_in_decoder:
       raise NotImplementedError
     if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
@@ -673,7 +667,8 @@ class DecoderWrapper(torch.nn.Module):
                           n_context=num_d,
                           only_topk_n_context=self.only_topk_n_context,
                           use_softmax=True,
-                          encoder_score_pre_softmaxed=self.encoder_attention_pre_softmax), reg_point)
+                          encoder_score_pre_softmaxed=self.encoder_attention_pre_softmax,
+                          in_batch_negative=self.in_batch_negative), reg_point)
     else:
       raise NotImplementedError
     # decode
@@ -703,6 +698,8 @@ class EncoderWrapper(torch.nn.Module):
           del kwargs['direct']
           return self.encoder(input_ids, attention_mask, **kwargs)
         n_passages = kwargs['n_passages'] if 'n_passages' in kwargs else self.n_passages
+        for block in self.encoder.block:
+          block.n_passages = n_passages
         # total_length = n_passages * passage_length
         bsz, total_length = input_ids.shape
         passage_length = total_length // n_passages
@@ -874,8 +871,9 @@ class T5blockWrapper(torch.nn.Module):
                     field='query',
                     use_hidden_states=False,
                 ), reg_point)
-            if self.in_batch_negative:  # TODO: add rank
-              reg_point.in_batch_negative = types.MethodType(functools.partial(in_batch_negative, rank=0), reg_point)
+            if self.in_batch_negative:
+              reg_point.in_batch_negative = types.MethodType(
+                functools.partial(in_batch_negative, n_context=self.n_passages), reg_point)
         # handle separate/full attention
         if self.use_full_attention:
             # modify (potentially separate) attention mask to make it a full attention
@@ -949,12 +947,13 @@ def encoder_decoder_kl(
      self,
      decoder_score: torch.FloatTensor,  # (bs, n_heads, dec_seq_len, enc_seq_len)
      decoder_mask: torch.BoolTensor,  # (bs, n_heads or 1, dec_seq_len, enc_seq_len)
-     encoder_score: torch.FloatTensor,  # (bs, n_context, [text_len])
+     encoder_score: torch.FloatTensor,  # (bs, n_context, [text_len]) or ((n_gpu * bs)^2, n_context)
      encoder_score_mask: torch.BoolTensor,  # (bs, n_context, text_len)
      n_context: int,
      only_topk_n_context: int = 0,
      use_softmax: bool = False,
-     encoder_score_pre_softmaxed: bool = False):
+     encoder_score_pre_softmaxed: bool = False,
+     in_batch_negative: bool = False):
   bs, _, _, enc_seq_len = decoder_score.size()
   has_token = encoder_score.dim() == 3
 
@@ -970,6 +969,8 @@ def encoder_decoder_kl(
   decoder_mask = decoder_mask[:, 0, 0]  # (bs, enc_seq_len)
 
   if has_token:  # token-level kl
+    if in_batch_negative:
+      raise NotImplementedError
     assert not encoder_score_pre_softmaxed
     encoder_score = encoder_score.view(bs, -1)  # (bs, enc_seq_len)
     encoder_score_mask = encoder_score_mask.view(bs, -1)  # (bs, enc_seq_len)
@@ -994,23 +995,45 @@ def encoder_decoder_kl(
     dec_attn = torch.softmax(s, dim=-1)  # no grad to decoder
   WandbLogger.log_w_step({'decoder-dist-kl': torch.sort(dec_attn[0], descending=True)[0][:10]})
   if encoder_score_pre_softmaxed:
+    if in_batch_negative:
+      raise NotImplementedError
     enc_attn = encoder_score  # already with log
   else:
+    if in_batch_negative:
+      bs_t_ngpu = math.sqrt(encoder_score.size(0))
+      assert int(bs_t_ngpu) == bs_t_ngpu
+      bs_t_ngpu = int(bs_t_ngpu)
+      encoder_score = encoder_score.view(bs_t_ngpu, -1)  # (n_gpu * bs, n_gpu * bs * n_context)
     enc_attn = torch.log_softmax(encoder_score, dim=-1)
+  if in_batch_negative:
+    global_dec_attn, = gather_tensors(dec_attn)
+    global_dec_attn = torch.cat(global_dec_attn, dim=0).to(dec_attn).detach()  # (n_gpu * bs, n_context)
+    # (n_gpu * bs, n_gpu * bs * n_context)
+    dec_attn = torch.cat([global_dec_attn, torch.zeros((bs_t_ngpu, (bs_t_ngpu - 1) * n_context)).to(dec_attn)], dim=-1)
   kl = kl_loss_func(enc_attn, dec_attn.detach())
+  # TODO: debug
+  #print(encoder_score[:, ::50], get_rank())
+  #print(dec_attn[:, 0], get_rank())
+  #input()
   return kl
 
 def collect_for_retrieval(
      self,
-     scores: torch.FloatTensor,  # (bs, n_heads, seq_len, seq_len)
-     hidden_states: torch.FloatTensor,  # (bs, seq_len, emb_size)
-     query_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
-     key_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
-     attention_mask: torch.BoolTensor,  # (bs, seq_len, seq_len)
+     scores: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, seq_len)
+     hidden_states: torch.FloatTensor,  # (bs * n_context, seq_len, emb_size)
+     query_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+     key_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+     position_bias: torch.FloatTensor,  # (1, n_heads, seq_len, seq_len)
+     attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
      aggregation_method: str,  # 'head-query-key'
      field: str,
-     use_hidden_states: bool,
-):
+     use_hidden_states: bool):
+  if hasattr(self, 'in_batch_negative'):  # collect and combine from all gpu
+    # mask is ((n_gpu * bs)^2 * n_context, seq_len, seq_len)
+    _query_states, _key_states, attention_mask = self.in_batch_negative(query_states, key_states, attention_mask)
+    # ((n_gpu * bs)^2 * n_context, n_heads, seq_len, seq_len)
+    scores = torch.matmul(_query_states, _key_states.transpose(3, 2)) + position_bias
+
   if use_hidden_states:
     scores = torch.matmul(
       hidden_states,
@@ -1076,25 +1099,100 @@ def collect_for_retrieval(
     raise NotImplementedError
   self.retrieval['two_tower_attn_score'] = scores
 
+def cross_combine(values,  # (query_dim, doc_dim, seq_len, ...)
+                  sep_lens,
+                  diagonal: bool = True):  # (query_dim)
+  query_dim, doc_dim, seq_len = values.size()[:3]
+  query_values: List[torch.Tensor] = []
+  doc_values: List[torch.Tensor] = []
+  for value, sep_len in zip(values, sep_lens):
+    query_values.append(value[:, :sep_len])
+    doc_values.append(value[:, sep_len:])
+  new_combs: List[List[torch.Tensor]] = []
+  for qi, query_value in enumerate(query_values):
+    new_combs.append([])
+    for di, doc_value in enumerate(doc_values):
+      new_comb = torch.cat([query_value, doc_value], dim=1)
+      real_seq_len = new_comb.size(1)
+      if real_seq_len < seq_len:
+        size = list(new_comb.size())
+        size[1] = seq_len - real_seq_len
+        new_comb = torch.cat([new_comb, torch.zeros(*size).to(new_comb)], dim=1)  # padding
+      elif real_seq_len > seq_len:
+        new_comb = new_comb[:, :seq_len]  # truncate
+      if not diagonal and qi == di:
+        new_combs[-1].insert(0, new_comb)
+      else:
+        new_combs[-1].append(new_comb)
+  new_combs = torch.stack([d for q in new_combs for d in q], dim=0)  # (query_dim * query_dim, doc_dim, seq_len, ...)
+  return new_combs
+
+def cross_combine2(values,  # (query_dim, doc_dim, seq_len, seq_len, ...)
+                   sep_lens,
+                   diagonal: bool = True):  # (query_dim)
+  query_dim, doc_dim, seq_len = values.size()[:3]
+  query_values: List[torch.Tensor] = []
+  doc_values: List[torch.Tensor] = []
+  for value, sep_len in zip(values, sep_lens):
+    query_values.append(value[:, :sep_len])
+    doc_values.append(value[:, sep_len:, sep_len:])
+  new_combs: List[List[torch.Tensor]] = []
+  for qi, (query_value, sep_len) in enumerate(zip(query_values, sep_lens)):
+    new_combs.append([])
+    assert sep_len == query_value.size(1)
+    for di, doc_value in enumerate(doc_values):
+      # adjust along dim 2
+      size = list(doc_value.size())
+      size[2] = sep_len
+      doc_value = torch.cat([torch.zeros(*size).to(doc_value), doc_value], dim=2)
+      real_seq_len = doc_value.size(2)
+      if real_seq_len < seq_len:
+        size = list(doc_value.size())
+        size[2] = seq_len - real_seq_len
+        doc_value = torch.cat([doc_value, torch.zeros(*size).to(doc_value)], dim=2)  # padding
+      elif real_seq_len > seq_len:
+        doc_value = doc_value[:, :, :seq_len]  # truncate
+      # adjust along dim 1
+      new_comb = torch.cat([query_value, doc_value], dim=1)
+      real_seq_len = new_comb.size(1)
+      if real_seq_len < seq_len:
+        ext = new_comb[:, -1:].repeat(1, seq_len - real_seq_len, *([1] * (new_comb.dim() - 2)))
+        new_comb = torch.cat([new_comb, ext], dim=1)  # padding
+      elif real_seq_len > seq_len:
+        new_comb = new_comb[:, :seq_len]  # truncate
+      if not diagonal and qi == di:
+        new_combs[-1].insert(0, new_comb)
+      else:
+        new_combs[-1].append(new_comb)
+  new_combs = torch.stack([d for q in new_combs for d in q], dim=0)  # (query_dim * query_dim, doc_dim, seq_len, seq_len, ...)
+  return new_combs
+
 def in_batch_negative(self,
-                      query_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
-                      key_states: torch.FloatTensor,  # (bs, n_heads, seq_len, emb_size_per_head)
-                      rank: int):
-  global_qk = all_gather_list([query_states.cpu().detach(), key_states.cpu().detach()], max_size=592000)
-  global_q = []
-  global_k = []
-  for i, item in enumerate(global_qk):
-    q, k = item
-    if i != rank:
-      # TODO: we nned to recombine query and docs
-      global_q.append(q.to(query_states.device))
-      global_k.append(k.to(key_states.device))
-    else:
-      global_q.append(query_states)
-      global_k.append(key_states)
-  global_q = torch.cat(global_q, dim=0)
-  global_k = torch.cat(global_k, dim=0)
-  return global_q, global_k
+                      query_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+                      key_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+                      attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
+                      n_context: int):
+  # collect query, key, and attn across all gpus
+  global_q, global_k, global_attn = gather_tensors(query_states, key_states, attention_mask)
+  # (n_q, n_context, n_heads, seq_len, emb_size_per_head)  n_q = world_size * bs
+  global_q = torch.cat(global_q, dim=0).view(*((-1, n_context) + query_states.size()[1:]))
+  global_k = torch.cat(global_k, dim=0).view(*((-1, n_context) + key_states.size()[1:]))
+  # (n_q, n_context, seq_len, seq_len)
+  global_attn = torch.cat(global_attn, dim=0).view(*((-1, n_context) + attention_mask.size()[1:]))
+  query_len = global_attn[:, 0, 0].sum(-1)  # (n_q)
+
+  # cross combine
+  # (n_q * n_q, n_context, n_heads, seq_len, emb_size_per_head)
+  global_q = cross_combine(global_q, query_len, diagonal=False)
+  global_k = cross_combine(global_k, query_len, diagonal=False)
+  # (n_q * n_q, n_context, seq_len, seq_len)
+  global_attn = cross_combine2(global_attn, query_len, diagonal=False)
+
+  global_q = global_q.view(-1, *global_q.size()[2:])  # (n_q * n_q * n_context, n_heads, seq_len, emb_size_per_head)
+  global_k = global_k.view(-1, *global_k.size()[2:])
+  global_attn = global_attn.view(-1, *global_attn.size()[2:])  # (n_q * n_q * n_context, seq_len, seq_len)
+
+  return global_q, global_k, global_attn
 
 def cross_attention_forward(
         self,

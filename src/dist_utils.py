@@ -94,3 +94,14 @@ def all_gather_list(data, group=None, max_size=16384):
             'in your training script that can cause one worker to finish an epoch '
             'while other workers are still iterating over their portions of the data.'
         )
+
+
+def _gather_tensor(t: torch.Tensor):
+  all_tensors = [torch.empty_like(t) for _ in range(get_world_size())]
+  dist.all_gather(all_tensors, t)
+  all_tensors[get_rank()] = t
+  return all_tensors
+
+def gather_tensors(*tt: torch.Tensor):
+  tt = [_gather_tensor(t) for t in tt]
+  return tt

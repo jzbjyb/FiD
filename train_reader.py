@@ -21,7 +21,7 @@ import src.util
 import src.evaluation
 import src.data
 import src.model
-from src.util import WandbLogger
+from src.util import WandbLogger, global_context
 
 
 def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_metric, checkpoint_path):
@@ -150,9 +150,10 @@ if __name__ == "__main__":
     options.add_optim_options()
     opt = options.parse()
     #opt = options.get_options(use_reader=True, use_optim=True)
+    global_context['opt'] = opt
 
     torch.manual_seed(opt.seed)
-    src.slurm.init_distributed_mode(opt)
+    src.slurm.init_distributed_mode(opt, is_slurm_job=False)
     src.slurm.init_signal_handler()
 
     checkpoint_path = Path(opt.checkpoint_dir)/opt.name

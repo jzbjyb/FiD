@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 clean_text_for_tsv = lambda x: '' if x is None else x.replace('\n', ' ').replace('\t', ' ')
 
+global_context = {'opt': None}
+
 @contextlib.contextmanager
 def open_file(path_to_file: str, mode: str = 'r'):
     if path_to_file is None:

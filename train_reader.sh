@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-#SBATCH --mem=32000
-#SBATCH --gres=gpu:3090:1
+#SBATCH --mem=64000
+#SBATCH --gres=gpu:A6000:2
 #SBATCH --cpus-per-task=4
 #SBATCH --time=0
 #SBATCH --output=slurm_out/%j.out
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
-train_data=open_domain_data/NQ/train.raw50randneg50.json
-eval_data=open_domain_data/NQ/dev.raw50randneg50.json
+train_data=open_domain_data/NQ/train.json
+eval_data=open_domain_data/NQ/dev.json
 #train_data=open_domain_data/scifact/train.json
 #eval_data=open_domain_data/scifact/test.json
 #train_data=open_domain_data/SciQ/train.json
@@ -26,7 +26,7 @@ combine_weight=0
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_raw50randneg50all
+name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_inbatchneg4
 init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
 n_context=100
 only_topk_n_context=0
@@ -93,14 +93,15 @@ python ${prefix} train_reader.py \
   --retrieval_aggregation_method ${retrieval_aggregation_method} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 300 \
-  --warmup_step 30 \
-  --save_freq 300 \
-  --eval_freq 50 \
+  --total_step 1000 \
+  --warmup_step 100 \
+  --save_freq 500 \
+  --eval_freq 200 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
-  --init_from ${init_from}
+  --init_from ${init_from} \
+  --in_batch_negative
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
 # --decoder_attn_ctx_normalize \
