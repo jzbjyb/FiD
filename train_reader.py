@@ -42,9 +42,8 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
         sampler=train_sampler,
         batch_size=opt.per_gpu_batch_size,
         drop_last=True,
-        num_workers=10,
-        collate_fn=collator
-    )
+        num_workers=opt.num_workers,
+        collate_fn=collator)
 
     loss, curr_loss = 0.0, 0.0
     epoch = 0
@@ -112,9 +111,8 @@ def evaluate(model, dataset, tokenizer, collator, opt):
         sampler=sampler,
         batch_size=opt.per_gpu_batch_size,
         drop_last=False,
-        num_workers=10,
-        collate_fn=collator
-    )
+        num_workers=opt.num_workers,
+        collate_fn=collator)
     model.eval()
     total = 0
     exactmatch = []

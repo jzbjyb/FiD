@@ -125,6 +125,7 @@ class Options():
         self.parser.add_argument("--main_port", type=int, default=-1,
                         help="Main port (for multi-node SLURM jobs)")
         self.parser.add_argument('--seed', type=int, default=0, help="random seed for initialization")
+        self.parser.add_argument('--num_workers', type=int, default=0, help='number of workers for dataloader')
         # training parameters
         self.parser.add_argument('--eval_freq', type=int, default=500,
                         help='evaluate model every <eval_freq> steps during training')

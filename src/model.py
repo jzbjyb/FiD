@@ -668,7 +668,7 @@ class DecoderWrapper(torch.nn.Module):
                           only_topk_n_context=self.only_topk_n_context,
                           use_softmax=True,
                           encoder_score_pre_softmaxed=self.encoder_attention_pre_softmax,
-                          in_batch_negative=self.in_batch_negative), reg_point)
+                          in_batch_negative=self.in_batch_negative and self.training), reg_point)  # only activate in training
     else:
       raise NotImplementedError
     # decode
@@ -1028,7 +1028,7 @@ def collect_for_retrieval(
      aggregation_method: str,  # 'head-query-key'
      field: str,
      use_hidden_states: bool):
-  if hasattr(self, 'in_batch_negative'):  # collect and combine from all gpu
+  if hasattr(self, 'in_batch_negative') and self.training:  # collect and combine from all gpu (only in training)
     # mask is ((n_gpu * bs)^2 * n_context, seq_len, seq_len)
     _query_states, _key_states, attention_mask = self.in_batch_negative(query_states, key_states, attention_mask)
     # ((n_gpu * bs)^2 * n_context, n_heads, seq_len, seq_len)
