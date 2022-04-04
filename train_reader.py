@@ -219,6 +219,7 @@ if __name__ == "__main__":
           head_weights_norm_func=opt.head_weights_norm_func,
           encoder_decoder_kl_ratio=opt.encoder_decoder_kl_ratio,
           in_batch_negative=opt.in_batch_negative,
+          pairwise_loss=opt.pairwise_loss,
           encoder_encoder_kl_ratio=opt.encoder_encoder_kl_ratio,
           encoder_encoder_kl_sparsity=opt.encoder_encoder_kl_sparsity,
           encoder_encoder_kl=opt.encoder_encoder_kl,

@@ -87,6 +87,8 @@ class Options():
         self.parser.add_argument('--metric', type=str, default='em', choices=['em', 'rougel'])
         self.parser.add_argument('--in_batch_negative', action='store_true',
                                  help='activate in-batch negative in KL divergence')
+        self.parser.add_argument('--pairwise_loss', type=str, default=None, choices=[None, 'sigmoid'],
+                                 help='pairwise loss function used when --in_batch_negative is activated')
 
     def add_retriever_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')

@@ -179,6 +179,7 @@ class FiDT5Config(transformers.T5Config):
                encoder_attention_pre_softmax: bool = False,
                encoder_decoder_kl_ratio: float = 0,
                in_batch_negative: bool = False,
+               pairwise_loss: str = None,
                encoder_encoder_kl_ratio: float = 0,
                encoder_encoder_kl: str = None,
                encoder_encoder_kl_sparsity: int = 0,
@@ -199,6 +200,7 @@ class FiDT5Config(transformers.T5Config):
     self.encoder_attention_pre_softmax = encoder_attention_pre_softmax
     self.encoder_decoder_kl_ratio = encoder_decoder_kl_ratio
     self.in_batch_negative = in_batch_negative
+    self.pairwise_loss = pairwise_loss
     self.encoder_encoder_kl_ratio = encoder_encoder_kl_ratio
     self.encoder_encoder_kl = encoder_encoder_kl
     self.encoder_encoder_kl_sparsity = encoder_encoder_kl_sparsity
@@ -232,6 +234,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 encoder_attention_pre_softmax: bool = False,
                 encoder_decoder_kl_ratio: float = 0,
                 in_batch_negative: bool = False,
+                pairwise_loss: str = None,
                 encoder_encoder_kl_ratio: float = 0,
                 encoder_encoder_kl: str = None,
                 encoder_encoder_kl_sparsity: int = 0,
@@ -252,6 +255,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           encoder_attention_pre_softmax=encoder_attention_pre_softmax,
           encoder_decoder_kl_ratio=encoder_decoder_kl_ratio,
           in_batch_negative=in_batch_negative,
+          pairwise_loss=pairwise_loss,
           encoder_encoder_kl_ratio=encoder_encoder_kl_ratio,
           encoder_encoder_kl=encoder_encoder_kl,
           encoder_encoder_kl_sparsity=encoder_encoder_kl_sparsity,
@@ -536,6 +540,7 @@ class DecoderWrapper(torch.nn.Module):
     self.n_layer_two_tower = config.n_layer_two_tower
     self.encoder_attention_pre_softmax = config.encoder_attention_pre_softmax
     self.in_batch_negative = config.in_batch_negative
+    self.pairwise_loss = config.pairwise_loss
     if self.encoder_attention_pre_softmax and self.num_keep_ctx_in_decoder:
       raise NotImplementedError
     if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
@@ -577,7 +582,6 @@ class DecoderWrapper(torch.nn.Module):
   def get_kl_loss(self):
     assert self.encoder_decoder_kl_ratio
     kl_loss = self.decoder.block[-1].layer[1].EncDecAttention.kl_loss * self.encoder_decoder_kl_ratio
-    WandbLogger.log_w_step({'kl-loss': kl_loss.item()})
     return kl_loss
 
   def forward(
@@ -668,7 +672,8 @@ class DecoderWrapper(torch.nn.Module):
                           only_topk_n_context=self.only_topk_n_context,
                           use_softmax=True,
                           encoder_score_pre_softmaxed=self.encoder_attention_pre_softmax,
-                          in_batch_negative=self.in_batch_negative and self.training), reg_point)  # only activate in training
+                          in_batch_negative=self.in_batch_negative and self.training,
+                          pairwise_loss=self.pairwise_loss), reg_point)  # only activate in training
     else:
       raise NotImplementedError
     # decode
@@ -871,7 +876,7 @@ class T5blockWrapper(torch.nn.Module):
                     field='query',
                     use_hidden_states=False,
                 ), reg_point)
-            if self.in_batch_negative:
+            if self.in_batch_negative and self.training:
               reg_point.in_batch_negative = types.MethodType(
                 functools.partial(in_batch_negative, n_context=self.n_passages), reg_point)
         # handle separate/full attention
@@ -953,7 +958,8 @@ def encoder_decoder_kl(
      only_topk_n_context: int = 0,
      use_softmax: bool = False,
      encoder_score_pre_softmaxed: bool = False,
-     in_batch_negative: bool = False):
+     in_batch_negative: bool = False,
+     pairwise_loss: str = None):
   bs, _, _, enc_seq_len = decoder_score.size()
   has_token = encoder_score.dim() == 3
 
@@ -1004,18 +1010,34 @@ def encoder_decoder_kl(
       assert int(bs_t_ngpu) == bs_t_ngpu
       bs_t_ngpu = int(bs_t_ngpu)
       encoder_score = encoder_score.view(bs_t_ngpu, -1)  # (n_gpu * bs, n_gpu * bs * n_context)
-    enc_attn = torch.log_softmax(encoder_score, dim=-1)
+    if pairwise_loss is None:  # kl over all docs
+      enc_attn = torch.log_softmax(encoder_score, dim=-1)
+    elif pairwise_loss == 'sigmoid':  # kl over current docs, sigmoid over others
+      enc_attn = torch.log_softmax(encoder_score[:, :n_context], dim=-1)
+    else:
+      raise NotImplementedError
   if in_batch_negative:
-    global_dec_attn, = gather_tensors(dec_attn)
-    global_dec_attn = torch.cat(global_dec_attn, dim=0).to(dec_attn).detach()  # (n_gpu * bs, n_context)
-    # (n_gpu * bs, n_gpu * bs * n_context)
-    dec_attn = torch.cat([global_dec_attn, torch.zeros((bs_t_ngpu, (bs_t_ngpu - 1) * n_context)).to(dec_attn)], dim=-1)
-  kl = kl_loss_func(enc_attn, dec_attn.detach())
-  # TODO: debug
-  #print(encoder_score[:, ::50], get_rank())
-  #print(dec_attn[:, 0], get_rank())
-  #input()
-  return kl
+    dec_attn, = gather_tensors(dec_attn)
+    dec_attn = torch.cat(dec_attn, dim=0).to(enc_attn).detach()  # (n_gpu * bs, n_context)
+    if pairwise_loss is None:  # kl over all docs
+      # (n_gpu * bs, n_gpu * bs * n_context)
+      dec_attn = torch.cat([dec_attn, torch.zeros((bs_t_ngpu, (bs_t_ngpu - 1) * n_context)).to(enc_attn)], dim=-1)
+      loss = kl_loss_func(enc_attn, dec_attn.detach())
+      WandbLogger.log_w_step({'kl-loss': loss.item()})
+    elif pairwise_loss == 'sigmoid':  # kl over current docs, sigmoid over others  # TODO: not tested
+      loss = kl_loss_func(enc_attn, dec_attn.detach())
+      WandbLogger.log_w_step({'kl-loss': loss.item()})
+      # (n_gpu * bs, n_context, (n_gpu * bs - 1) * n_context)
+      margin = encoder_score[:, :n_context].unsqueeze(-1) - encoder_score[:, n_context:].unsqueeze(1)
+      margin_loss = -F.logsigmoid(margin).mean(-1).sum(-1).mean(0)
+      WandbLogger.log_w_step({'sigmoid-loss': margin_loss.item()})
+      loss = loss + margin_loss
+    else:
+      raise NotImplementedError
+  else:
+    loss = kl_loss_func(enc_attn, dec_attn.detach())
+    WandbLogger.log_w_step({'kl-loss': loss.item()})
+  return loss
 
 def collect_for_retrieval(
      self,
@@ -1100,8 +1122,9 @@ def collect_for_retrieval(
   self.retrieval['two_tower_attn_score'] = scores
 
 def cross_combine(values,  # (query_dim, doc_dim, seq_len, ...)
-                  sep_lens,
-                  diagonal: bool = True):  # (query_dim)
+                  sep_lens,  # (query_dim)
+                  diagonal: bool = True):
+  assert values.size(0) == sep_lens.size(0)
   query_dim, doc_dim, seq_len = values.size()[:3]
   query_values: List[torch.Tensor] = []
   doc_values: List[torch.Tensor] = []
@@ -1128,8 +1151,9 @@ def cross_combine(values,  # (query_dim, doc_dim, seq_len, ...)
   return new_combs
 
 def cross_combine2(values,  # (query_dim, doc_dim, seq_len, seq_len, ...)
-                   sep_lens,
-                   diagonal: bool = True):  # (query_dim)
+                   sep_lens,  # (query_dim)
+                   diagonal: bool = True):
+  assert values.size(0) == sep_lens.size(0)
   query_dim, doc_dim, seq_len = values.size()[:3]
   query_values: List[torch.Tensor] = []
   doc_values: List[torch.Tensor] = []
@@ -1174,17 +1198,17 @@ def in_batch_negative(self,
                       n_context: int):
   # collect query, key, and attn across all gpus
   global_q, global_k, global_attn = gather_tensors(query_states, key_states, attention_mask)
-  # (n_q, n_context, n_heads, seq_len, emb_size_per_head)  n_q = world_size * bs
-  global_q = torch.cat(global_q, dim=0).view(*((-1, n_context) + query_states.size()[1:]))
-  global_k = torch.cat(global_k, dim=0).view(*((-1, n_context) + key_states.size()[1:]))
+  # (n_q, n_context, seq_len, n_heads, emb_size_per_head)  n_q = world_size * bs
+  global_q = torch.cat(global_q, dim=0).view(-1, n_context, *query_states.size()[1:]).transpose(2, 3)
+  global_k = torch.cat(global_k, dim=0).view(-1, n_context, *key_states.size()[1:]).transpose(2, 3)
   # (n_q, n_context, seq_len, seq_len)
-  global_attn = torch.cat(global_attn, dim=0).view(*((-1, n_context) + attention_mask.size()[1:]))
+  global_attn = torch.cat(global_attn, dim=0).view(-1, n_context, *attention_mask.size()[1:])
   query_len = global_attn[:, 0, 0].sum(-1)  # (n_q)
 
   # cross combine
   # (n_q * n_q, n_context, n_heads, seq_len, emb_size_per_head)
-  global_q = cross_combine(global_q, query_len, diagonal=False)
-  global_k = cross_combine(global_k, query_len, diagonal=False)
+  global_q = cross_combine(global_q, query_len, diagonal=False).transpose(2, 3)
+  global_k = cross_combine(global_k, query_len, diagonal=False).transpose(2, 3)
   # (n_q * n_q, n_context, seq_len, seq_len)
   global_attn = cross_combine2(global_attn, query_len, diagonal=False)
 

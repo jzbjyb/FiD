@@ -17,13 +17,15 @@ class Dataset(torch.utils.data.Dataset):
                  question_prefix='question:',
                  title_prefix='title:',
                  passage_prefix='context:',
-                 add_eos: bool = False):
+                 add_eos: bool = False,
+                 in_batch_negative_mimic: int = 0):
         self.data = data
         self.n_context = n_context
         self.question_prefix = question_prefix
         self.title_prefix = title_prefix
         self.passage_prefix = passage_prefix
         self.eos = (' </s>' if add_eos else '')
+        self.in_batch_negative_mimic = in_batch_negative_mimic
         self.sort_data()
 
     def __len__(self):
@@ -53,16 +55,24 @@ class Dataset(torch.utils.data.Dataset):
 
         if 'ctxs' in example and self.n_context is not None:
             f = self.title_prefix + " {} " + self.passage_prefix + " {}" + self.eos
-            contexts = example['ctxs'][:self.n_context]
+            if self.in_batch_negative_mimic:
+              sampled_idxs = random.sample(range(len(self)), self.in_batch_negative_mimic)
+              sampled_idxs = list(set(sampled_idxs) - {index})[:self.in_batch_negative_mimic - 1]
+              contexts = []
+              for idx in ([index] + sampled_idxs):
+                contexts.extend(self.data[idx]['ctxs'])
+              contexts = contexts[:self.n_context]
+            else:
+              contexts = example['ctxs'][:self.n_context]
             passages = [f.format(c['title'], c['text']) for c in contexts]
             scores = [float(c['score']) for c in contexts]
             scores = torch.tensor(scores)
             # TODO(egrave): do we want to keep this?
             if len(contexts) == 0:
                 contexts = [question]
+            assert len(contexts) == self.n_context
         else:
             passages, scores = None, None
-
 
         return {
             'index' : index,

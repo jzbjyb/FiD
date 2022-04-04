@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --mem=64000
-#SBATCH --gres=gpu:A6000:2
+#SBATCH --gres=gpu:a100:2
 #SBATCH --cpus-per-task=4
 #SBATCH --time=0
 #SBATCH --output=slurm_out/%j.out
@@ -26,7 +26,7 @@ combine_weight=0
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_inbatchneg4
+name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_inbatchneg4_nobug
 init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
 n_context=100
 only_topk_n_context=0

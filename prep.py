@@ -740,11 +740,29 @@ def add_negative(query_file: str, out_file: str, raw_count: int = 100, add_count
     json.dump(data, fout, indent=2)
 
 
+def add_negative_mimic_inbatch(query_file: str, out_file: str, batch_size: int = 1):
+  qidx2ctxs: Dict[str, List] = {}
+  with open(query_file, 'r') as fin, open(out_file, 'w') as fout:
+    data = json.load(fin)
+    for qidx, q in tqdm(enumerate(data)):
+      qidx2ctxs[qidx] = q['ctxs']
+    for qidx, q in tqdm(enumerate(data)):
+      sampled_qidxs = random.sample(range(len(qidx2ctxs)), batch_size)
+      sampled_qidxs = list(set(sampled_qidxs) - {qidx})[:batch_size - 1]
+      assert len(sampled_qidxs) == batch_size - 1
+      q['ctxs'] = []
+      for _qidx in ([qidx] + sampled_qidxs):
+        q['ctxs'].extend(qidx2ctxs[_qidx])
+      assert len(q['ctxs']) == 400
+    json.dump(data, fout, indent=2)
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
     'convert_sciq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
-    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx', 'rank2json', 'add_negative',
+    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx', 'rank2json',
+    'add_negative', 'add_negative_mimic_inbatch',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
@@ -894,3 +912,8 @@ if __name__ == '__main__':
     query_file = args.inp[0]
     out_file = args.out[0]
     add_negative(query_file, out_file, raw_count=50, add_count=50)
+
+  elif args.task == 'add_negative_mimic_inbatch':
+    query_file = args.inp[0]
+    out_file = args.out[0]
+    add_negative_mimic_inbatch(query_file, out_file, batch_size=4)
