@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import faiss
 import time
 import sys
 import torch
@@ -220,6 +221,8 @@ if __name__ == "__main__":
           encoder_decoder_kl_ratio=opt.encoder_decoder_kl_ratio,
           in_batch_negative=opt.in_batch_negative,
           pairwise_loss=opt.pairwise_loss,
+          memory_bank=opt.memory_bank,
+          memory_bank_topk=opt.memory_bank_topk,
           encoder_encoder_kl_ratio=opt.encoder_encoder_kl_ratio,
           encoder_encoder_kl_sparsity=opt.encoder_encoder_kl_sparsity,
           encoder_encoder_kl=opt.encoder_encoder_kl,

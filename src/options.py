@@ -89,6 +89,8 @@ class Options():
                                  help='activate in-batch negative in KL divergence')
         self.parser.add_argument('--pairwise_loss', type=str, default=None, choices=[None, 'sigmoid'],
                                  help='pairwise loss function used when --in_batch_negative is activated')
+        self.parser.add_argument('--memory_bank', type=int, default=0, help='number of documents kept in memory bank')
+        self.parser.add_argument('--memory_bank_topk', type=int, default=0, help='number of documents retrieved from memory bank')
 
     def add_retriever_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')

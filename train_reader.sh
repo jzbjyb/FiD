@@ -19,14 +19,14 @@ metric=em
 
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
-batch_size=2
+batch_size=1
 accum=$2
 num_keep_ctx_in_decoder=0
 combine_weight=0
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_inbatchneg4_nobug
+name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_bank20000_100
 init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
 n_context=100
 only_topk_n_context=0
@@ -93,15 +93,16 @@ python ${prefix} train_reader.py \
   --retrieval_aggregation_method ${retrieval_aggregation_method} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 1000 \
-  --warmup_step 100 \
-  --save_freq 500 \
-  --eval_freq 200 \
+  --total_step 200 \
+  --warmup_step 20 \
+  --save_freq 200 \
+  --eval_freq 50 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
   --init_from ${init_from} \
-  --in_batch_negative
+  --memory_bank 20000 \
+  --memory_bank_topk 100
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
 # --decoder_attn_ctx_normalize \

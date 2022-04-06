@@ -23,7 +23,7 @@ elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
   passage_maxlength=200
   per_gpu_batch_size=128
 elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
-  passages=open_domain_data/bioasq_500k.nosummary/psgs_w100.test_aggregate.tsv
+  passages=open_domain_data/bioasq_500k.nosummary/psgs.test_aggregate.tsv
   passage_maxlength=1024  # TODO use 512?
   per_gpu_batch_size=32
 elif [[ ${index_short_name} == 'fiqa' ]]; then

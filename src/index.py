@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from typing import List, Tuple, Union
+from typing import List, Tuple, Set
 import time
 import glob
 from pathlib import Path
@@ -63,15 +63,31 @@ class Indexer(object):
                  ids: np.ndarray,
                  embeddings: np.ndarray,
                  texts: np.ndarray = None,
-                 indexing_batch_size: int = 50000):
+                 indexing_batch_size: int = 50000,
+                 disable_log: bool = False):
       self._update_id_mapping(ids)
       self._update_texts(texts)
       embeddings = embeddings.astype('float32')
       if not self.index.is_trained:
           self.index.train(embeddings)
-      for b in tqdm(range(0, len(embeddings), indexing_batch_size), desc='indexing'):
+      for b in tqdm(range(0, len(embeddings), indexing_batch_size), desc='indexing', disable=disable_log):
         self.index.add(embeddings[b:b + indexing_batch_size])
-      logger.info(f'total data indexed {len(self.ids)}')
+      if not disable_log:
+        logger.info(f'total data indexed {len(self.ids)}')
+
+  def remove_data(self, num_unique_id: int):
+    unique_ids: Set[str] = set()
+    stop = False
+    for i, id in enumerate(self.ids):
+      if len(unique_ids) == num_unique_id and id not in unique_ids:
+        stop = True
+        break
+      unique_ids.add(id)
+    if not stop:  # remove all
+      i = len(self.ids)
+    self.index.remove_ids(np.arange(i))
+    self.ids = self.ids[i:]
+    self.texts = self.texts[i:]
 
   def search_knn(self,
                  query_vectors: np.array,

@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import faiss
 from typing import List, Tuple, Dict
 import argparse
 from collections import defaultdict
@@ -236,4 +237,5 @@ if __name__ == '__main__':
   args = parser.parse_args()
 
   src.slurm.init_distributed_mode(args)
+  src.util.global_context['opt'] = args
   main(args)

@@ -70,4 +70,5 @@ python ${prefix} retrieval.py \
   --doc_topk 10 \
   --head_idx ${head_idx} \
   --save_or_load_index \
+  --use_faiss_gpu \
   ${extra}
