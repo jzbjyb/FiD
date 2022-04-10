@@ -185,6 +185,7 @@ class FiDT5Config(transformers.T5Config):
                pairwise_loss: str = None,
                memory_bank: int = 0,
                memory_bank_topk: int = 0,
+               memory_use_random: bool = False,
                encoder_encoder_kl_ratio: float = 0,
                encoder_encoder_kl: str = None,
                encoder_encoder_kl_sparsity: int = 0,
@@ -208,6 +209,7 @@ class FiDT5Config(transformers.T5Config):
     self.pairwise_loss = pairwise_loss
     self.memory_bank = memory_bank
     self.memory_bank_topk = memory_bank_topk
+    self.memory_use_random = memory_use_random
     self.encoder_encoder_kl_ratio = encoder_encoder_kl_ratio
     self.encoder_encoder_kl = encoder_encoder_kl
     self.encoder_encoder_kl_sparsity = encoder_encoder_kl_sparsity
@@ -244,6 +246,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 pairwise_loss: str = None,
                 memory_bank: int = 0,
                 memory_bank_topk: int = 0,
+                memory_use_random: bool = False,
                 encoder_encoder_kl_ratio: float = 0,
                 encoder_encoder_kl: str = None,
                 encoder_encoder_kl_sparsity: int = 0,
@@ -267,6 +270,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           pairwise_loss=pairwise_loss,
           memory_bank=memory_bank,
           memory_bank_topk=memory_bank_topk,
+          memory_use_random=memory_use_random,
           encoder_encoder_kl_ratio=encoder_encoder_kl_ratio,
           encoder_encoder_kl=encoder_encoder_kl,
           encoder_encoder_kl_sparsity=encoder_encoder_kl_sparsity,
@@ -877,6 +881,7 @@ class T5blockWrapper(torch.nn.Module):
         self.in_batch_negative = config.in_batch_negative
         self.memory_bank = None
         self.memory_bank_topk = config.memory_bank_topk
+        self.memory_use_random = config.memory_use_random
         if self.use_for_retrieval and config.memory_bank:
           self.memory_bank = MemoryBank(config.memory_bank, indexing_dimension=config.d_kv)
         self.need_collect = FiDT5.need_wrap_decoder(config) or bool(config.encoder_encoder_kl_ratio)
@@ -895,6 +900,7 @@ class T5blockWrapper(torch.nn.Module):
                     n_context=self.n_passages if hasattr(self, 'n_passages') else None,
                     memory_bank=self.memory_bank if self.training else None,
                     memory_bank_topk=self.memory_bank_topk if self.training else 0,
+                    memory_use_random=self.memory_use_random
                 ), reg_point)
             if self.in_batch_negative and self.training:
               reg_point.in_batch_negative = types.MethodType(
@@ -1056,7 +1062,8 @@ class MemoryBank:
     # concatenate
     concat_key, concat_qry, concat_mask = [], [], []
     retrieved_count: List[int] = []
-    for qid, did2score in qid2did2score.items():
+    for qid in range(bs):
+      did2score = qid2did2score[qid]
       query_len = mask[qid].sum().item()
       dids = list(sorted(did2score.items(), key=lambda x: -x[1]))[:doc_topk]
       retrieved_count.append(len(dids))
@@ -1243,8 +1250,9 @@ def collect_for_retrieval(
      field: str,
      use_hidden_states: bool,
      n_context: int,
-     memory_bank: MemoryBank,
-     memory_bank_topk: int = 0):
+     memory_bank: MemoryBank = None,
+     memory_bank_topk: int = 0,
+     memory_use_random: bool = False):
   if hasattr(self, 'in_batch_negative') and self.training:  # collect and combine from all gpu (only in training)
     # mask is ((n_gpu * bs)^2 * n_context, seq_len, seq_len)
     _query_states, _key_states, attention_mask = self.in_batch_negative(query_states, key_states, attention_mask)
@@ -1270,10 +1278,17 @@ def collect_for_retrieval(
       mask_to_query = _attention_mask[:, 0, 0, :max_qry_len]  # (bs, max_qry_len)
       # retrieve
       # TODO: how many tokens to retrieve?
+      # (bs, n_context * ?, seq_len, emb_size_per_head), (bs, n_context * ?, seq_len, seq_len)
       __key_states, __query_states, __attention_mask = memory_bank.query(
-        key_to_query, query_to_query, mask_to_query, token_topk=memory_bank_topk * 5, doc_topk=memory_bank_topk)
-      # combine current batch with retrieved
+        key_to_query, query_to_query, mask_to_query,
+        token_topk=memory_bank_topk * 5, doc_topk=memory_bank_topk, use_random=memory_use_random)
+      # use original query-related vectors TODO: avoid dropout?
       assert __key_states.size(1) % n_context == 0
+      ratio = _key_states.size(1) // n_context
+      keep_query_rel_mask = __attention_mask[:, :, 0].unsqueeze(-1)  # (bs, n_context * ?, seq_len, 1)
+      __key_states = __key_states * ~keep_query_rel_mask + _key_states.repeat(1, ratio, 1, 1) * keep_query_rel_mask
+      __query_states = __query_states * ~keep_query_rel_mask + _query_states.repeat(1, ratio, 1, 1) * keep_query_rel_mask
+      # combine current batch with retrieved
       # (bs * n_context * ?, seq_len, emb_size_per_head)
       __key_states = torch.cat([_key_states, __key_states], dim=1).view(-1, seq_len, emb_size)
       __query_states = torch.cat([_query_states, __query_states], dim=1).view(-1, seq_len, emb_size)

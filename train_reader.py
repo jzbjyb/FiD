@@ -223,6 +223,7 @@ if __name__ == "__main__":
           pairwise_loss=opt.pairwise_loss,
           memory_bank=opt.memory_bank,
           memory_bank_topk=opt.memory_bank_topk,
+          memory_use_random=opt.memory_use_random,
           encoder_encoder_kl_ratio=opt.encoder_encoder_kl_ratio,
           encoder_encoder_kl_sparsity=opt.encoder_encoder_kl_sparsity,
           encoder_encoder_kl=opt.encoder_encoder_kl,
