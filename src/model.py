@@ -1233,6 +1233,8 @@ def encoder_decoder_kl(
     assert tuple(enc_attn.size()) == tuple(dec_attn.size())
     loss = kl_loss_func(enc_attn, dec_attn.detach())
     WandbLogger.log_w_step({'kl-loss': loss.item()})
+    ori_kl = kl_loss_func(torch.log_softmax(encoder_score[:, :n_context], dim=-1), dec_attn[:, :n_context].detach())
+    WandbLogger.log_w_step({'kl-loss-original': ori_kl.item()})
   else:
     loss = kl_loss_func(enc_attn, dec_attn.detach())
     WandbLogger.log_w_step({'kl-loss': loss.item()})
@@ -1253,18 +1255,24 @@ def collect_for_retrieval(
      memory_bank: MemoryBank = None,
      memory_bank_topk: int = 0,
      memory_use_random: bool = False):
+  use_head_idx = None
+  n_heads = key_states.size(1)
+
   if hasattr(self, 'in_batch_negative') and self.training:  # collect and combine from all gpu (only in training)
+    use_head_idx = 3  # TODO: add multi-head?
     # mask is ((n_gpu * bs)^2 * n_context, seq_len, seq_len)
-    _query_states, _key_states, attention_mask = self.in_batch_negative(query_states, key_states, attention_mask)
+    _query_states, _key_states, attention_mask = self.in_batch_negative(
+      query_states, key_states, attention_mask, head_idx=use_head_idx)
     # ((n_gpu * bs)^2 * n_context, n_heads, seq_len, seq_len)
-    scores = torch.matmul(_query_states, _key_states.transpose(3, 2)) + position_bias
+    scores = torch.matmul(_query_states, _key_states.transpose(3, 2))
+    scores = scores + position_bias[:, use_head_idx:use_head_idx + 1]
 
   if memory_bank is not None:
-    head_idx = 3  # TODO: add multi-head?
+    use_head_idx = 3  # TODO: add multi-head?
     n_heads, seq_len, emb_size = key_states.size()[1:]
     # (bs, n_context, seq_len, emb_size_per_head)
-    _key_states = key_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, head_idx]
-    _query_states = query_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, head_idx]
+    _key_states = key_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
+    _query_states = query_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
     # (bs, n_context, seq_len, seq_len)
     _attention_mask = attention_mask.view(-1, n_context, seq_len, seq_len)
     query_len = _attention_mask[:, 0, 0].sum(-1)  # (bs)
@@ -1296,10 +1304,7 @@ def collect_for_retrieval(
       attention_mask = torch.cat([_attention_mask, __attention_mask], dim=1).view(-1, seq_len, seq_len)
       # (bs * n_context * ?, 1 (n_heads), seq_len, seq_len)
       scores = torch.matmul(__query_states, __key_states.transpose(2, 1)).unsqueeze(1)
-      scores = torch.cat([torch.zeros_like(scores).repeat(1, head_idx, 1, 1),
-                          scores,
-                          torch.zeros_like(scores).repeat(1, n_heads - head_idx - 1, 1, 1)], dim=1)
-      scores = scores + position_bias
+      scores = scores + position_bias[:, use_head_idx:use_head_idx + 1]
 
     # add to memory bank and avoid duplicated add when checkpointing is activated TODO: better workaround?
     if query_states.requires_grad:
@@ -1378,6 +1383,11 @@ def collect_for_retrieval(
     pass
   else:
     raise NotImplementedError
+
+  if use_head_idx is not None:
+    scores = torch.cat([torch.zeros_like(scores).repeat(1, use_head_idx), scores,
+                        torch.zeros_like(scores).repeat(1, n_heads - use_head_idx - 1)], dim=1)
+
   self.retrieval['two_tower_attn_score'] = scores
 
 def cross_combine(values,  # (query_dim, doc_dim, seq_len, ...)
@@ -1454,12 +1464,17 @@ def in_batch_negative(self,
                       query_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
                       key_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
                       attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
-                      n_context: int):
+                      n_context: int,
+                      head_idx: int = None):
   # collect query, key, and attn across all gpus
-  global_q, global_k, global_attn = gather_tensors(query_states, key_states, attention_mask)
+  if head_idx is not None:
+    global_q, global_k, global_attn = gather_tensors(
+      query_states[:, head_idx:head_idx + 1].contiguous(), key_states[:, head_idx:head_idx + 1].contiguous(), attention_mask)
+  else:
+    global_q, global_k, global_attn = gather_tensors(query_states, key_states, attention_mask)
   # (n_q, n_context, seq_len, n_heads, emb_size_per_head)  n_q = world_size * bs
-  global_q = torch.cat(global_q, dim=0).view(-1, n_context, *query_states.size()[1:]).transpose(2, 3)
-  global_k = torch.cat(global_k, dim=0).view(-1, n_context, *key_states.size()[1:]).transpose(2, 3)
+  global_q = torch.cat(global_q, dim=0).view(-1, n_context, *global_q[0].size()[1:]).transpose(2, 3)
+  global_k = torch.cat(global_k, dim=0).view(-1, n_context, *global_k[0].size()[1:]).transpose(2, 3)
   # (n_q, n_context, seq_len, seq_len)
   global_attn = torch.cat(global_attn, dim=0).view(-1, n_context, *attention_mask.size()[1:])
   query_len = global_attn[:, 0, 0].sum(-1)  # (n_q)
