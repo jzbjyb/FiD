@@ -14,7 +14,7 @@ import json
 import contextlib
 from pathlib import Path
 import torch.distributed as dist
-from fairscale.optim.oss import OSS
+#from fairscale.optim.oss import OSS
 import csv
 import wandb
 

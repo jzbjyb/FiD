@@ -13,8 +13,8 @@ import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
-from fairscale.optim.oss import OSS
-from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
+#from fairscale.optim.oss import OSS
+#from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
 
 from src.options import Options
 import src.slurm

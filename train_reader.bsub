@@ -3,13 +3,18 @@
 #BSUB -J fid
 #BSUB -o bosch/%J.stdout
 #BSUB -e bosch/%J.stderr
-#BSUB -W 96:00
-#BSUB -n 8
-#BSUB -M 64000
-#BSUB -gpu "num=8:mode=exclusive_process:mps=no"
+#BSUB -W 48:00
+#BSUB -n 4
+#BSUB -M 16000
+#BSUB -gpu "num=4:mode=exclusive_process:mps=no"
 #BSUB -q batch_v100
 
 source activate beir
+
+module load proxy4server-access
+source /fs/applications/p4s-access/1.0/ActivateP4S.sh -a
+
+export WANDB_MODE=offline
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 train_data=open_domain_data/NQ/train.json
@@ -23,15 +28,15 @@ eval_data=open_domain_data/NQ/dev.json
 metric=em
 
 MAX_NUM_GPU_PER_NODE=8
-num_gpu=8
+num_gpu=4
 batch_size=2
-accum=4
+accum=8
 num_keep_ctx_in_decoder=0
 combine_weight=0
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_fidhp
+name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_bs64_step1k_gpu4
 init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
 n_context=100
 only_topk_n_context=0
@@ -98,10 +103,10 @@ python ${prefix} train_reader.py \
   --retrieval_aggregation_method ${retrieval_aggregation_method} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 10000 \
-  --warmup_step 1000 \
-  --save_freq 2000 \
-  --eval_freq 500 \
+  --total_step 1000 \
+  --warmup_step 100 \
+  --save_freq 200 \
+  --eval_freq 100 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
