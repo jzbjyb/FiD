@@ -177,7 +177,11 @@ if __name__ == "__main__":
     model_class = src.model.FiDT5
 
     #load data
+    if opt.is_distributed and opt.global_rank != 0:  # load tokenizer
+        torch.distributed.barrier()
     tokenizer = transformers.T5Tokenizer.from_pretrained(model_name)
+    if opt.is_distributed and opt.global_rank == 0:
+        torch.distributed.barrier()
     collator = src.data.Collator(
       opt.text_maxlength,
       tokenizer,
@@ -204,6 +208,8 @@ if __name__ == "__main__":
         eval_examples = eval_examples[:opt.eval_num_examples]
     eval_dataset = src.data.Dataset(eval_examples, opt.n_context)
 
+    if opt.is_distributed and opt.global_rank != 0:  # load model
+        torch.distributed.barrier()
     if not checkpoint_exists and opt.model_path == "none":
         model = src.model.FiDT5.from_t5(
           model_name,
@@ -247,6 +253,8 @@ if __name__ == "__main__":
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model, sharding=opt.use_sharding)
         step, best_dev_metric = 0, 0.0
+    if opt.is_distributed and opt.global_rank == 0:
+        torch.distributed.barrier()
 
     model.set_checkpoint(opt.use_checkpoint)
 
