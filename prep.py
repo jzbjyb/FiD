@@ -10,6 +10,8 @@ import logging
 import pickle
 import statistics
 from tqdm import tqdm
+import spacy
+from spacy.lang.en import English
 import scipy.stats
 from collections import defaultdict
 from beir.datasets.data_loader import GenericDataLoader
@@ -25,7 +27,7 @@ logging.basicConfig(level=logging.DEBUG)
 class BEIRDataset:
   def __init__(self, root_dir: str, name: str):
     self.name = name
-    self.qid2answer: Dict[str, Any] = self.load_query(os.path.join(root_dir, 'queries.jsonl'))
+    self.qid2answer, self.qid2meta = self.load_query(os.path.join(root_dir, 'queries.jsonl'))
 
   @classmethod
   def get_answer_scifact(cls, metadata: Dict) -> List[str]:
@@ -68,17 +70,23 @@ class BEIRDataset:
   def get_answer_cqadupstack(cls, metadata: Dict) -> List[str]:
     return ['']  # TODO: use what for answer?
 
+  @classmethod
+  def get_answer_pseudo(cls, metadata: Dict) -> List[str]:
+    return [metadata['answer']]
+
   def load_query(self, filename: str):
+    qid2meta: Dict[str, Dict] = {}
     qid2answer: Dict[str, Any] = {}
     with open(filename, 'r') as fin:
       for l in fin:
         l = json.loads(l)
         id, text, metadata = l['_id'], l['text'], l['metadata']
+        qid2meta[id] = metadata
         ans = getattr(self, f'get_answer_{self.name}')(metadata)
         if ans is None:
           continue
         qid2answer[id] = ans
-    return qid2answer
+    return qid2answer, qid2meta
 
 
 def aggregate_ctxs(json_files: List[str], out_file: str):
@@ -99,7 +107,13 @@ def aggregate_ctxs(json_files: List[str], out_file: str):
       fout.write(f'{id}\t{text}\t{title}\n')
 
 
-def convert_beir_to_fid_format(beir_dir: str, out_dir: str, dataset_name: str, splits: List[str], topk: int = 100):
+def convert_beir_to_fid_format(
+     beir_dir: str,
+     out_dir: str,
+     dataset_name: str,
+     splits: List[str],
+     topk: int = 100,
+     add_self: bool = False):
   bert_data = BEIRDataset(beir_dir, name=dataset_name)
 
   # build index
@@ -139,10 +153,17 @@ def convert_beir_to_fid_format(beir_dir: str, out_dir: str, dataset_name: str, s
       query = clean_text_for_tsv(queries[qid])
       example = {'question': query, 'id': qid, 'answers': answer, 'ctxs': []}
       scores = sorted(scores_dict.items(), key=lambda item: item[1], reverse=True)[:topk]
+      if add_self:
+        if bert_data.qid2meta[qid]['docid'] not in set(x[0] for x in scores):  # self doc not retrieved
+          scores.insert(0, (bert_data.qid2meta[qid]['docid'], scores[0][1] + 1.0))  # highest score
+          scores = scores[:topk]
       for rank in range(len(scores)):
         did = scores[rank][0]
         title = clean_text_for_tsv(corpus[did].get('title'))
-        text = clean_text_for_tsv(corpus[did].get('text'))
+        if add_self and did == bert_data.qid2meta[qid]['docid']:
+          text = clean_text_for_tsv(bert_data.qid2meta[qid]['context'])
+        else:
+          text = clean_text_for_tsv(corpus[did].get('text'))
         example['ctxs'].append({'id': did, 'title': title, 'text': text})
       examples.append(example)
     os.makedirs(out_dir, exist_ok=True)
@@ -150,23 +171,26 @@ def convert_beir_to_fid_format(beir_dir: str, out_dir: str, dataset_name: str, s
 
 
 def save_beir_format(beir_dir: str,
-                     qid2dict: Dict[str, Dict],
-                     did2dict: Dict[str, Dict],
-                     split2qiddid: Dict[str, List[Tuple[str, str]]]):
+                     qid2dict: Dict[str, Dict] = None,
+                     did2dict: Dict[str, Dict] = None,
+                     split2qiddid: Dict[str, List[Tuple[str, str]]] = None):
   # save
   os.makedirs(beir_dir, exist_ok=True)
-  with open(os.path.join(beir_dir, 'queries.jsonl'), 'w') as fout:
-    for qid in qid2dict:
-      fout.write(json.dumps(qid2dict[qid]) + '\n')
-  with open(os.path.join(beir_dir, 'corpus.jsonl'), 'w') as fout:
-    for did in did2dict:
-      fout.write(json.dumps(did2dict[did]) + '\n')
-  os.makedirs(os.path.join(beir_dir, 'qrels'), exist_ok=True)
-  for split in split2qiddid:
-    with open(os.path.join(beir_dir, 'qrels', f'{split}.tsv'), 'w') as fout:
-      fout.write('query-id\tcorpus-id\tscore\n')
-      for qid, did in split2qiddid[split]:
-        fout.write(f'{qid}\t{did}\t1\n')
+  if qid2dict is not None:
+    with open(os.path.join(beir_dir, 'queries.jsonl'), 'w') as fout:
+      for qid in qid2dict:
+        fout.write(json.dumps(qid2dict[qid]) + '\n')
+  if did2dict is not None:
+    with open(os.path.join(beir_dir, 'corpus.jsonl'), 'w') as fout:
+      for did in did2dict:
+        fout.write(json.dumps(did2dict[did]) + '\n')
+  if split2qiddid is not None:
+    os.makedirs(os.path.join(beir_dir, 'qrels'), exist_ok=True)
+    for split in split2qiddid:
+      with open(os.path.join(beir_dir, 'qrels', f'{split}.tsv'), 'w') as fout:
+        fout.write('query-id\tcorpus-id\tscore\n')
+        for qid, did in split2qiddid[split]:
+          fout.write(f'{qid}\t{did}\t1\n')
 
 
 def convert_sciq_to_beir_format(sciq_dir: str, beir_dir: str):
@@ -757,18 +781,90 @@ def add_negative_mimic_inbatch(query_file: str, out_file: str, batch_size: int =
     json.dump(data, fout, indent=2)
 
 
+def create_pseudo_queries_from_corpus(
+     beir_dir: str,
+     out_beir_dir: str,
+     split: str,
+     subsample: int = None,
+     num_sent_per_doc: int = 1,
+     max_num_mask_ent: int = 5):
+  sentencizer = English()
+  sentencizer.add_pipe('sentencizer')
+  ner = spacy.load('en_core_web_sm')
+
+  corpus, _, _ = GenericDataLoader(data_folder=beir_dir).load(split=split)
+  overall_qid = 0
+  qid2dict: Dict[str, Dict] = {}
+  split2qiddid: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+  num_ents: List[int] = []
+  if subsample:
+    sampled_dids = random.sample(list(corpus.keys()), min(len(corpus), subsample))
+  else:
+    sampled_dids = corpus.keys()
+  for did in tqdm(sampled_dids):
+    text = clean_text_for_tsv(corpus[did].get('text'))  # only use text not title
+    sents = list(sentencizer(text).sents)
+    if len(sents) <= 1:
+      continue
+    sent_idxs = random.sample(range(len(sents)), min(len(sents), num_sent_per_doc))
+    for sent_idx in sent_idxs:
+      query = str(sents[sent_idx])
+      context = ' '.join(map(str, sents[:sent_idx] + sents[sent_idx + 1:]))
+      # ner
+      ents: List[Tuple[int, int, str]] = [(ent.start_char, ent.end_char, ent.label_) for ent in ner(query).ents]
+      # remove overlap
+      ents = sorted(ents, key=lambda x: (x[0], x[1]))
+      ents = [ent for i, ent in enumerate(ents) if (i <= 0 or ent[0] >= ents[i - 1][1])]
+      if len(ents) <= 0:
+        continue
+      # max num
+      if len(ents) > max_num_mask_ent:
+        ents = [ents[i] for i in sorted(random.sample(range(len(ents)), max_num_mask_ent))]
+      num_ents.append(len(ents))
+      # mask
+      masked_query: List[str] = []
+      target: List[str] = []
+      prev_idx = 0
+      mask_idx = 0
+      for i, ent in enumerate(ents):
+        masked_query.append(query[prev_idx:ent[0]])
+        masked_query.append(f'<extra_id_{mask_idx}>')
+        target.append(f'<extra_id_{mask_idx}> {query[ent[0]:ent[1]]}')
+        prev_idx = ent[1]
+        mask_idx += 1
+      masked_query.append(query[prev_idx:])
+      masked_query: str = ''.join(masked_query)
+      target.append(f'<extra_id_{mask_idx}>')
+      target: str = ' '.join(target)
+
+      qid = f'{overall_qid}'
+      qid2dict[qid] = {
+        '_id': qid,
+        'text': masked_query,
+        'metadata': {'answer': target, 'docid': did, 'context': context}
+      }
+      split2qiddid[split].append((qid, did))
+      overall_qid += 1
+  save_beir_format(out_beir_dir, qid2dict, None, split2qiddid)
+  print(f'#queries {len(qid2dict)}, avg #entities {np.mean(num_ents)}')
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
     'convert_sciq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
     'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx', 'rank2json',
-    'add_negative', 'add_negative_mimic_inbatch',
-    'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format',
+    'add_negative', 'add_negative_mimic_inbatch', 'create_pseudo_queries_from_beir',
+    'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format', 'split_fid_file',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   parser.add_argument('--other', type=str, nargs='+', help='additional arguments')
   args = parser.parse_args()
+
+  seed = 2022
+  random.seed(seed)
+  np.random.seed(seed)
 
   if args.task == 'aggregate_ctxs':
     json_files: List[str] = args.inp
@@ -778,7 +874,7 @@ if __name__ == '__main__':
   elif args.task == 'convert_beir_to_fid_format':
     beir_dir = args.inp[0]
     out_dir = args.out[0]
-    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='cqadupstack', splits=['test'])
+    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='pseudo', splits=['test'], add_self=True)
 
   elif args.task == 'convert_sciq_to_beir_format':
     sciq_dir = args.inp[0]
@@ -917,3 +1013,20 @@ if __name__ == '__main__':
     query_file = args.inp[0]
     out_file = args.out[0]
     add_negative_mimic_inbatch(query_file, out_file, batch_size=4)
+
+  elif args.task == 'create_pseudo_queries_from_beir':
+    beir_dir = args.inp[0]
+    out_beir_dir = args.out[0]
+    create_pseudo_queries_from_corpus(beir_dir, out_beir_dir, subsample=100000, split='test', max_num_mask_ent=5)
+
+  elif args.task == 'split_fid_file':
+    query_file = args.inp[0]
+    split1, split2 = args.out
+    count2 = 5000
+    with open(query_file, 'r') as fin, open(split1, 'w') as fout1, open(split2, 'w') as fout2:
+      data = json.load(fin)
+      perm = np.random.permutation(len(data))
+      data1 = [data[i] for i in perm[:-count2]]
+      data2 = [data[i] for i in perm[-count2:]]
+      json.dump(data1, fout1, indent=2)
+      json.dump(data2, fout2, indent=2)

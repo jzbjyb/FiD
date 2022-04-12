@@ -5,7 +5,7 @@
 #BSUB -e bosch/%J.stderr
 #BSUB -W 48:00
 #BSUB -n 4
-#BSUB -M 16000
+#BSUB -M 50000
 #BSUB -gpu "num=4:mode=exclusive_process:mps=no"
 #BSUB -q batch_v100
 
@@ -16,27 +16,23 @@ source /fs/applications/p4s-access/1.0/ActivateP4S.sh -a
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
-train_data=open_domain_data/NQ/train.json
-eval_data=open_domain_data/NQ/dev.json
-#train_data=open_domain_data/scifact/train.json
-#eval_data=open_domain_data/scifact/test.json
-#train_data=open_domain_data/SciQ/train.json
-#eval_data=open_domain_data/SciQ/dev.json
-#train_data=open_domain_data/quasar_s/train.json
-#eval_data=open_domain_data/quasar_s/dev.json
+#train_data=open_domain_data/bioasq_500k.nosummary/train.json
+#eval_data=open_domain_data/bioasq_500k.nosummary/test.json
+train_data=open_domain_data/bioasq_500k.nosummary.pseudo100k/train.json
+eval_data=open_domain_data/bioasq_500k.nosummary.pseudo100k/dev.json
 metric=em
 
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=4
-batch_size=2
-accum=8
+batch_size=1
+accum=4
 num_keep_ctx_in_decoder=0
 combine_weight=0
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_bs64_step1k_gpu4
-init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
+name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_adapt_bioasq_500k_nosummary_pseudo100k_kl_inbatchneg4
+init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001/checkpoint/latest
 n_context=100
 only_topk_n_context=0
 n_layer_two_tower=6
@@ -77,7 +73,7 @@ python ${prefix} train_reader.py \
   --eval_data ${eval_data} \
   --model_size ${init_model} \
   --use_checkpoint \
-  --text_maxlength 250 \
+  --text_maxlength 512 \
   --answer_maxlength ${answer_maxlength} \
   --per_gpu_batch_size ${batch_size} \
   --accumulation_steps ${accum} \
@@ -104,39 +100,14 @@ python ${prefix} train_reader.py \
   --query_in_decoder ${query_in_decoder} \
   --total_step 1000 \
   --warmup_step 100 \
-  --save_freq 200 \
-  --eval_freq 100 \
+  --save_freq 500 \
+  --eval_freq 200 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
-  --init_from ${init_from}
+  --init_from ${init_from} \
+  --in_batch_negative
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
 # --decoder_attn_ctx_normalize \
 # --encoder_attention_pre_softmax \
-
-# NQ
-# 3501
-# 250
-# 500
-# 300
-# 200
-
-# 1001
-# 100
-# 1000
-# 200
-# 200
-
-# SciQ
-# 1001
-# 100
-# 1000
-# 50
-# 100
-
-# 501
-# 50
-# 500
-# 50
-# 100
