@@ -226,6 +226,7 @@ if __name__ == "__main__":
           head_weights_norm_func=opt.head_weights_norm_func,
           encoder_decoder_kl_ratio=opt.encoder_decoder_kl_ratio,
           in_batch_negative=opt.in_batch_negative,
+          in_batch_negative_max_num_query=opt.in_batch_negative_max_num_query,
           pairwise_loss=opt.pairwise_loss,
           memory_bank=opt.memory_bank,
           memory_bank_topk=opt.memory_bank_topk,
