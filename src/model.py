@@ -1338,18 +1338,39 @@ def collect_for_retrieval(
 
   if hasattr(self, 'in_batch_negative') and self.training:  # collect and combine from all gpu (only in training)
     use_head_idx = 3  # TODO: add multi-head?
+    only_self_attn_qd = True  # only compute self attn between query query vectors and doc key vectors to save memory
     scores_li = []
     # ((n_gpu * bs)^2 * n_context, n_heads, seq_len, emb_size_per_head)
     # ((n_gpu * bs)^2 * n_context, seq_len, seq_len)
     for _query_states, _key_states, _attention_mask in self.in_batch_negative(
       query_states, key_states, attention_mask, head_idx=use_head_idx):
-      # ((n_gpu * bs)^2 * n_context, n_heads, seq_len, seq_len)
-      scores = torch.matmul(_query_states, _key_states.transpose(3, 2))
-      scores = scores + position_bias[:, use_head_idx:use_head_idx + 1]
-      aggregate_attention(
-        self, scores, _attention_mask,
-        field=field, aggregation_method=aggregation_method, use_head_idx=use_head_idx, n_heads=n_heads)
-      scores_li.append(self.retrieval['two_tower_attn_score'])
+      if only_self_attn_qd:
+        max_qry_len = _attention_mask[:, 0].sum(-1).max()  # ((n_gpu * bs)^2 * n_context)
+        min_qry_len = _attention_mask[:, 0].sum(-1).min()  # ((n_gpu * bs)^2 * n_context)
+        query_mask = _attention_mask[:, 0, :max_qry_len]  # ((n_gpu * bs)^2 * n_context, max_qry_len)
+        doc_mask = _attention_mask[:, -1, min_qry_len:]  # ((n_gpu * bs)^2 * n_context, seq_len - min_qry_len)
+        _query_states = _query_states[:, :, :max_qry_len]  # ((n_gpu * bs)^2 * n_context, n_heads, max_qry_len, emb_size_per_head)
+        _key_states = _key_states[:, :, min_qry_len:]  # ((n_gpu * bs)^2 * n_context, n_heads, seq_len - min_qry_len, emb_size_per_head)
+        # ((n_gpu * bs)^2 * n_context, n_heads, max_qry_len, seq_len - min_qry_len)
+        scores = torch.matmul(_query_states, _key_states.transpose(3, 2))
+        scores = scores + position_bias[:, use_head_idx:use_head_idx + 1, :max_qry_len, min_qry_len:]
+        assert aggregation_method == 'all-avg-max'
+        # ((n_gpu * bs)^2 * n_context, 1 (n_heads), max_qry_len, seq_len - min_qry_len)
+        cross_mask = (query_mask.unsqueeze(-1) & doc_mask.unsqueeze(1)).unsqueeze(1)
+        scores = (scores - (~cross_mask * 1e5)).max(-1)[0]  # ((n_gpu * bs)^2 * n_context, n_heads, max_qry_len)
+        scores = (scores * query_mask.unsqueeze(1)).sum(-1) / query_mask.unsqueeze(1).sum(-1)  # (bs, n_heads)
+        if use_head_idx is not None:
+          scores = torch.cat([torch.zeros_like(scores).repeat(1, use_head_idx), scores,
+                              torch.zeros_like(scores).repeat(1, n_heads - use_head_idx - 1)], dim=1)
+        scores_li.append(scores)
+      else:
+        # ((n_gpu * bs)^2 * n_context, n_heads, seq_len, seq_len)
+        scores = torch.matmul(_query_states, _key_states.transpose(3, 2))
+        scores = scores + position_bias[:, use_head_idx:use_head_idx + 1]
+        aggregate_attention(
+          self, scores, _attention_mask,
+          field=field, aggregation_method=aggregation_method, use_head_idx=use_head_idx, n_heads=n_heads)
+        scores_li.append(self.retrieval['two_tower_attn_score'])
     self.retrieval['two_tower_attn_score'] = torch.cat(scores_li, dim=0)
     return
 

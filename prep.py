@@ -1022,11 +1022,12 @@ if __name__ == '__main__':
   elif args.task == 'split_fid_file':
     query_file = args.inp[0]
     split1, split2 = args.out
-    count2 = 5000
+    count1, count2 = 30000, 5000
     with open(query_file, 'r') as fin, open(split1, 'w') as fout1, open(split2, 'w') as fout2:
       data = json.load(fin)
+      assert len(data) >= count1 + count2
       perm = np.random.permutation(len(data))
-      data1 = [data[i] for i in perm[:-count2]]
+      data1 = [data[i] for i in perm[:count1]]
       data2 = [data[i] for i in perm[-count2:]]
       json.dump(data1, fout1, indent=2)
       json.dump(data2, fout2, indent=2)
