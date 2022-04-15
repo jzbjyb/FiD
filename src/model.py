@@ -1222,6 +1222,8 @@ def encoder_decoder_kl(
     if pairwise_loss is None:  # kl over all docs
       # (n_gpu * bs, n_gpu * bs * n_context)
       dec_attn = torch.cat([dec_attn, torch.zeros((bs_t_ngpu, (bs_t_ngpu - 1) * n_context)).to(enc_attn)], dim=-1)
+      pos_prob_sum = enc_attn[:, :n_context].exp().sum(-1)  # (n_gpu * bs)
+      WandbLogger.log_w_step({'current-docs-encoder-prob-sum': pos_prob_sum.mean().item()})
       loss = kl_loss_func(enc_attn, dec_attn.detach())
       WandbLogger.log_w_step({'kl-loss': loss.item()})
     elif pairwise_loss == 'sigmoid':  # kl over current docs, sigmoid over others  # TODO: not tested
