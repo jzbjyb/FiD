@@ -87,6 +87,8 @@ class Options():
         self.parser.add_argument('--metric', type=str, default='em', choices=['em', 'rougel'])
         self.parser.add_argument('--in_batch_negative', action='store_true',
                                  help='activate in-batch negative in KL divergence')
+        self.parser.add_argument('--in_batch_negative_size', type=int, default=0,
+                                 help='the number of queries use in in-batch negative in total')
         self.parser.add_argument('--in_batch_negative_max_num_query', type=int, default=None,
                                  help='the number of queries to compute at one time for in-batch negative to save memory')
         self.parser.add_argument('--pairwise_loss', type=str, default=None, choices=[None, 'sigmoid'],
