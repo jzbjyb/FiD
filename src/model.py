@@ -1137,7 +1137,7 @@ class T5blockWrapper(torch.nn.Module):
                 functools.partial(
                     collect_for_retrieval,
                     attention_mask=attention_mask[:, 0].eq(0),
-                    input_ids=self.input_ids,  # passed from the forward function of the encoder
+                    input_ids=self.input_ids if hasattr(self, 'input_ids') else None,  # passed from the forward function of the encoder
                     aggregation_method=self.retrieval_aggregation_method,
                     field='query',
                     use_hidden_states=False,
