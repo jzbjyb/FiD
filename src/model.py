@@ -449,6 +449,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         self.wrap_decoder(config)
         self.collect_kl_loss_from_decoder = bool(config.encoder_decoder_kl_ratio)
         self.collect_kl_loss_from_encoder = bool(config.encoder_encoder_kl_ratio)
+        self.n_layer_two_tower = config.n_layer_two_tower
+        self.memory_bank_recompute = config.memory_bank_recompute
 
     @classmethod
     def from_t5(cls,
@@ -680,8 +682,11 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         Enable or disable checkpointing in the encoder.
         See https://pytorch.org/docs/stable/checkpoint.html
         """
-        for mod in self.encoder.encoder.block:
-            mod.use_checkpoint = use_checkpoint
+        all_ckpt = lambda i: True  # checkpoint all layers
+        later_ckpt = lambda i: i > self.n_layer_two_tower  # only checkpoint layers after bi-encoder
+        use_ckpt_per_layer = later_ckpt if self.memory_bank_recompute else all_ckpt
+        for i, layer in enumerate(self.encoder.encoder.block):
+            layer.use_checkpoint = use_checkpoint and use_ckpt_per_layer(i)
 
     def set_attention_separate_mask(self, attention_separate_mask):
         self.encoder.attention_separate_mask = attention_separate_mask
@@ -1158,7 +1163,7 @@ class T5blockWrapper(torch.nn.Module):
             # modify (potentially separate) attention mask to make it a full attention
             attention_mask = attention_mask.max(2, keepdim=True)[0]  # (bs, num_heads, 1, seq_len)
         # handle checkpointing
-        if self.use_checkpoint and self.training and (not self.memory_bank_recompute or not self.use_for_retrieval):
+        if self.use_checkpoint and self.training:
             # when memory bank requires recompute, do not use checkpoint for retrieval layer
             kwargs = {k: v for k, v in kwargs.items() if v is not None}
             def custom_forward(*inputs):
@@ -1654,6 +1659,7 @@ def collect_for_retrieval(
       # retrieve
       # TODO: how many tokens to retrieve?
       # (bs, n_context * ?, seq_len, emb_size_per_head), (bs, n_context * ?, seq_len, seq_len), (bs, n_context * ?, seq_len)
+      # memory_bank_topk = n_context * ?
       __key_states, __query_states, __attention_mask, __input_ids = memory_bank.query(
         key_to_query, query_to_query, mask_to_query, input_ids_to_query,
         token_topk=memory_bank_topk * 5, doc_topk=memory_bank_topk, use_random=memory_use_random)
@@ -1662,22 +1668,14 @@ def collect_for_retrieval(
         self.just_collect = True
         bi_encoder_forward(__input_ids.view(-1, seq_len), __attention_mask.view(-1, seq_len, seq_len))
         del self.just_collect
-        __key_states = self.retrieval['key_states'][:, use_head_idx].view(-1, n_context, seq_len, emb_size)
-        __query_states = self.retrieval['query_states'][:, use_head_idx].view(-1, n_context, seq_len, emb_size)
+        # (bs, n_context * ?, seq_len, emb_size_per_head)
+        __key_states = self.retrieval['key_states'][:, use_head_idx].view(-1, memory_bank_topk, seq_len, emb_size)
+        __query_states = self.retrieval['query_states'][:, use_head_idx].view(-1, memory_bank_topk, seq_len, emb_size)
         self.retrieval = {'query_states': query_states, 'key_states': key_states}
-        '''
-        for i in range(2):
-          assert __input_ids[i, :, :query_len[i]].eq(_input_ids[i, :, :query_len[i]]).all()
-          assert __attention_mask[i, :, :query_len[i]].eq(__attention_mask[i, :, :query_len[i]]).all()
-          assert __input_ids[i, :, query_len[i]:].ne(_input_ids[i, :, query_len[i]:]).any()
-          assert __key_states[i, :, :query_len[i]].eq(_key_states[i, :, :query_len[i]]).all()
-          assert __key_states[i, :, query_len[i]:].ne(_key_states[i, :, query_len[i]:]).any()
-          assert __key_states[i, :, query_len[i]:].ne(_key_states[i, :, query_len[i]:]).any()
-        '''
 
-      # use original query-related vectors TODO: avoid dropout?
-      assert __key_states.size(1) % n_context == 0
-      ratio = _key_states.size(1) // n_context
+      # use original query-related vectors (different because of dropout)
+      assert memory_bank_topk % n_context == 0
+      ratio = memory_bank_topk // n_context
       keep_query_rel_mask = __attention_mask[:, :, 0].unsqueeze(-1)  # (bs, n_context * ?, seq_len, 1)
       __key_states = __key_states * ~keep_query_rel_mask + _key_states.repeat(1, ratio, 1, 1) * keep_query_rel_mask
       __query_states = __query_states * ~keep_query_rel_mask + _query_states.repeat(1, ratio, 1, 1) * keep_query_rel_mask
