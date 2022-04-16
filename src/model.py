@@ -14,12 +14,229 @@ from collections import defaultdict
 import math
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 import numpy as np
-from transformers.models.t5.modeling_t5 import T5Attention
+from transformers.models.t5.modeling_t5 import T5Attention, T5Stack, logger
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from entmax import sparsemax
 from .util import max_sparsify, WandbLogger, global_context
 from .dist_utils import gather_tensors, get_rank
 from .index import Indexer
+
+def t5stack_forward(
+     self,
+     input_ids=None,
+     attention_mask=None,
+     encoder_hidden_states=None,
+     encoder_attention_mask=None,
+     inputs_embeds=None,
+     head_mask=None,
+     cross_attn_head_mask=None,
+     past_key_values=None,
+     use_cache=None,
+     output_attentions=None,
+     output_hidden_states=None,
+     return_dict=None,
+     num_run_layers: int = None,  # number of layers to run (added parameters)
+):
+  block_to_run = self.block if num_run_layers is None else self.block[:num_run_layers]
+
+  # Model parallel
+  if self.model_parallel:
+    torch.cuda.set_device(self.first_device)
+    self.embed_tokens = self.embed_tokens.to(self.first_device)
+  use_cache = use_cache if use_cache is not None else self.config.use_cache
+  output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+  output_hidden_states = (
+    output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+  )
+  return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+  if input_ids is not None and inputs_embeds is not None:
+    err_msg_prefix = "decoder_" if self.is_decoder else ""
+    raise ValueError(
+      f"You cannot specify both {err_msg_prefix}input_ids and {err_msg_prefix}inputs_embeds at the same time"
+    )
+  elif input_ids is not None:
+    input_shape = input_ids.size()
+    input_ids = input_ids.view(-1, input_shape[-1])
+  elif inputs_embeds is not None:
+    input_shape = inputs_embeds.size()[:-1]
+  else:
+    err_msg_prefix = "decoder_" if self.is_decoder else ""
+    raise ValueError(f"You have to specify either {err_msg_prefix}input_ids or {err_msg_prefix}inputs_embeds")
+
+  if inputs_embeds is None:
+    assert self.embed_tokens is not None, "You have to initialize the model with valid token embeddings"
+    inputs_embeds = self.embed_tokens(input_ids)
+
+  batch_size, seq_length = input_shape
+
+  # required mask seq length can be calculated via length of past
+  mask_seq_length = past_key_values[0][0].shape[2] + seq_length if past_key_values is not None else seq_length
+
+  if use_cache is True:
+    assert self.is_decoder, f":obj:`use_cache` can only be set to `True` if {self} is used as a decoder"
+
+  if attention_mask is None:
+    attention_mask = torch.ones(batch_size, mask_seq_length).to(inputs_embeds.device)
+  if self.is_decoder and encoder_attention_mask is None and encoder_hidden_states is not None:
+    encoder_seq_length = encoder_hidden_states.shape[1]
+    encoder_attention_mask = torch.ones(
+      batch_size, encoder_seq_length, device=inputs_embeds.device, dtype=torch.long
+    )
+
+  # initialize past_key_values with `None` if past does not exist
+  if past_key_values is None:
+    past_key_values = [None] * len(block_to_run)
+
+  # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
+  # ourselves in which case we just need to make it broadcastable to all heads.
+  extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape, inputs_embeds.device)
+
+  # If a 2D or 3D attention mask is provided for the cross-attention
+  # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+  if self.is_decoder and encoder_hidden_states is not None:
+    encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+    encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+    if encoder_attention_mask is None:
+      encoder_attention_mask = torch.ones(encoder_hidden_shape, device=inputs_embeds.device)
+    encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+  else:
+    encoder_extended_attention_mask = None
+
+  # Prepare head mask if needed
+  head_mask = self.get_head_mask(head_mask, self.config.num_layers)
+  cross_attn_head_mask = self.get_head_mask(cross_attn_head_mask, self.config.num_layers)
+  present_key_value_states = () if use_cache else None
+  all_hidden_states = () if output_hidden_states else None
+  all_attentions = () if output_attentions else None
+  all_cross_attentions = () if (output_attentions and self.is_decoder) else None
+  position_bias = None
+  encoder_decoder_position_bias = None
+
+  hidden_states = self.dropout(inputs_embeds)
+
+  for i, (layer_module, past_key_value) in enumerate(zip(block_to_run, past_key_values)):
+    layer_head_mask = head_mask[i]
+    cross_attn_layer_head_mask = cross_attn_head_mask[i]
+    # Model parallel
+    if self.model_parallel:
+      torch.cuda.set_device(hidden_states.device)
+      # Ensure that attention_mask is always on the same device as hidden_states
+      if attention_mask is not None:
+        attention_mask = attention_mask.to(hidden_states.device)
+      if position_bias is not None:
+        position_bias = position_bias.to(hidden_states.device)
+      if encoder_hidden_states is not None:
+        encoder_hidden_states = encoder_hidden_states.to(hidden_states.device)
+      if encoder_extended_attention_mask is not None:
+        encoder_extended_attention_mask = encoder_extended_attention_mask.to(hidden_states.device)
+      if encoder_decoder_position_bias is not None:
+        encoder_decoder_position_bias = encoder_decoder_position_bias.to(hidden_states.device)
+      if layer_head_mask is not None:
+        layer_head_mask = layer_head_mask.to(hidden_states.device)
+      if cross_attn_layer_head_mask is not None:
+        cross_attn_layer_head_mask = cross_attn_layer_head_mask.to(hidden_states.device)
+    if output_hidden_states:
+      all_hidden_states = all_hidden_states + (hidden_states,)
+
+    if self.gradient_checkpointing and self.training:
+      if use_cache:
+        logger.warn(
+          "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+        )
+        use_cache = False
+
+      def create_custom_forward(module):
+        def custom_forward(*inputs):
+          return tuple(module(*inputs, use_cache, output_attentions))
+
+        return custom_forward
+
+      layer_outputs = checkpoint(
+        create_custom_forward(layer_module),
+        hidden_states,
+        extended_attention_mask,
+        position_bias,
+        encoder_hidden_states,
+        encoder_extended_attention_mask,
+        encoder_decoder_position_bias,
+        layer_head_mask,
+        cross_attn_layer_head_mask,
+        None,  # past_key_value is always None with gradient checkpointing
+      )
+    else:
+      layer_outputs = layer_module(
+        hidden_states,
+        attention_mask=extended_attention_mask,
+        position_bias=position_bias,
+        encoder_hidden_states=encoder_hidden_states,
+        encoder_attention_mask=encoder_extended_attention_mask,
+        encoder_decoder_position_bias=encoder_decoder_position_bias,
+        layer_head_mask=layer_head_mask,
+        cross_attn_layer_head_mask=cross_attn_layer_head_mask,
+        past_key_value=past_key_value,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+      )
+
+    # layer_outputs is a tuple with:
+    # hidden-states, key-value-states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
+    if use_cache is False:
+      layer_outputs = layer_outputs[:1] + (None,) + layer_outputs[1:]
+
+    hidden_states, present_key_value_state = layer_outputs[:2]
+
+    # We share the position biases between the layers - the first layer store them
+    # layer_outputs = hidden-states, key-value-states (self-attention position bias), (self-attention weights),
+    # (cross-attention position bias), (cross-attention weights)
+    position_bias = layer_outputs[2]
+    if self.is_decoder and encoder_hidden_states is not None:
+      encoder_decoder_position_bias = layer_outputs[4 if output_attentions else 3]
+    # append next layer key value states
+    if use_cache:
+      present_key_value_states = present_key_value_states + (present_key_value_state,)
+
+    if output_attentions:
+      all_attentions = all_attentions + (layer_outputs[3],)
+      if self.is_decoder:
+        all_cross_attentions = all_cross_attentions + (layer_outputs[5],)
+
+    # Model Parallel: If it's the last layer for that device, put things on the next device
+    if self.model_parallel:
+      for k, v in self.device_map.items():
+        if i == v[-1] and "cuda:" + str(k) != self.last_device:
+          hidden_states = hidden_states.to("cuda:" + str(k + 1))
+
+  hidden_states = self.final_layer_norm(hidden_states)
+  hidden_states = self.dropout(hidden_states)
+
+  # Add last layer
+  if output_hidden_states:
+    all_hidden_states = all_hidden_states + (hidden_states,)
+
+  if not return_dict:
+    return tuple(
+      v
+      for v in [
+        hidden_states,
+        present_key_value_states,
+        all_hidden_states,
+        all_attentions,
+        all_cross_attentions,
+      ]
+      if v is not None
+    )
+  return BaseModelOutputWithPastAndCrossAttentions(
+    last_hidden_state=hidden_states,
+    past_key_values=present_key_value_states,
+    hidden_states=all_hidden_states,
+    attentions=all_attentions,
+    cross_attentions=all_cross_attentions,
+  )
+
+T5Stack.forward = t5stack_forward
 
 def t5attention_forward(
      self,
@@ -152,7 +369,8 @@ def t5attention_forward(
   present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
   outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
 
-  need_to_push_attn_in_output_to_enable_bp = self.training and hasattr(self, 'collect_for_retrieval')
+  need_to_push_attn_in_output_to_enable_bp = \
+    self.training and hasattr(self, 'collect_for_retrieval') and not hasattr(self, 'just_collect')
 
   if output_attentions or need_to_push_attn_in_output_to_enable_bp:
     if need_to_push_attn_in_output_to_enable_bp:
@@ -188,6 +406,7 @@ class FiDT5Config(transformers.T5Config):
                memory_bank: int = 0,
                memory_bank_topk: int = 0,
                memory_use_random: bool = False,
+               memory_bank_recompute: bool = False,
                encoder_encoder_kl_ratio: float = 0,
                encoder_encoder_kl: str = None,
                encoder_encoder_kl_sparsity: int = 0,
@@ -214,6 +433,7 @@ class FiDT5Config(transformers.T5Config):
     self.memory_bank = memory_bank
     self.memory_bank_topk = memory_bank_topk
     self.memory_use_random = memory_use_random
+    self.memory_bank_recompute = memory_bank_recompute
     self.encoder_encoder_kl_ratio = encoder_encoder_kl_ratio
     self.encoder_encoder_kl = encoder_encoder_kl
     self.encoder_encoder_kl_sparsity = encoder_encoder_kl_sparsity
@@ -253,6 +473,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 memory_bank: int = 0,
                 memory_bank_topk: int = 0,
                 memory_use_random: bool = False,
+                memory_bank_recompute: bool = False,
                 encoder_encoder_kl_ratio: float = 0,
                 encoder_encoder_kl: str = None,
                 encoder_encoder_kl_sparsity: int = 0,
@@ -279,6 +500,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           memory_bank=memory_bank,
           memory_bank_topk=memory_bank_topk,
           memory_use_random=memory_use_random,
+          memory_bank_recompute=memory_bank_recompute,
           encoder_encoder_kl_ratio=encoder_encoder_kl_ratio,
           encoder_encoder_kl=encoder_encoder_kl,
           encoder_encoder_kl_sparsity=encoder_encoder_kl_sparsity,
@@ -728,8 +950,6 @@ class EncoderWrapper(torch.nn.Module):
           del kwargs['direct']
           return self.encoder(input_ids, attention_mask, **kwargs)
         n_passages = kwargs['n_passages'] if 'n_passages' in kwargs else self.n_passages
-        for block in self.encoder.block:
-          block.n_passages = n_passages
         # total_length = n_passages * passage_length
         bsz, total_length = input_ids.shape
         passage_length = total_length // n_passages
@@ -739,7 +959,13 @@ class EncoderWrapper(torch.nn.Module):
             *((bsz * n_passages,) + self.attention_separate_mask.size()[2:]))  # (bs * n_passage, seq_len * seq_len)
         else:
           attention_mask = attention_mask.view(bsz * n_passages, passage_length)  # (bs * n_passage, seq_len)
+
+        for block in self.encoder.block:
+          block.n_passages = n_passages
+          block.input_ids = input_ids
+
         outputs = self.encoder(input_ids, attention_mask, **kwargs)
+
         if bool(self.encoder_encoder_kl_ratio):
           merge = self.get_collected_for_retrieval()
           # (num_query, n_context, num_layers, [num_heads, seq_len, seq_len])
@@ -812,6 +1038,8 @@ class EncoderWrapper(torch.nn.Module):
       return kl_loss
 
     def apply_t5block_wrapper(self, config):
+      bi_encoder_forward = lambda *args, **kwargs: \
+        self.encoder(*args, **kwargs, num_run_layers=self.n_layer_two_tower + 1)
       nl_total = len(self.encoder.block)
       nl_twotower = config.n_layer_two_tower
       use_first_layer = lambda i: i == nl_twotower
@@ -843,7 +1071,8 @@ class EncoderWrapper(torch.nn.Module):
           layer,
           use_checkpoint=self.use_checkpoint,
           use_full_attention=i >= config.n_layer_two_tower,
-          use_for_retrieval=use_for_retrieval)
+          use_for_retrieval=use_for_retrieval,
+          bi_encoder_forward=bi_encoder_forward)
         if use_for_retrieval:
           self.retrieval_t5block_funcs.append(wrapped_layer.get_collected_for_retrieval)
         layers.append(wrapped_layer)
@@ -879,12 +1108,14 @@ class T5blockWrapper(torch.nn.Module):
                  module,
                  use_checkpoint: bool = False,
                  use_full_attention: bool = True,
-                 use_for_retrieval: bool = False):
+                 use_for_retrieval: bool = False,
+                 bi_encoder_forward: Callable = None):
         super().__init__()
         self.module = module
         self.use_checkpoint = use_checkpoint
         self.use_full_attention = use_full_attention
         self.use_for_retrieval = use_for_retrieval
+        self.bi_encoder_forward = bi_encoder_forward
         self.retrieval_aggregation_method = config.retrieval_aggregation_method
         self.in_batch_negative = config.in_batch_negative
         self.in_batch_negative_size = config.in_batch_negative_size
@@ -892,6 +1123,8 @@ class T5blockWrapper(torch.nn.Module):
         self.memory_bank = None
         self.memory_bank_topk = config.memory_bank_topk
         self.memory_use_random = config.memory_use_random
+        self.memory_bank_recompute = config.memory_bank_recompute
+        self.pad_token_id = config.pad_token_id
         if self.use_for_retrieval and config.memory_bank:
           self.memory_bank = MemoryBank(config.memory_bank, indexing_dimension=config.d_kv)
         self.need_collect = FiDT5.need_wrap_decoder(config) or bool(config.encoder_encoder_kl_ratio)
@@ -904,13 +1137,17 @@ class T5blockWrapper(torch.nn.Module):
                 functools.partial(
                     collect_for_retrieval,
                     attention_mask=attention_mask[:, 0].eq(0),
+                    input_ids=self.input_ids,  # passed from the forward function of the encoder
                     aggregation_method=self.retrieval_aggregation_method,
                     field='query',
                     use_hidden_states=False,
                     n_context=self.n_passages if hasattr(self, 'n_passages') else None,
                     memory_bank=self.memory_bank if self.training else None,
                     memory_bank_topk=self.memory_bank_topk if self.training else 0,
-                    memory_use_random=self.memory_use_random
+                    memory_use_random=self.memory_use_random,
+                    memory_bank_recompute=self.memory_bank_recompute,
+                    pad_token_id=self.pad_token_id,
+                    bi_encoder_forward=self.bi_encoder_forward,
                 ), reg_point)
             if self.in_batch_negative and self.training:
               reg_point.in_batch_negative = types.MethodType(functools.partial(
@@ -921,7 +1158,8 @@ class T5blockWrapper(torch.nn.Module):
             # modify (potentially separate) attention mask to make it a full attention
             attention_mask = attention_mask.max(2, keepdim=True)[0]  # (bs, num_heads, 1, seq_len)
         # handle checkpointing
-        if self.use_checkpoint and self.training:
+        if self.use_checkpoint and self.training and (not self.memory_bank_recompute or not self.use_for_retrieval):
+            # when memory bank requires recompute, do not use checkpoint for retrieval layer
             kwargs = {k: v for k, v in kwargs.items() if v is not None}
             def custom_forward(*inputs):
                 output = self.module(*inputs, **kwargs)
@@ -933,7 +1171,7 @@ class T5blockWrapper(torch.nn.Module):
                 output = tuple(x if x is not None else empty for x in output)
                 return output
 
-            output = torch.utils.checkpoint.checkpoint(
+            output = checkpoint(
                 custom_forward,
                 hidden_states,
                 attention_mask,
@@ -966,7 +1204,7 @@ class MemoryBank:
     self.keys: List[torch.FloatTensor] = []
     self.queries: List[torch.FloatTensor] = []
     self.masks: List[torch.BoolTensor] = []
-    self.tokids: List[torch.LongTensor] = []
+    self.token_ids: List[torch.LongTensor] = []
 
   def __len__(self):
     return len(self.ids)
@@ -981,7 +1219,7 @@ class MemoryBank:
           key: torch.FloatTensor,  # (bs, seq_len, emb_size)
           query: torch.FloatTensor,  # (bs, seq_len, emb_size)
           mask: torch.BoolTensor,  # (bs, seq_len)
-          tokid: torch.LongTensor = None,  # (bs, seq_len)
+          token_id: torch.LongTensor = None,  # (bs, seq_len)
           debug: bool = False):
     bs, emb_size = key.size(0), key.size(-1)
     assert key.size(-1) == query.size(-1) == self.indexing_dimension
@@ -998,8 +1236,8 @@ class MemoryBank:
       self.keys.append(key[i])
       self.queries.append(query[i])
       self.masks.append(mask[i])
-      if tokid is not None:
-        self.tokids.append(tokid[i])
+      if token_id is not None:
+        self.token_ids.append(token_id[i])
     # add index data
     embs_for_index = torch.masked_select(key, mask.unsqueeze(-1)).view(-1, emb_size).numpy()
     ids_for_index = []
@@ -1026,7 +1264,7 @@ class MemoryBank:
     self.keys = self.keys[num_remove:]
     self.queries = self.queries[num_remove:]
     self.masks = self.masks[num_remove:]
-    self.tokids = self.tokids[num_remove:]
+    self.token_ids = self.token_ids[num_remove:]
     # remove index data
     if to_empty:
       self.index = self.get_index()
@@ -1039,7 +1277,7 @@ class MemoryBank:
             key: torch.FloatTensor,  # (bs, max_qry_len, emb_size)
             query: torch.FloatTensor,  # (bs, max_qry_len, emb_size)
             mask: torch.BoolTensor,  # (bs, max_qry_len)
-            tokid: torch.LongTensor = None,  # (bs, seq_len)
+            token_id: torch.LongTensor = None,  # (bs, max_qry_len)
             token_topk: int = 1,
             doc_topk: int = 1,
             use_random: bool = False,
@@ -1071,7 +1309,7 @@ class MemoryBank:
           qid2did2score[qid][did] += score
 
     # concatenate
-    concat_key, concat_qry, concat_mask = [], [], []
+    concat_key, concat_qry, concat_mask, concat_tokid = [], [], [], []
     retrieved_count: List[int] = []
     for qid in range(bs):
       did2score = qid2did2score[qid]
@@ -1107,11 +1345,16 @@ class MemoryBank:
       doc_mask = doc_mask.unsqueeze(1).repeat(1, self.doc_seq_len - query_len, 1)  # (doc_topk, seq_len - query_len, seq_len)
       concat_mask.append(torch.cat([query_mask, doc_mask], dim=1))  # (doc_topk, seq_len, seq_len)
 
+      query_tokid = token_id[qid][:query_len].unsqueeze(0).repeat(doc_topk, 1)  # (doc_topk, qry_len)
+      doc_tokid = torch.stack([self.token_ids[did] for did in dids], dim=0).to(token_id)  # (doc_topk, seq_len)
+      concat_tokid.append(torch.cat([query_tokid, doc_tokid], dim=1)[:, :self.doc_seq_len])  # (doc_topk, seq_len, emb_size)
+
     WandbLogger.log_w_step({'memory-band-retrieved-count': np.mean(retrieved_count)})
     concat_key = torch.stack(concat_key, dim=0)  # (bs, doc_topk, seq_len, emb_size)
     concat_qry = torch.stack(concat_qry, dim=0)  # (bs, doc_topk, seq_len, emb_size)
     concat_mask = torch.stack(concat_mask, dim=0)  # (bs, doc_topk, seq_len, seq_len)
-    return concat_key, concat_qry, concat_mask
+    concat_tokid = torch.stack(concat_tokid, dim=0)  # (bs, doc_topk, seq_len)
+    return concat_key, concat_qry, concat_mask, concat_tokid
 
 def collect_cross_attention(
      self,
@@ -1331,14 +1574,21 @@ def collect_for_retrieval(
      key_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
      position_bias: torch.FloatTensor,  # (1, n_heads, seq_len, seq_len)
      attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
+     input_ids: torch.LongTensor,  # (bs * n_context, seq_len)
      aggregation_method: str,  # 'head-query-key'
      field: str,
      use_hidden_states: bool,
      n_context: int,
      memory_bank: MemoryBank = None,
      memory_bank_topk: int = 0,
-     memory_use_random: bool = False):
+     memory_use_random: bool = False,
+     memory_bank_recompute: bool = False,
+     pad_token_id: int = 0,
+     bi_encoder_forward: Callable = None):
   self.retrieval = {'query_states': query_states, 'key_states': key_states}
+  if hasattr(self, 'just_collect') and self.just_collect:  # collect some tensors
+    return
+
   use_head_idx = None
   n_heads = key_states.size(1)
 
@@ -1381,28 +1631,50 @@ def collect_for_retrieval(
     return
 
   if memory_bank is not None:
-    use_head_idx = 3  # TODO: add multi-head?
+    _use_head_idx = 3  # TODO: add multi-head?
     n_heads, seq_len, emb_size = key_states.size()[1:]
     # (bs, n_context, seq_len, emb_size_per_head)
-    _key_states = key_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
-    _query_states = query_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
+    _key_states = key_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, _use_head_idx]
+    _query_states = query_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, _use_head_idx]
     # (bs, n_context, seq_len, seq_len)
     _attention_mask = attention_mask.view(-1, n_context, seq_len, seq_len)
+    # (bs, n_context, seq_len)
+    _input_ids = input_ids.view(-1, n_context, seq_len)
     query_len = _attention_mask[:, 0, 0].sum(-1)  # (bs)
 
     # query memory bank when there are enough
     if memory_bank_topk and len(memory_bank) >= memory_bank_topk:
+      use_head_idx = _use_head_idx
       # extract query
       max_qry_len = query_len.max().item()
       key_to_query = _key_states[:, 0, :max_qry_len]  # (bs, max_qry_len, emb_size_per_head)
       query_to_query = _query_states[:, 0, :max_qry_len]  # (bs, max_qry_len, emb_size_per_head)
       mask_to_query = _attention_mask[:, 0, 0, :max_qry_len]  # (bs, max_qry_len)
+      input_ids_to_query = _input_ids[:, 0, :max_qry_len]  # (bs, max_qry_len)
       # retrieve
       # TODO: how many tokens to retrieve?
-      # (bs, n_context * ?, seq_len, emb_size_per_head), (bs, n_context * ?, seq_len, seq_len)
-      __key_states, __query_states, __attention_mask = memory_bank.query(
-        key_to_query, query_to_query, mask_to_query,
+      # (bs, n_context * ?, seq_len, emb_size_per_head), (bs, n_context * ?, seq_len, seq_len), (bs, n_context * ?, seq_len)
+      __key_states, __query_states, __attention_mask, __input_ids = memory_bank.query(
+        key_to_query, query_to_query, mask_to_query, input_ids_to_query,
         token_topk=memory_bank_topk * 5, doc_topk=memory_bank_topk, use_random=memory_use_random)
+
+      if memory_bank_recompute:  # run bi-encoder
+        self.just_collect = True
+        bi_encoder_forward(__input_ids.view(-1, seq_len), __attention_mask.view(-1, seq_len, seq_len))
+        del self.just_collect
+        __key_states = self.retrieval['key_states'][:, use_head_idx].view(-1, n_context, seq_len, emb_size)
+        __query_states = self.retrieval['query_states'][:, use_head_idx].view(-1, n_context, seq_len, emb_size)
+        self.retrieval = {'query_states': query_states, 'key_states': key_states}
+        '''
+        for i in range(2):
+          assert __input_ids[i, :, :query_len[i]].eq(_input_ids[i, :, :query_len[i]]).all()
+          assert __attention_mask[i, :, :query_len[i]].eq(__attention_mask[i, :, :query_len[i]]).all()
+          assert __input_ids[i, :, query_len[i]:].ne(_input_ids[i, :, query_len[i]:]).any()
+          assert __key_states[i, :, :query_len[i]].eq(_key_states[i, :, :query_len[i]]).all()
+          assert __key_states[i, :, query_len[i]:].ne(_key_states[i, :, query_len[i]:]).any()
+          assert __key_states[i, :, query_len[i]:].ne(_key_states[i, :, query_len[i]:]).any()
+        '''
+
       # use original query-related vectors TODO: avoid dropout?
       assert __key_states.size(1) % n_context == 0
       ratio = _key_states.size(1) // n_context
@@ -1425,13 +1697,16 @@ def collect_for_retrieval(
       for i in range(len(query_len)):
         pad = torch.zeros(n_context, query_len[i], emb_size).to(_key_states)  # (n_context, qry_len, emb_size_per_head)
         pad_mask = torch.zeros(n_context, query_len[i]).to(_attention_mask)  # (n_context, qry_len)
+        pad_input_ids = torch.full((n_context, query_len[i]), pad_token_id).to(_input_ids)  # (n_context, qry_len)
         # always use the same seq_len
         # (n_context, seq_len, emb_size_per_head)
         key_to_add = torch.cat([_key_states[i, :, query_len[i]:], pad], dim=1)
         query_to_add = torch.cat([_query_states[i, :, query_len[i]:], pad], dim=1)
         # (n_context, seq_len)
         mask_to_add = torch.cat([_attention_mask[i, :, query_len[i], query_len[i]:], pad_mask], dim=1)
-        memory_bank.add(key_to_add, query_to_add, mask_to_add)
+        # (n_context, seq_len)
+        input_ids_to_add = torch.cat([_input_ids[i, :, query_len[i]:], pad_input_ids], dim=1)
+        memory_bank.add(key_to_add, query_to_add, mask_to_add, input_ids_to_add)
 
   if use_hidden_states:
     scores = torch.matmul(
