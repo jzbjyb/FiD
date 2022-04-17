@@ -1142,6 +1142,7 @@ class EncoderWrapper(torch.nn.Module):
         self.encoder_encoder_kl_ratio = config.encoder_encoder_kl_ratio
         self.encoder_encoder_kl = config.encoder_encoder_kl
         self.encoder_encoder_kl_sparsity = config.encoder_encoder_kl_sparsity
+        self.memory_bank_additional_encode = config.memory_bank_additional_encode
         self.apply_t5block_wrapper(config)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
@@ -1240,7 +1241,8 @@ class EncoderWrapper(torch.nn.Module):
       def bi_encoder_forward(
            input_ids,  # (bs, seq_len)
            attention_mask):  # (bs, seq_len, seq_len)
-        self.attention_mask = attention_mask  # for decoder
+        if self.memory_bank_additional_encode and self.training:
+          self.attention_mask = attention_mask  # for decoder
         return self.encoder(input_ids, attention_mask, num_run_layers=self.n_layer_two_tower + 1)
       nl_total = len(self.encoder.block)
       nl_twotower = config.n_layer_two_tower
