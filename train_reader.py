@@ -233,6 +233,7 @@ if __name__ == "__main__":
           memory_bank_topk=opt.memory_bank_topk,
           memory_use_random=opt.memory_use_random,
           memory_bank_recompute=opt.memory_bank_recompute,
+          memory_bank_additional_encode=opt.memory_bank_additional_encode,
           encoder_encoder_kl_ratio=opt.encoder_encoder_kl_ratio,
           encoder_encoder_kl_sparsity=opt.encoder_encoder_kl_sparsity,
           encoder_encoder_kl=opt.encoder_encoder_kl,

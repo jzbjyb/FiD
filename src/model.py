@@ -6,6 +6,7 @@
 
 from typing import Callable, List, Dict
 import types
+import warnings
 import torch
 import transformers
 import functools
@@ -16,12 +17,194 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 import numpy as np
-from transformers.models.t5.modeling_t5 import T5Attention, T5Stack, logger
-from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
+from transformers.models.t5.modeling_t5 import \
+  T5Attention, T5Stack, T5LayerSelfAttention, T5ForConditionalGeneration, __HEAD_MASK_WARNING_MSG, logger
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, BaseModelOutput, Seq2SeqLMOutput
 from entmax import sparsemax
 from .util import max_sparsify, WandbLogger, global_context
 from .dist_utils import gather_tensors, get_rank
 from .index import Indexer
+
+
+def t5forconditionalgeneration_forward(
+     self,
+     input_ids=None,
+     attention_mask=None,
+     decoder_input_ids=None,
+     decoder_attention_mask=None,
+     head_mask=None,
+     decoder_head_mask=None,
+     cross_attn_head_mask=None,
+     encoder_outputs=None,
+     past_key_values=None,
+     inputs_embeds=None,
+     decoder_inputs_embeds=None,
+     labels=None,
+     use_cache=None,
+     output_attentions=None,
+     output_hidden_states=None,
+     return_dict=None,
+):
+  r"""
+  labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+      Labels for computing the sequence classification/regression loss. Indices should be in `[-100, 0, ..., config.vocab_size - 1]`. All labels set to `-100` are ignored (masked), the loss is only computed for
+      labels in `[0, ..., config.vocab_size]`
+  Returns:
+  Examples:
+  ```python
+  >>> from transformers import T5Tokenizer, T5ForConditionalGeneration
+  >>> tokenizer = T5Tokenizer.from_pretrained('t5-small')
+  >>> model = T5ForConditionalGeneration.from_pretrained('t5-small')
+  >>> # training
+  >>> input_ids = tokenizer('The <extra_id_0> walks in <extra_id_1> park', return_tensors='pt').input_ids
+  >>> labels = tokenizer('<extra_id_0> cute dog <extra_id_1> the <extra_id_2>', return_tensors='pt').input_ids
+  >>> outputs = model(input_ids=input_ids, labels=labels)
+  >>> loss = outputs.loss
+  >>> logits = outputs.logits
+  >>> # inference
+  >>> input_ids = tokenizer("summarize: studies have shown that owning a dog is good for you", return_tensors="pt").input_ids  # Batch size 1
+  >>> outputs = model.generate(input_ids)
+  >>> print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+  >>> # studies have shown that owning a dog is good for you.
+  ```"""
+  use_cache = use_cache if use_cache is not None else self.config.use_cache
+  return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+  # FutureWarning: head_mask was separated into two input args - head_mask, decoder_head_mask
+  if head_mask is not None and decoder_head_mask is None:
+    if self.config.num_layers == self.config.num_decoder_layers:
+      warnings.warn(__HEAD_MASK_WARNING_MSG, FutureWarning)
+      decoder_head_mask = head_mask
+
+  # Encode if needed (training, first prediction pass)
+  if encoder_outputs is None:
+    # Convert encoder inputs in embeddings if needed
+    encoder_outputs = self.encoder(
+      input_ids=input_ids,
+      attention_mask=attention_mask,
+      inputs_embeds=inputs_embeds,
+      head_mask=head_mask,
+      output_attentions=output_attentions,
+      output_hidden_states=output_hidden_states,
+      return_dict=return_dict,
+    )
+  elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
+    encoder_outputs = BaseModelOutput(
+      last_hidden_state=encoder_outputs[0],
+      hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
+      attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
+    )
+
+  hidden_states = encoder_outputs[0]
+
+  if self.model_parallel:
+    torch.cuda.set_device(self.decoder.first_device)
+
+  if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
+    # get decoder inputs from shifting lm labels to the right
+    decoder_input_ids = self._shift_right(labels)
+
+  # Set device for model parallelism
+  if self.model_parallel:
+    torch.cuda.set_device(self.decoder.first_device)
+    hidden_states = hidden_states.to(self.decoder.first_device)
+    if decoder_input_ids is not None:
+      decoder_input_ids = decoder_input_ids.to(self.decoder.first_device)
+    if attention_mask is not None:
+      attention_mask = attention_mask.to(self.decoder.first_device)
+    if decoder_attention_mask is not None:
+      decoder_attention_mask = decoder_attention_mask.to(self.decoder.first_device)
+
+  # Decode
+  if hasattr(self.encoder, 'attention_mask'):  # (bs * ?, seq_len, seq_len)
+    bs = attention_mask.size(0)
+    # (bs, (n_context + ?) * seq_len)
+    attention_mask = torch.cat([attention_mask, self.encoder.attention_mask.max(1)[0].view(bs, -1)], dim=1)
+    del self.encoder.attention_mask
+
+  decoder_outputs = self.decoder(
+    input_ids=decoder_input_ids,
+    attention_mask=decoder_attention_mask,
+    inputs_embeds=decoder_inputs_embeds,
+    past_key_values=past_key_values,
+    encoder_hidden_states=hidden_states,
+    encoder_attention_mask=attention_mask,
+    head_mask=decoder_head_mask,
+    cross_attn_head_mask=cross_attn_head_mask,
+    use_cache=use_cache,
+    output_attentions=output_attentions,
+    output_hidden_states=output_hidden_states,
+    return_dict=return_dict,
+  )
+
+  sequence_output = decoder_outputs[0]
+
+  # Set device for model parallelism
+  if self.model_parallel:
+    torch.cuda.set_device(self.encoder.first_device)
+    self.lm_head = self.lm_head.to(self.encoder.first_device)
+    sequence_output = sequence_output.to(self.lm_head.weight.device)
+
+  if self.config.tie_word_embeddings:
+    # Rescale output before projecting on vocab
+    # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/transformer.py#L586
+    sequence_output = sequence_output * (self.model_dim ** -0.5)
+
+  lm_logits = self.lm_head(sequence_output)
+
+  loss = None
+  if labels is not None:
+    loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+    loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1))
+    # TODO(thom): Add z_loss https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L666
+
+  if not return_dict:
+    output = (lm_logits,) + decoder_outputs[1:] + encoder_outputs
+    return ((loss,) + output) if loss is not None else output
+
+  return Seq2SeqLMOutput(
+    loss=loss,
+    logits=lm_logits,
+    past_key_values=decoder_outputs.past_key_values,
+    decoder_hidden_states=decoder_outputs.hidden_states,
+    decoder_attentions=decoder_outputs.attentions,
+    cross_attentions=decoder_outputs.cross_attentions,
+    encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+    encoder_hidden_states=encoder_outputs.hidden_states,
+    encoder_attentions=encoder_outputs.attentions,
+  )
+
+T5ForConditionalGeneration.forward = t5forconditionalgeneration_forward
+
+def t5layerselfattention_forward(
+     self,
+     hidden_states,
+     attention_mask=None,
+     position_bias=None,
+     layer_head_mask=None,
+     past_key_value=None,
+     use_cache=False,
+     output_attentions=False,
+):
+  if hasattr(self, 'additional_encode'):
+    self.hidden_states = hidden_states
+  normed_hidden_states = self.layer_norm(hidden_states)
+  attention_output = self.SelfAttention(
+    normed_hidden_states,
+    mask=attention_mask,
+    position_bias=position_bias,
+    layer_head_mask=layer_head_mask,
+    past_key_value=past_key_value,
+    use_cache=use_cache,
+    output_attentions=output_attentions,
+  )
+  if hasattr(self, 'additional_encode') and hidden_states.size(0) < attention_output[0].size(0):
+    hidden_states = torch.cat([hidden_states, self.hidden_states], dim=0)
+  hidden_states = hidden_states + self.dropout(attention_output[0])
+  outputs = (hidden_states,) + attention_output[1:]  # add attentions if we output them
+  return outputs
+
+T5LayerSelfAttention.forward = t5layerselfattention_forward
 
 def t5stack_forward(
      self,
@@ -180,6 +363,9 @@ def t5stack_forward(
         use_cache=use_cache,
         output_attentions=output_attentions,
       )
+    if not self.is_decoder and hasattr(layer_module.module.layer[0].SelfAttention, 'preprocessed_mask'):
+      extended_attention_mask = layer_module.module.layer[0].SelfAttention.preprocessed_mask
+      del layer_module.module.layer[0].SelfAttention.preprocessed_mask
 
     # layer_outputs is a tuple with:
     # hidden-states, key-value-states, (self-attention position bias), (self-attention weights), (cross-attention position bias), (cross-attention weights)
@@ -270,11 +456,13 @@ def t5attention_forward(
 
   def shape(states):
     """projection"""
-    return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
+    bs = states.size(0)
+    return states.view(bs, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
 
   def unshape(states):
     """reshape"""
-    return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
+    bs = states.size(0)
+    return states.transpose(1, 2).contiguous().view(bs, -1, self.inner_dim)
 
   def project(hidden_states, proj_layer, key_value_states, past_key_value):
     """projects hidden states correctly to key/query states"""
@@ -334,7 +522,9 @@ def t5attention_forward(
 
   # collect encoder attn (before applying mask)
   if hasattr(self, 'collect_for_retrieval'):
-    self.collect_for_retrieval(scores, hidden_states, query_states, key_states, position_bias)
+    collect_return = self.collect_for_retrieval(scores, hidden_states, query_states, key_states, value_states, position_bias, mask)
+    if collect_return is not None:  # update these tensors to make them larger
+      scores, query_states, key_states, value_states, mask = collect_return
 
   if mask is not None:
     # apply token-leve mask
@@ -407,6 +597,7 @@ class FiDT5Config(transformers.T5Config):
                memory_bank_topk: int = 0,
                memory_use_random: bool = False,
                memory_bank_recompute: bool = False,
+               memory_bank_additional_encode: bool = False,
                encoder_encoder_kl_ratio: float = 0,
                encoder_encoder_kl: str = None,
                encoder_encoder_kl_sparsity: int = 0,
@@ -434,6 +625,7 @@ class FiDT5Config(transformers.T5Config):
     self.memory_bank_topk = memory_bank_topk
     self.memory_use_random = memory_use_random
     self.memory_bank_recompute = memory_bank_recompute
+    self.memory_bank_additional_encode = memory_bank_additional_encode
     self.encoder_encoder_kl_ratio = encoder_encoder_kl_ratio
     self.encoder_encoder_kl = encoder_encoder_kl
     self.encoder_encoder_kl_sparsity = encoder_encoder_kl_sparsity
@@ -476,6 +668,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 memory_bank_topk: int = 0,
                 memory_use_random: bool = False,
                 memory_bank_recompute: bool = False,
+                memory_bank_additional_encode: bool = False,
                 encoder_encoder_kl_ratio: float = 0,
                 encoder_encoder_kl: str = None,
                 encoder_encoder_kl_sparsity: int = 0,
@@ -503,6 +696,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           memory_bank_topk=memory_bank_topk,
           memory_use_random=memory_use_random,
           memory_bank_recompute=memory_bank_recompute,
+          memory_bank_additional_encode=memory_bank_additional_encode,
           encoder_encoder_kl_ratio=encoder_encoder_kl_ratio,
           encoder_encoder_kl=encoder_encoder_kl,
           encoder_encoder_kl_sparsity=encoder_encoder_kl_sparsity,
@@ -958,7 +1152,7 @@ class EncoderWrapper(torch.nn.Module):
         # total_length = n_passages * passage_length
         bsz, total_length = input_ids.shape
         passage_length = total_length // n_passages
-        input_ids = input_ids.view(bsz*n_passages, passage_length)
+        input_ids = input_ids.view(bsz * n_passages, passage_length)
         if hasattr(self, 'attention_separate_mask') and self.attention_separate_mask is not None:  # use separate attention mask
           attention_mask = self.attention_separate_mask.view(
             *((bsz * n_passages,) + self.attention_separate_mask.size()[2:]))  # (bs * n_passage, seq_len * seq_len)
@@ -979,9 +1173,9 @@ class EncoderWrapper(torch.nn.Module):
           ttasfm = merge['two_tower_attn_score_full_mask'] if 'two_tower_attn_score_full' in merge else None
           self.compute_encoder_encoder_kl(ttas, ttasfm)
         if kwargs['return_dict']:
-          outputs.last_hidden_state = outputs.last_hidden_state.view(bsz, n_passages*passage_length, -1)
+          outputs.last_hidden_state = outputs.last_hidden_state.view(bsz, -1, outputs.last_hidden_state.size(-1))
         else:
-          outputs = (outputs[0].view(bsz, n_passages*passage_length, -1), ) + outputs[1:]
+          outputs = (outputs[0].view(bsz, -1, outputs[0].size(-1)),) + outputs[1:]
         return outputs
 
     def compute_encoder_encoder_kl(self,
@@ -1043,8 +1237,11 @@ class EncoderWrapper(torch.nn.Module):
       return kl_loss
 
     def apply_t5block_wrapper(self, config):
-      bi_encoder_forward = lambda *args, **kwargs: \
-        self.encoder(*args, **kwargs, num_run_layers=self.n_layer_two_tower + 1)
+      def bi_encoder_forward(
+           input_ids,  # (bs, seq_len)
+           attention_mask):  # (bs, seq_len, seq_len)
+        self.attention_mask = attention_mask  # for decoder
+        return self.encoder(input_ids, attention_mask, num_run_layers=self.n_layer_two_tower + 1)
       nl_total = len(self.encoder.block)
       nl_twotower = config.n_layer_two_tower
       use_first_layer = lambda i: i == nl_twotower
@@ -1129,6 +1326,7 @@ class T5blockWrapper(torch.nn.Module):
         self.memory_bank_topk = config.memory_bank_topk
         self.memory_use_random = config.memory_use_random
         self.memory_bank_recompute = config.memory_bank_recompute
+        self.memory_bank_additional_encode = config.memory_bank_additional_encode
         self.pad_token_id = config.pad_token_id
         if self.use_for_retrieval and config.memory_bank:
           self.memory_bank = MemoryBank(config.memory_bank, indexing_dimension=config.d_kv)
@@ -1137,8 +1335,8 @@ class T5blockWrapper(torch.nn.Module):
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
         # register callback for retrieval
         if self.use_for_retrieval and (not self.training or self.need_collect):
-            reg_point = self.module.layer[0].SelfAttention
-            reg_point.collect_for_retrieval = types.MethodType(
+            reg_point = self.module.layer[0]
+            reg_point.SelfAttention.collect_for_retrieval = types.MethodType(
                 functools.partial(
                     collect_for_retrieval,
                     attention_mask=attention_mask[:, 0].eq(0),
@@ -1151,13 +1349,16 @@ class T5blockWrapper(torch.nn.Module):
                     memory_bank_topk=self.memory_bank_topk if self.training else 0,
                     memory_use_random=self.memory_use_random,
                     memory_bank_recompute=self.memory_bank_recompute,
+                    memory_bank_additional_encode=self.memory_bank_additional_encode,
                     pad_token_id=self.pad_token_id,
                     bi_encoder_forward=self.bi_encoder_forward,
-                ), reg_point)
+                ), reg_point.SelfAttention)
+            if self.memory_bank_additional_encode and self.training:
+              reg_point.additional_encode = True
             if self.in_batch_negative and self.training:
-              reg_point.in_batch_negative = types.MethodType(functools.partial(
+              reg_point.SelfAttention.in_batch_negative = types.MethodType(functools.partial(
                 in_batch_negative, n_context=self.n_passages, in_batch_negative_size=self.in_batch_negative_size,
-                max_num_query_per_compute=self.in_batch_negative_max_num_query), reg_point)
+                max_num_query_per_compute=self.in_batch_negative_max_num_query), reg_point.SelfAttention)
         # handle separate/full attention
         if self.use_full_attention:
             # modify (potentially separate) attention mask to make it a full attention
@@ -1577,7 +1778,9 @@ def collect_for_retrieval(
      hidden_states: torch.FloatTensor,  # (bs * n_context, seq_len, emb_size)
      query_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
      key_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+     value_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
      position_bias: torch.FloatTensor,  # (1, n_heads, seq_len, seq_len)
+     preprocessed_mask: torch.FloatTensor,  # (bs * n_context, 1 (n_heads), seq_len, seq_len)
      attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
      input_ids: torch.LongTensor,  # (bs * n_context, seq_len)
      aggregation_method: str,  # 'head-query-key'
@@ -1588,13 +1791,18 @@ def collect_for_retrieval(
      memory_bank_topk: int = 0,
      memory_use_random: bool = False,
      memory_bank_recompute: bool = False,
+     memory_bank_additional_encode: bool = False,
      pad_token_id: int = 0,
      bi_encoder_forward: Callable = None):
-  self.retrieval = {'query_states': query_states, 'key_states': key_states}
+  self.retrieval = {
+    'scores': scores,
+    'query_states': query_states,
+    'key_states': key_states,
+    'value_states': value_states,
+    'preprocessed_mask': preprocessed_mask}
   if hasattr(self, 'just_collect') and self.just_collect:  # collect some tensors
     return
 
-  use_head_idx = None
   n_heads = key_states.size(1)
 
   if hasattr(self, 'in_batch_negative') and self.training:  # collect and combine from all gpu (only in training)
@@ -1668,26 +1876,59 @@ def collect_for_retrieval(
         self.just_collect = True
         bi_encoder_forward(__input_ids.view(-1, seq_len), __attention_mask.view(-1, seq_len, seq_len))
         del self.just_collect
-        # (bs, n_context * ?, seq_len, emb_size_per_head)
-        __key_states = self.retrieval['key_states'][:, use_head_idx].view(-1, memory_bank_topk, seq_len, emb_size)
-        __query_states = self.retrieval['query_states'][:, use_head_idx].view(-1, memory_bank_topk, seq_len, emb_size)
-        self.retrieval = {'query_states': query_states, 'key_states': key_states}
-
-      # use original query-related vectors (different because of dropout)
-      assert memory_bank_topk % n_context == 0
-      ratio = memory_bank_topk // n_context
-      keep_query_rel_mask = __attention_mask[:, :, 0].unsqueeze(-1)  # (bs, n_context * ?, seq_len, 1)
-      __key_states = __key_states * ~keep_query_rel_mask + _key_states.repeat(1, ratio, 1, 1) * keep_query_rel_mask
-      __query_states = __query_states * ~keep_query_rel_mask + _query_states.repeat(1, ratio, 1, 1) * keep_query_rel_mask
-      # combine current batch with retrieved
-      # (bs * n_context * ?, seq_len, emb_size_per_head)
-      __key_states = torch.cat([_key_states, __key_states], dim=1).view(-1, seq_len, emb_size)
-      __query_states = torch.cat([_query_states, __query_states], dim=1).view(-1, seq_len, emb_size)
-      # (bs * n_context * ?, seq_len, seq_len)
-      attention_mask = torch.cat([_attention_mask, __attention_mask], dim=1).view(-1, seq_len, seq_len)
-      # (bs * n_context * ?, 1 (n_heads), seq_len, seq_len)
-      scores = torch.matmul(__query_states, __key_states.transpose(2, 1)).unsqueeze(1)
-      scores = scores + position_bias[:, use_head_idx:use_head_idx + 1]
+        # tensors of retrieved docs from bi-encoder
+        __scores = self.retrieval['scores']
+        __query_states = self.retrieval['query_states']
+        __key_states = self.retrieval['key_states']
+        __value_states = self.retrieval['value_states']
+        __preprocessed_mask = self.retrieval['preprocessed_mask']
+        # set self.retrieval back to the current docs
+        self.retrieval = {
+          'scores': scores,
+          'query_states': query_states,
+          'key_states': key_states,
+          'value_states': value_states,
+          'preprocessed_mask': preprocessed_mask}
+        def cat_by_doc(raw_tensor, memory_bank_tensor):  # concat along the document dimension
+          return torch.cat([
+            raw_tensor.view(-1, n_context, *raw_tensor.size()[1:]),
+            memory_bank_tensor.view(-1, memory_bank_topk, *memory_bank_tensor.size()[1:])], dim=1).view(
+            -1, *raw_tensor.size()[1:])
+        # (bs * (n_context + memory_bank_topk), ...)
+        scores = cat_by_doc(scores, __scores)
+        query_states = cat_by_doc(query_states, __query_states)
+        key_states = cat_by_doc(key_states, __key_states)
+        value_states = cat_by_doc(value_states, __value_states)
+        preprocessed_mask = cat_by_doc(preprocessed_mask, __preprocessed_mask)
+        attention_mask = cat_by_doc(attention_mask, __attention_mask.view(-1, seq_len, seq_len))
+        aggregate_attention(
+          self, scores, attention_mask,
+          field=field, aggregation_method=aggregation_method)
+        if memory_bank_additional_encode:  # used for following encoder layers
+          self.preprocessed_mask = preprocessed_mask  # this will be used by following encoder layers
+          return scores, query_states, key_states, value_states, preprocessed_mask
+        else:
+          return
+      else:
+        # use original query-related vectors to enable dropout
+        assert memory_bank_topk % n_context == 0
+        ratio = memory_bank_topk // n_context
+        keep_query_rel_mask = __attention_mask[:, :, 0].unsqueeze(-1)  # (bs, n_context * ?, seq_len, 1)
+        __key_states = __key_states * ~keep_query_rel_mask + _key_states.repeat(1, ratio, 1, 1) * keep_query_rel_mask
+        __query_states = __query_states * ~keep_query_rel_mask + _query_states.repeat(1, ratio, 1, 1) * keep_query_rel_mask
+        # combine current batch with retrieved
+        # (bs * n_context * ?, seq_len, emb_size_per_head)
+        __key_states = torch.cat([_key_states, __key_states], dim=1).view(-1, seq_len, emb_size)
+        __query_states = torch.cat([_query_states, __query_states], dim=1).view(-1, seq_len, emb_size)
+        # (bs * n_context * ?, seq_len, seq_len)
+        attention_mask = torch.cat([_attention_mask, __attention_mask], dim=1).view(-1, seq_len, seq_len)
+        # (bs * n_context * ?, 1 (n_heads), seq_len, seq_len)
+        scores = torch.matmul(__query_states, __key_states.transpose(2, 1)).unsqueeze(1)
+        scores = scores + position_bias[:, use_head_idx:use_head_idx + 1]
+        aggregate_attention(
+          self, scores, attention_mask,
+          field=field, aggregation_method=aggregation_method, use_head_idx=use_head_idx, n_heads=n_heads)
+        return
 
     # add to memory bank and avoid duplicated add when checkpointing is activated TODO: better workaround?
     if query_states.requires_grad:
@@ -1715,7 +1956,7 @@ def collect_for_retrieval(
 
   aggregate_attention(
     self, scores, attention_mask,
-    field=field, aggregation_method=aggregation_method, use_head_idx=use_head_idx, n_heads=n_heads)
+    field=field, aggregation_method=aggregation_method)
 
 def cross_combine(values,  # (query_dim, doc_dim, seq_len, ...)
                   sep_lens,  # (query_dim)
