@@ -133,6 +133,8 @@ if __name__ == "__main__":
         world_size=opt.world_size,
         n_context=opt.n_context,
     )
+    if opt.eval_num_examples:
+      eval_examples = eval_examples[:opt.eval_num_examples]
     eval_dataset = src.data.Dataset(
         eval_examples, 
         opt.n_context, 
@@ -143,7 +145,7 @@ if __name__ == "__main__":
         eval_dataset, 
         sampler=eval_sampler, 
         batch_size=opt.per_gpu_batch_size,
-        num_workers=20, 
+        num_workers=opt.num_workers,
         collate_fn=collator_function
     )
     

@@ -6,6 +6,7 @@ model=$2/checkpoint/latest  # pretrained_models/nq_reader_base
 dataname=$3
 n_context=$4
 ckpt_dir=${model}.rerank/${dataname}
+other="${@:5}"
 
 if [[ ${dataname} == 'nq' ]]; then
   data=open_domain_data/NQ/test.json
@@ -88,4 +89,5 @@ python ${prefix} test_reader.py \
   --name distill \
   --checkpoint_dir ${ckpt_dir} \
   --write_crossattention_scores \
-  --write_results
+  --write_results \
+  ${other}
