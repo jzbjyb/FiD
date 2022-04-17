@@ -2,23 +2,21 @@
 
 MAX_NUM_GPU_PER_NODE=8
 num_gpu=$1
-
-model=$2/checkpoint/latest
-#model=pretrained_models/nq_reader_base
-
+model=$2/checkpoint/latest  # pretrained_models/nq_reader_base
 dataname=$3
-data=$4
-n_context=$5
-#ckpt_dir=${model}.allhead_softmax.${dataname}_test
-ckpt_dir=${data}.rerank
+n_context=$4
+ckpt_dir=${model}.rerank/${dataname}
 
 if [[ ${dataname} == 'nq' ]]; then
+  data=open_domain_data/NQ/test.json
   text_maxlength=250
   per_gpu_batch_size=8
 elif [[ ${dataname} == 'bioasq' ]]; then
+  data=open_domain_data/bioasq_500k.nosummary/test.json
   text_maxlength=1024
   per_gpu_batch_size=1
 elif [[ ${dataname} == 'msmarcoqa' ]]; then
+  data=open_domain_data/msmarco_qa/dev.json
   text_maxlength=250
   per_gpu_batch_size=8
 else
