@@ -34,6 +34,7 @@ class Options():
         self.parser.add_argument('--write_results', action='store_true', help='save results')
         self.parser.add_argument('--write_crossattention_scores', action='store_true', help='save dataset with cross-attention scores')
         self.parser.add_argument('--eval_num_examples', type=int, default=None, help='number of examples used in evaluation during training')
+        self.parser.add_argument('--num_workers', type=int, default=0, help='number of workers for dataloader')
 
     def add_reader_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')
