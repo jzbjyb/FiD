@@ -1684,6 +1684,8 @@ def encoder_decoder_kl(
       WandbLogger.log_w_step({'current-docs-encoder-prob-sum': pos_prob_sum.mean().item()})
       loss = kl_loss_func(enc_attn, dec_attn.detach())
       WandbLogger.log_w_step({'kl-loss': loss.item()})
+      ori_kl = kl_loss_func(torch.log_softmax(encoder_score[:, :n_context], dim=-1), dec_attn[:, :n_context].detach())
+      WandbLogger.log_w_step({'kl-loss-original': ori_kl.item()})
     elif pairwise_loss == 'sigmoid':  # kl over current docs, sigmoid over others  # TODO: not tested
       loss = kl_loss_func(enc_attn, dec_attn.detach())
       WandbLogger.log_w_step({'kl-loss': loss.item()})
@@ -1697,6 +1699,8 @@ def encoder_decoder_kl(
   elif use_memory_bank:
     dec_attn = torch.cat([dec_attn, torch.zeros((bs, memory_bank_topk)).to(dec_attn)], dim=-1)  # (bs, n_context + memory_bank_topk)
     assert tuple(enc_attn.size()) == tuple(dec_attn.size())
+    pos_prob_sum = enc_attn[:, :n_context].exp().sum(-1)  # (n_gpu * bs)
+    WandbLogger.log_w_step({'current-docs-encoder-prob-sum': pos_prob_sum.mean().item()})
     loss = kl_loss_func(enc_attn, dec_attn.detach())
     WandbLogger.log_w_step({'kl-loss': loss.item()})
     ori_kl = kl_loss_func(torch.log_softmax(encoder_score[:, :n_context], dim=-1), dec_attn[:, :n_context].detach())
