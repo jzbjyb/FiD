@@ -1330,6 +1330,8 @@ class T5blockWrapper(torch.nn.Module):
         self.memory_bank_recompute = config.memory_bank_recompute
         self.memory_bank_additional_encode = config.memory_bank_additional_encode
         self.pad_token_id = config.pad_token_id
+        self.model_name = config._name_or_path
+        self.n_layer_two_tower = config.n_layer_two_tower
         if self.use_for_retrieval and config.memory_bank:
           self.memory_bank = MemoryBank(config.memory_bank, indexing_dimension=config.d_kv)
         self.need_collect = FiDT5.need_wrap_decoder(config) or bool(config.encoder_encoder_kl_ratio)
@@ -1354,6 +1356,7 @@ class T5blockWrapper(torch.nn.Module):
                     memory_bank_additional_encode=self.memory_bank_additional_encode,
                     pad_token_id=self.pad_token_id,
                     bi_encoder_forward=self.bi_encoder_forward,
+                    use_head_idx=get_single_head_idx(self.model_name, self.n_layer_two_tower)
                 ), reg_point.SelfAttention)
             if self.memory_bank_additional_encode and self.training:
               reg_point.additional_encode = True
@@ -1774,6 +1777,15 @@ def aggregate_attention(
                         torch.zeros_like(scores).repeat(1, n_heads - use_head_idx - 1)], dim=1)
   self.retrieval['two_tower_attn_score'] = scores
 
+def get_single_head_idx(model_name: str, n_layer_two_tower: int):
+  if model_name == 'google/t5-base-lm-adapt':
+    assert n_layer_two_tower == 6
+    return 3
+  if model_name == 'google/t5-large-lm-adapt':
+    assert n_layer_two_tower == 12
+    return 6
+  raise NotImplementedError
+
 def collect_for_retrieval(
      self,
      scores: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, seq_len)
@@ -1795,7 +1807,8 @@ def collect_for_retrieval(
      memory_bank_recompute: bool = False,
      memory_bank_additional_encode: bool = False,
      pad_token_id: int = 0,
-     bi_encoder_forward: Callable = None):
+     bi_encoder_forward: Callable = None,
+     use_head_idx: int = None):
   self.retrieval = {
     'scores': scores,
     'query_states': query_states,
@@ -1808,7 +1821,6 @@ def collect_for_retrieval(
   n_heads = key_states.size(1)
 
   if hasattr(self, 'in_batch_negative') and self.training:  # collect and combine from all gpu (only in training)
-    use_head_idx = 3  # TODO: add multi-head?
     only_self_attn_qd = True  # only compute self attn between query query vectors and doc key vectors to save memory
     scores_li = []
     # (<=(n_gpu * bs)^2 * n_context, n_heads, seq_len, emb_size_per_head)
@@ -1824,7 +1836,10 @@ def collect_for_retrieval(
         _key_states = _key_states[:, :, min_qry_len:]  # (<=(n_gpu * bs)^2 * n_context, n_heads, seq_len - min_qry_len, emb_size_per_head)
         # (<=(n_gpu * bs)^2 * n_context, n_heads, max_qry_len, seq_len - min_qry_len)
         scores = torch.matmul(_query_states, _key_states.transpose(3, 2))
-        scores = scores + position_bias[:, use_head_idx:use_head_idx + 1, :max_qry_len, min_qry_len:]
+        if use_head_idx is not None:
+          scores = scores + position_bias[:, use_head_idx:use_head_idx + 1, :max_qry_len, min_qry_len:]
+        else:
+          scores = scores + position_bias[:, :, :max_qry_len, min_qry_len:]
         assert aggregation_method == 'all-avg-max'
         # (<=(n_gpu * bs)^2 * n_context, 1 (n_heads), max_qry_len, seq_len - min_qry_len)
         cross_mask = (query_mask.unsqueeze(-1) & doc_mask.unsqueeze(1)).unsqueeze(1)
@@ -1837,7 +1852,10 @@ def collect_for_retrieval(
       else:
         # (<=(n_gpu * bs)^2 * n_context, n_heads, seq_len, seq_len)
         scores = torch.matmul(_query_states, _key_states.transpose(3, 2))
-        scores = scores + position_bias[:, use_head_idx:use_head_idx + 1]
+        if use_head_idx is not None:
+          scores = scores + position_bias[:, use_head_idx:use_head_idx + 1]
+        else:
+          scores = scores + position_bias
         aggregate_attention(
           self, scores, _attention_mask,
           field=field, aggregation_method=aggregation_method, use_head_idx=use_head_idx, n_heads=n_heads)
@@ -1846,11 +1864,11 @@ def collect_for_retrieval(
     return
 
   if memory_bank is not None:
-    _use_head_idx = 3  # TODO: add multi-head?
+    assert use_head_idx is not None  # TODO: add multi-head?
     n_heads, seq_len, emb_size = key_states.size()[1:]
     # (bs, n_context, seq_len, emb_size_per_head)
-    _key_states = key_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, _use_head_idx]
-    _query_states = query_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, _use_head_idx]
+    _key_states = key_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
+    _query_states = query_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
     # (bs, n_context, seq_len, seq_len)
     _attention_mask = attention_mask.view(-1, n_context, seq_len, seq_len)
     # (bs, n_context, seq_len)
@@ -1859,7 +1877,6 @@ def collect_for_retrieval(
 
     # query memory bank when there are enough
     if memory_bank_topk and len(memory_bank) >= memory_bank_topk:
-      use_head_idx = _use_head_idx
       # extract query
       max_qry_len = query_len.max().item()
       key_to_query = _key_states[:, 0, :max_qry_len]  # (bs, max_qry_len, emb_size_per_head)
