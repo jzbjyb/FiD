@@ -1330,7 +1330,7 @@ class T5blockWrapper(torch.nn.Module):
         self.memory_bank_recompute = config.memory_bank_recompute
         self.memory_bank_additional_encode = config.memory_bank_additional_encode
         self.pad_token_id = config.pad_token_id
-        self.model_name = config._name_or_path
+        self.num_heads = config.num_heads
         self.n_layer_two_tower = config.n_layer_two_tower
         if self.use_for_retrieval and config.memory_bank:
           self.memory_bank = MemoryBank(config.memory_bank, indexing_dimension=config.d_kv)
@@ -1356,7 +1356,7 @@ class T5blockWrapper(torch.nn.Module):
                     memory_bank_additional_encode=self.memory_bank_additional_encode,
                     pad_token_id=self.pad_token_id,
                     bi_encoder_forward=self.bi_encoder_forward,
-                    use_head_idx=get_single_head_idx(self.model_name, self.n_layer_two_tower)
+                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower)
                 ), reg_point.SelfAttention)
             if self.memory_bank_additional_encode and self.training:
               reg_point.additional_encode = True
@@ -1777,11 +1777,11 @@ def aggregate_attention(
                         torch.zeros_like(scores).repeat(1, n_heads - use_head_idx - 1)], dim=1)
   self.retrieval['two_tower_attn_score'] = scores
 
-def get_single_head_idx(model_name: str, n_layer_two_tower: int):
-  if model_name == 'google/t5-base-lm-adapt':
+def get_single_head_idx(num_heads: int, n_layer_two_tower: int):
+  if num_heads == 12:  # 'google/t5-base-lm-adapt':
     assert n_layer_two_tower == 6
     return 3
-  if model_name == 'google/t5-large-lm-adapt':
+  if num_heads == 16:  # 'google/t5-large-lm-adapt':
     assert n_layer_two_tower == 12
     return 6
   raise NotImplementedError
