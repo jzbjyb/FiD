@@ -1891,9 +1891,10 @@ def collect_for_retrieval(
       # TODO: how many tokens to retrieve?
       # (bs, n_context * ?, seq_len, emb_size_per_head), (bs, n_context * ?, seq_len, seq_len), (bs, n_context * ?, seq_len)
       # memory_bank_topk = n_context * ?
+      assert memory_bank_topk <= 2048, 'faiss does not support topk > 2048'
       __key_states, __query_states, __attention_mask, __input_ids = memory_bank.query(
         key_to_query, query_to_query, mask_to_query, input_ids_to_query,
-        token_topk=memory_bank_topk * 5, doc_topk=memory_bank_topk, use_random=memory_use_random)
+        token_topk=2048, doc_topk=memory_bank_topk, use_random=memory_use_random)
 
       if memory_bank_recompute:  # run bi-encoder
         self.just_collect = True
