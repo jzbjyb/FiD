@@ -878,7 +878,9 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         """
         all_ckpt = lambda i: True  # checkpoint all layers
         later_ckpt = lambda i: i > self.n_layer_two_tower  # only checkpoint layers after bi-encoder
-        use_ckpt_per_layer = later_ckpt if self.memory_bank_recompute else all_ckpt
+        # TODO: (to remove) disable memory bank implemented here
+        #use_ckpt_per_layer = later_ckpt if self.memory_bank_recompute else all_ckpt
+        use_ckpt_per_layer = all_ckpt
         for i, layer in enumerate(self.encoder.encoder.block):
             layer.use_checkpoint = use_checkpoint and use_ckpt_per_layer(i)
 
@@ -986,6 +988,7 @@ class DecoderWrapper(torch.nn.Module):
     self.in_batch_negative = config.in_batch_negative
     self.pairwise_loss = config.pairwise_loss
     self.memory_bank_topk = config.memory_bank_topk
+    self.memory_bank_additional_encode = config.memory_bank_additional_encode
     if self.encoder_attention_pre_softmax and self.num_keep_ctx_in_decoder:
       raise NotImplementedError
     if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
@@ -1109,17 +1112,19 @@ class DecoderWrapper(torch.nn.Module):
     elif self.encoder_decoder_kl_ratio:
       # assign to the last cross attn module
       reg_point = self.decoder.block[-1].layer[1].EncDecAttention
-      reg_point.encoder_decoder_kl = types.MethodType(
-        functools.partial(encoder_decoder_kl,
-                          encoder_score=encoder_imp,
-                          encoder_score_mask=encoder_imp_tok_mask,
-                          n_context=num_d,
-                          only_topk_n_context=self.only_topk_n_context,
-                          use_softmax=True,
-                          encoder_score_pre_softmaxed=self.encoder_attention_pre_softmax,
-                          in_batch_negative=self.in_batch_negative and self.training,
-                          pairwise_loss=self.pairwise_loss,
-                          memory_bank_topk=self.memory_bank_topk if self.training else 0), reg_point)
+      reg_point.encoder_decoder_kl = types.MethodType(functools.partial(
+        encoder_decoder_kl,
+        encoder_score=encoder_imp,
+        encoder_score_mask=encoder_imp_tok_mask,
+        n_context=num_d,
+        only_topk_n_context=self.only_topk_n_context,
+        use_softmax=True,
+        encoder_score_pre_softmaxed=self.encoder_attention_pre_softmax,
+        in_batch_negative=self.in_batch_negative and self.training,
+        pairwise_loss=self.pairwise_loss,
+        memory_bank_topk=self.memory_bank_topk if self.training else 0,
+        memory_bank_additional_encode=self.memory_bank_additional_encode if self.training else 0
+      ), reg_point)
     else:
       raise NotImplementedError
     # decode
@@ -1137,31 +1142,82 @@ class EncoderWrapper(torch.nn.Module):
 
         self.encoder = encoder
         self.use_checkpoint = use_checkpoint
+        self.num_heads = config.num_heads
         self.n_layer_two_tower = config.n_layer_two_tower
         self.layer_for_retrieval = config.layer_for_retrieval
         self.encoder_encoder_kl_ratio = config.encoder_encoder_kl_ratio
         self.encoder_encoder_kl = config.encoder_encoder_kl
         self.encoder_encoder_kl_sparsity = config.encoder_encoder_kl_sparsity
+        self.memory_bank = MemoryBank(config.memory_bank, indexing_dimension=config.d_kv) if config.memory_bank else None
+        self.memory_bank_topk = config.memory_bank_topk
+        self.memory_use_random = config.memory_use_random
         self.memory_bank_additional_encode = config.memory_bank_additional_encode
+        self.memory_bank_inference = True  # use inference mode to run memory bank
+        if self.memory_bank_inference and self.memory_bank is not None:
+          assert config.memory_bank_recompute and self.memory_bank_additional_encode, 'not implemented'
+        self.pad_token_id = config.pad_token_id
+        def bi_encoder_forward(
+             input_ids,  # (bs, seq_len)
+             attention_mask):  # (bs, seq_len, seq_len)
+          return self.encoder(input_ids, attention_mask, num_run_layers=self.n_layer_two_tower + 1)
+        self.bi_encoder_forward = bi_encoder_forward
         self.apply_t5block_wrapper(config)
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
         if 'direct' in kwargs and kwargs['direct']:  # no reshaping, used in retrieval
           del kwargs['direct']
           return self.encoder(input_ids, attention_mask, **kwargs)
-        n_passages = kwargs['n_passages'] if 'n_passages' in kwargs else self.n_passages
         # total_length = n_passages * passage_length
         bsz, total_length = input_ids.shape
-        passage_length = total_length // n_passages
-        input_ids = input_ids.view(bsz * n_passages, passage_length)
+        passage_length = total_length // self.n_passages
+        input_ids = input_ids.view(bsz * self.n_passages, passage_length)
         if hasattr(self, 'attention_separate_mask') and self.attention_separate_mask is not None:  # use separate attention mask
           attention_mask = self.attention_separate_mask.view(
-            *((bsz * n_passages,) + self.attention_separate_mask.size()[2:]))  # (bs * n_passage, seq_len * seq_len)
+            *((bsz * self.n_passages,) + self.attention_separate_mask.size()[2:]))  # (bs * n_passage, seq_len * seq_len)
         else:
-          attention_mask = attention_mask.view(bsz * n_passages, passage_length)  # (bs * n_passage, seq_len)
+          attention_mask = attention_mask.view(bsz * self.n_passages, passage_length)  # (bs * n_passage, seq_len)
+
+        use_memory_bank = self.training and self.memory_bank_inference and self.memory_bank is not None
+        use_memory_bank_and_retrieve = use_memory_bank and self.memory_bank_topk and len(self.memory_bank) >= self.memory_bank_topk
+        with torch.no_grad():
+          was_training = self.training
+          self.eval()
+          if use_memory_bank:  # generate bi-encoder representations
+            n_context = self.n_passages
+            use_head_idx = get_single_head_idx(self.num_heads, self.n_layer_two_tower)
+            reg_point = self.encoder.block[self.n_layer_two_tower].module.layer[0].SelfAttention
+            reg_point.just_collect = True
+            self.bi_encoder_forward(input_ids, attention_mask)
+            del reg_point.just_collect
+            query_states, key_states = reg_point.retrieval['query_states'], reg_point.retrieval['key_states']
+          if use_memory_bank_and_retrieve:  # retrieve
+            _input_ids, _attention_mask = self.memory_bank.query_from_t5(
+              query_states, key_states, attention_mask, input_ids,
+              n_context=n_context,
+              memory_bank_topk=self.memory_bank_topk,
+              memory_use_random=self.memory_use_random,
+              use_head_idx=use_head_idx)
+            if self.memory_bank_additional_encode:
+              self.attention_mask = _attention_mask  # for decoder
+          if use_memory_bank:  # store
+            self.memory_bank.add_from_t5(
+              query_states, key_states, attention_mask, input_ids,
+              n_context=n_context, use_head_idx=use_head_idx, pad_token_id=self.pad_token_id)
+          if use_memory_bank_and_retrieve:  # update
+            def cat_by_doc(raw_tensor, memory_bank_tensor):  # concat along the document dimension
+              return torch.cat([
+                raw_tensor.view(-1, self.n_passages, *raw_tensor.size()[1:]),
+                memory_bank_tensor.view(-1, self.memory_bank_topk, *memory_bank_tensor.size()[1:])], dim=1).view(
+                -1, *raw_tensor.size()[1:])
+            # (bs * (n_context + memory_bank_topk), ...)
+            input_ids = cat_by_doc(input_ids, _input_ids)
+            attention_mask = cat_by_doc(attention_mask, _attention_mask)
+            self.n_passages = self.n_passages + self.memory_bank_topk
+          if was_training:
+            self.train()
 
         for block in self.encoder.block:
-          block.n_passages = n_passages
+          block.n_passages = self.n_passages
           block.input_ids = input_ids
 
         outputs = self.encoder(input_ids, attention_mask, **kwargs)
@@ -1238,12 +1294,13 @@ class EncoderWrapper(torch.nn.Module):
       return kl_loss
 
     def apply_t5block_wrapper(self, config):
-      def bi_encoder_forward(
+      def _bi_encoder_forward(
            input_ids,  # (bs, seq_len)
            attention_mask):  # (bs, seq_len, seq_len)
         if self.memory_bank_additional_encode and self.training:
           self.attention_mask = attention_mask  # for decoder
-        return self.encoder(input_ids, attention_mask, num_run_layers=self.n_layer_two_tower + 1)
+        self.n_passages = self.n_passages + self.memory_bank_topk  # for encoder-decoder kl loss
+        return self.bi_encoder_forward(input_ids, attention_mask)
       nl_total = len(self.encoder.block)
       nl_twotower = config.n_layer_two_tower
       use_first_layer = lambda i: i == nl_twotower
@@ -1276,7 +1333,7 @@ class EncoderWrapper(torch.nn.Module):
           use_checkpoint=self.use_checkpoint,
           use_full_attention=i >= config.n_layer_two_tower,
           use_for_retrieval=use_for_retrieval,
-          bi_encoder_forward=bi_encoder_forward)
+          bi_encoder_forward=_bi_encoder_forward)
         if use_for_retrieval:
           self.retrieval_t5block_funcs.append(wrapped_layer.get_collected_for_retrieval)
         layers.append(wrapped_layer)
@@ -1332,8 +1389,9 @@ class T5blockWrapper(torch.nn.Module):
         self.pad_token_id = config.pad_token_id
         self.num_heads = config.num_heads
         self.n_layer_two_tower = config.n_layer_two_tower
-        if self.use_for_retrieval and config.memory_bank:
-          self.memory_bank = MemoryBank(config.memory_bank, indexing_dimension=config.d_kv)
+        # TODO: (to remove) disable memory bank implemented here
+        #if self.use_for_retrieval and config.memory_bank:
+        #  self.memory_bank = MemoryBank(config.memory_bank, indexing_dimension=config.d_kv)
         self.need_collect = FiDT5.need_wrap_decoder(config) or bool(config.encoder_encoder_kl_ratio)
 
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
@@ -1349,17 +1407,19 @@ class T5blockWrapper(torch.nn.Module):
                     field='query',
                     use_hidden_states=False,
                     n_context=self.n_passages if hasattr(self, 'n_passages') else None,
-                    memory_bank=self.memory_bank if self.training else None,
-                    memory_bank_topk=self.memory_bank_topk if self.training else 0,
-                    memory_use_random=self.memory_use_random,
-                    memory_bank_recompute=self.memory_bank_recompute,
-                    memory_bank_additional_encode=self.memory_bank_additional_encode,
-                    pad_token_id=self.pad_token_id,
-                    bi_encoder_forward=self.bi_encoder_forward,
-                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower)
+                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower),
+                    # TODO: (to remove) disable memory bank implemented here
+                    #memory_bank=self.memory_bank if self.training else None,
+                    #memory_bank_topk=self.memory_bank_topk if self.training else 0,
+                    #memory_use_random=self.memory_use_random,
+                    #memory_bank_recompute=self.memory_bank_recompute,
+                    #memory_bank_additional_encode=self.memory_bank_additional_encode,
+                    #pad_token_id=self.pad_token_id,
+                    #bi_encoder_forward=self.bi_encoder_forward
                 ), reg_point.SelfAttention)
-            if self.memory_bank_additional_encode and self.training:
-              reg_point.additional_encode = True
+            # TODO: (to remove) disable memory bank implemented here
+            #if self.memory_bank_additional_encode and self.training:
+            #  reg_point.additional_encode = True
             if self.in_batch_negative and self.training:
               reg_point.SelfAttention.in_batch_negative = types.MethodType(functools.partial(
                 in_batch_negative, n_context=self.n_passages, in_batch_negative_size=self.in_batch_negative_size,
@@ -1567,6 +1627,85 @@ class MemoryBank:
     concat_tokid = torch.stack(concat_tokid, dim=0)  # (bs, doc_topk, seq_len)
     return concat_key, concat_qry, concat_mask, concat_tokid
 
+  def add_from_t5(
+       self,
+       query_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+       key_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+       attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
+       input_ids: torch.LongTensor,  # (bs * n_context, seq_len)
+       n_context: int,
+       use_head_idx: int = None,
+       pad_token_id: int = 0):
+    assert use_head_idx is not None  # TODO: add multi-head?
+    # reshape
+    n_heads, seq_len, emb_size = key_states.size()[1:]
+    # (bs, n_context, seq_len, emb_size_per_head)
+    key_states = key_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
+    query_states = query_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
+    # (bs, n_context, seq_len, seq_len)
+    attention_mask = attention_mask.view(-1, n_context, seq_len, seq_len)
+    # (bs, n_context, seq_len)
+    input_ids = input_ids.view(-1, n_context, seq_len)
+    query_len = attention_mask[:, 0, 0].sum(-1)  # (bs)
+
+    for i in range(len(query_len)):
+      pad = torch.zeros(n_context, query_len[i], emb_size).to(key_states)  # (n_context, qry_len, emb_size_per_head)
+      pad_mask = torch.zeros(n_context, query_len[i]).to(attention_mask)  # (n_context, qry_len)
+      pad_input_ids = torch.full((n_context, query_len[i]), pad_token_id).to(input_ids)  # (n_context, qry_len)
+      # always use the same seq_len
+      # (n_context, seq_len, emb_size_per_head)
+      key_to_add = torch.cat([key_states[i, :, query_len[i]:], pad], dim=1)
+      query_to_add = torch.cat([query_states[i, :, query_len[i]:], pad], dim=1)
+      # (n_context, seq_len)
+      mask_to_add = torch.cat([attention_mask[i, :, query_len[i], query_len[i]:], pad_mask], dim=1)
+      # (n_context, seq_len)
+      input_ids_to_add = torch.cat([input_ids[i, :, query_len[i]:], pad_input_ids], dim=1)
+      self.add(key_to_add, query_to_add, mask_to_add, input_ids_to_add)
+
+  def query_from_t5(
+       self,
+       query_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+       key_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+       attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
+       input_ids: torch.LongTensor,  # (bs * n_context, seq_len)
+       n_context: int,
+       memory_bank_topk: int,
+       memory_use_random: bool = False,
+       use_head_idx: int = None):
+    assert use_head_idx is not None  # TODO: add multi-head?
+    assert len(self) >= memory_bank_topk  # query memory bank when there are enough
+    assert memory_bank_topk % n_context == 0
+    assert memory_bank_topk <= 2048, 'faiss does not support topk > 2048'
+
+    # reshape
+    n_heads, seq_len, emb_size = key_states.size()[1:]
+    # (bs, n_context, seq_len, emb_size_per_head)
+    key_states = key_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
+    query_states = query_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
+    # (bs, n_context, seq_len, seq_len)
+    attention_mask = attention_mask.view(-1, n_context, seq_len, seq_len)
+    # (bs, n_context, seq_len)
+    input_ids = input_ids.view(-1, n_context, seq_len)
+    query_len = attention_mask[:, 0, 0].sum(-1)  # (bs)
+
+    # extract query
+    max_qry_len = query_len.max().item()
+    key_to_query = key_states[:, 0, :max_qry_len]  # (bs, max_qry_len, emb_size_per_head)
+    query_to_query = query_states[:, 0, :max_qry_len]  # (bs, max_qry_len, emb_size_per_head)
+    mask_to_query = attention_mask[:, 0, 0, :max_qry_len]  # (bs, max_qry_len)
+    input_ids_to_query = input_ids[:, 0, :max_qry_len]  # (bs, max_qry_len)
+
+    # retrieve
+    # (bs, memory_bank_topk, seq_len, emb_size_per_head) * 2
+    # (bs, memory_bank_topk, seq_len, seq_len)
+    # (bs, memory_bank_topk, seq_len)
+    _key_states, _query_states, _attention_mask, _input_ids = self.query(
+      key_to_query, query_to_query, mask_to_query, input_ids_to_query,
+      token_topk=2048, doc_topk=memory_bank_topk, use_random=memory_use_random)
+    # (bs * memory_bank_topk, seq_len)
+    # (bs * memory_bank_topk, seq_len, seq_len)
+    return _input_ids.view(-1, seq_len), _attention_mask.view(-1, seq_len, seq_len)
+
 def collect_cross_attention(
      self,
      scores: torch.FloatTensor,  # (bs, n_heads, 1, enc_seq_len) where masked positions have -inf
@@ -1612,10 +1751,13 @@ def encoder_decoder_kl(
      encoder_score_pre_softmaxed: bool = False,
      in_batch_negative: bool = False,
      pairwise_loss: str = None,
-     memory_bank_topk: int = 0):
+     memory_bank_topk: int = 0,
+     memory_bank_additional_encode: bool = False):
   bs, _, _, enc_seq_len = decoder_score.size()
   has_token = encoder_score.dim() == 3
-  use_memory_bank = memory_bank_topk and encoder_score.size(0) > bs  # the first several batch might not use memory-bank
+  use_memory_bank = memory_bank_topk and \
+                    not memory_bank_additional_encode and \
+                    encoder_score.size(0) > bs  # the first several batch might not use memory-bank
 
   if only_topk_n_context:  # only consider the topk context to mimic in-batch negative
     only_topk_enc_tok = (enc_seq_len // n_context) * only_topk_n_context
@@ -1680,12 +1822,20 @@ def encoder_decoder_kl(
     if pairwise_loss is None:  # kl over all docs
       # (n_gpu * bs, <=(n_gpu * bs) * n_context)
       dec_attn = torch.cat([dec_attn, torch.zeros((bs_t_ngpu, enc_attn.size(1) - n_context)).to(enc_attn)], dim=-1)
-      pos_prob_sum = enc_attn[:, :n_context].exp().sum(-1)  # (n_gpu * bs)
-      WandbLogger.log_w_step({'current-docs-encoder-prob-sum': pos_prob_sum.mean().item()})
       loss = kl_loss_func(enc_attn, dec_attn.detach())
       WandbLogger.log_w_step({'kl-loss': loss.item()})
+      pos_prob_sum = enc_attn[:, :n_context].exp().sum(-1).mean().item()
+      WandbLogger.log_w_step({'current-docs-encoder-prob-sum': pos_prob_sum})
       ori_kl = kl_loss_func(torch.log_softmax(encoder_score[:, :n_context], dim=-1), dec_attn[:, :n_context].detach())
       WandbLogger.log_w_step({'kl-loss-original': ori_kl.item()})
+      if memory_bank_topk and memory_bank_additional_encode:  # track the original kl when additional_encode is used
+        ori_n_context = n_context - memory_bank_topk
+        pos_prob_sum = enc_attn[:, :ori_n_context].exp().sum(-1).mean().item()
+        WandbLogger.log_w_step({'current-docs-encoder-prob-sum2': pos_prob_sum})
+        ori_kl = kl_loss_func(
+          torch.log_softmax(encoder_score[:, :ori_n_context], dim=-1),
+          (dec_attn[:, :ori_n_context] / (dec_attn[:, :ori_n_context].sum(-1, keepdim=True) + 1e-10)).detach())
+        WandbLogger.log_w_step({'kl-loss-original2': ori_kl.item()})
     elif pairwise_loss == 'sigmoid':  # kl over current docs, sigmoid over others  # TODO: not tested
       loss = kl_loss_func(enc_attn, dec_attn.detach())
       WandbLogger.log_w_step({'kl-loss': loss.item()})
@@ -1698,16 +1848,23 @@ def encoder_decoder_kl(
       raise NotImplementedError
   elif use_memory_bank:
     dec_attn = torch.cat([dec_attn, torch.zeros((bs, memory_bank_topk)).to(dec_attn)], dim=-1)  # (bs, n_context + memory_bank_topk)
-    assert tuple(enc_attn.size()) == tuple(dec_attn.size())
-    pos_prob_sum = enc_attn[:, :n_context].exp().sum(-1)  # (n_gpu * bs)
-    WandbLogger.log_w_step({'current-docs-encoder-prob-sum': pos_prob_sum.mean().item()})
     loss = kl_loss_func(enc_attn, dec_attn.detach())
     WandbLogger.log_w_step({'kl-loss': loss.item()})
+    pos_prob_sum = enc_attn[:, :n_context].exp().sum(-1).mean().item()
+    WandbLogger.log_w_step({'current-docs-encoder-prob-sum': pos_prob_sum})
     ori_kl = kl_loss_func(torch.log_softmax(encoder_score[:, :n_context], dim=-1), dec_attn[:, :n_context].detach())
     WandbLogger.log_w_step({'kl-loss-original': ori_kl.item()})
   else:
     loss = kl_loss_func(enc_attn, dec_attn.detach())
     WandbLogger.log_w_step({'kl-loss': loss.item()})
+    if memory_bank_topk and memory_bank_additional_encode:  # track the original kl when additional_encode is used
+      ori_n_context = n_context - memory_bank_topk
+      pos_prob_sum = enc_attn[:, :ori_n_context].exp().sum(-1).mean().item()
+      WandbLogger.log_w_step({'current-docs-encoder-prob-sum': pos_prob_sum})
+      ori_kl = kl_loss_func(
+        torch.log_softmax(encoder_score[:, :ori_n_context], dim=-1),
+        (dec_attn[:, :ori_n_context] / (dec_attn[:, :ori_n_context].sum(-1, keepdim=True) + 1e-10)).detach())
+      WandbLogger.log_w_step({'kl-loss-original': ori_kl.item()})
   return loss
 
 def aggregate_attention(
