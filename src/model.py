@@ -1912,25 +1912,45 @@ def collect_for_retrieval(
           'key_states': key_states,
           'value_states': value_states,
           'preprocessed_mask': preprocessed_mask}
-        def cat_by_doc(raw_tensor, memory_bank_tensor):  # concat along the document dimension
-          return torch.cat([
-            raw_tensor.view(-1, n_context, *raw_tensor.size()[1:]),
-            memory_bank_tensor.view(-1, memory_bank_topk, *memory_bank_tensor.size()[1:])], dim=1).view(
-            -1, *raw_tensor.size()[1:])
-        # (bs * (n_context + memory_bank_topk), ...)
-        scores = cat_by_doc(scores, __scores)
-        query_states = cat_by_doc(query_states, __query_states)
-        key_states = cat_by_doc(key_states, __key_states)
-        value_states = cat_by_doc(value_states, __value_states)
-        preprocessed_mask = cat_by_doc(preprocessed_mask, __preprocessed_mask)
-        attention_mask = cat_by_doc(attention_mask, __attention_mask.view(-1, seq_len, seq_len))
-        aggregate_attention(
-          self, scores, attention_mask,
-          field=field, aggregation_method=aggregation_method)
+        if memory_bank_additional_encode:  # TODO: debug
+          def cat_by_doc(raw_tensor, memory_bank_tensor):  # concat along the document dimension
+            return torch.cat([
+              raw_tensor.view(-1, n_context, *raw_tensor.size()[1:]),
+              memory_bank_tensor.view(-1, memory_bank_topk, *memory_bank_tensor.size()[1:])], dim=1).view(
+              -1, *raw_tensor.size()[1:])
+          # (bs * (n_context + memory_bank_topk), ...)
+          scores = cat_by_doc(scores, __scores)
+          query_states = cat_by_doc(query_states, __query_states)
+          key_states = cat_by_doc(key_states, __key_states)
+          value_states = cat_by_doc(value_states, __value_states)
+          preprocessed_mask = cat_by_doc(preprocessed_mask, __preprocessed_mask)
+          attention_mask = cat_by_doc(attention_mask, __attention_mask.view(-1, seq_len, seq_len))
+          aggregate_attention(
+            self, scores, attention_mask,
+            field=field, aggregation_method=aggregation_method)
         if memory_bank_additional_encode:  # used for following encoder layers
           self.preprocessed_mask = preprocessed_mask  # this will be used by following encoder layers
           return scores, query_states, key_states, value_states, preprocessed_mask
         else:
+          __key_states = __key_states[:, use_head_idx].view(-1, memory_bank_topk, seq_len, emb_size)
+          __query_states = __query_states[:, use_head_idx].view(-1, memory_bank_topk, seq_len, emb_size)
+          assert memory_bank_topk % n_context == 0
+          ratio = memory_bank_topk // n_context
+          keep_query_rel_mask = __attention_mask[:, :, 0].unsqueeze(-1)  # (bs, n_context * ?, seq_len, 1)
+          __key_states = __key_states * ~keep_query_rel_mask + _key_states.repeat(1, ratio, 1, 1) * keep_query_rel_mask
+          __query_states = __query_states * ~keep_query_rel_mask + _query_states.repeat(1, ratio, 1, 1) * keep_query_rel_mask
+          # combine current batch with retrieved
+          # (bs * n_context * ?, seq_len, emb_size_per_head)
+          __key_states = torch.cat([_key_states, __key_states], dim=1).view(-1, seq_len, emb_size)
+          __query_states = torch.cat([_query_states, __query_states], dim=1).view(-1, seq_len, emb_size)
+          # (bs * n_context * ?, seq_len, seq_len)
+          attention_mask = torch.cat([_attention_mask, __attention_mask], dim=1).view(-1, seq_len, seq_len)
+          # (bs * n_context * ?, 1 (n_heads), seq_len, seq_len)
+          scores = torch.matmul(__query_states, __key_states.transpose(2, 1)).unsqueeze(1)
+          scores = scores + position_bias[:, use_head_idx:use_head_idx + 1]
+          aggregate_attention(
+            self, scores, attention_mask,
+            field=field, aggregation_method=aggregation_method, use_head_idx=use_head_idx, n_heads=n_heads)
           return
       else:
         # use original query-related vectors to enable dropout
