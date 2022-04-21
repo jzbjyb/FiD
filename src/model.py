@@ -1798,7 +1798,7 @@ def encoder_decoder_kl(
   if in_batch_negative:  # collect dec_attn across gpus
     dec_attn, = gather_tensors(dec_attn)
     dec_attn = torch.cat(dec_attn, dim=0).to(dec_attn[0]).detach()  # (n_gpu * bs, n_context)
-  WandbLogger.log_w_step({'decoder-dist-kl': torch.sort(dec_attn[0], descending=True)[0][:10]})
+  #WandbLogger.log_w_step({'decoder-dist-kl': torch.sort(dec_attn[0], descending=True)[0][:10]})
   if encoder_score_pre_softmaxed:
     if in_batch_negative:
       raise NotImplementedError

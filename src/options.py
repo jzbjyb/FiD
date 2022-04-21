@@ -58,7 +58,7 @@ class Options():
                                  choices=[None, 'separate', 'query-side', 'no-query'],
                                  help='how to generate attention for query/doc')
         self.parser.add_argument('--retrieval_aggregation_method', type=str, default='all-avg-max',
-                                 choices=['all-avg-max', 'all-max-all', 'all-all-all'],
+                                 choices=['all-avg-max', 'all-avg-avg', 'all-max-all', 'all-all-all'],
                                  help='how to generate a single score for retrieval')
         self.parser.add_argument('--query_in_decoder', type=str, default='no', choices=['no', 'all'],
                                  help='use query at the beginning of the decoder')
