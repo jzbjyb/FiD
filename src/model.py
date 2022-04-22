@@ -1029,7 +1029,10 @@ class DecoderWrapper(torch.nn.Module):
 
   def get_kl_loss(self):
     assert self.encoder_decoder_kl_ratio
-    kl_loss = self.decoder.block[-1].layer[1].EncDecAttention.kl_loss * self.encoder_decoder_kl_ratio
+    world_size = 1
+    if self.in_batch_negative and global_context['opt'].is_distributed:  # to counter the gradient avg across gpus
+      world_size = global_context['opt'].world_size
+    kl_loss = self.decoder.block[-1].layer[1].EncDecAttention.kl_loss * self.encoder_decoder_kl_ratio * world_size
     return kl_loss
 
   def forward(
