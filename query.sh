@@ -30,6 +30,11 @@ else
   exit
 fi
 
+use_faiss_gpu="--use_faiss_gpu"
+if (( ${token_topk} > 2048 )); then
+  use_faiss_gpu=""
+fi
+
 if [[ ${use_position_bias} == 'true' ]]; then
   passages=${model_path}.index/${index_short_name}.position/embedding_*.npz
   output_path=${model_path}.index/${index_short_name}.position
@@ -70,5 +75,5 @@ python ${prefix} retrieval.py \
   --doc_topk 10 \
   --head_idx ${head_idx} \
   --save_or_load_index \
-  --use_faiss_gpu \
+  ${use_faiss_gpu} \
   ${extra}
