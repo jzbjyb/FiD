@@ -39,9 +39,9 @@ else
   exit
 fi
 
-echo python prep.py --task rank2json --inp ${pkl} ${queries} ${passages} --out ${json}
+python prep.py --task rank2json --inp ${pkl} ${queries} ${passages} --out ${json}
 if [[ ${index_short_name} == 'nq_test_top10' ]]; then
-  echo ./rerank.sh false ${json} score default
+  ./rerank.sh false ${json} score default
 else
   ./rerank.sh true ${json} ${beir} ${split} score default
 fi
