@@ -17,3 +17,5 @@ pip install fairscale==0.4.5
 pip install entmax==1.0
 pip install datasets==1.18.3
 pip install spacy==3.2.3
+pip install ujson==5.2.0
+pip install cupy-cuda110==10.3.1
