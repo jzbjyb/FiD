@@ -19,7 +19,7 @@ if [[ ${index_short_name} == 'nq_test_top10' ]]; then
   passage_maxlength=200
   per_gpu_batch_size=128
 elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
-  passages=open_domain_data/msmarco_qa/psgs_w100.dev_aggregate.tsv
+  passages=open_domain_data/msmarco_qa/psgs.dev_aggregate.tsv
   passage_maxlength=200
   per_gpu_batch_size=128
 elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
