@@ -31,7 +31,7 @@ combine_weight=0
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_adapt_bioasq_500k_nosummary_pseudo100k_kl_inbatchneg4
+name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_adapt_bioasq_500k_nosummary_pseudo100k_kl_inbatchneg4_step5h
 init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001/checkpoint/latest
 n_context=100
 only_topk_n_context=0
@@ -98,10 +98,10 @@ python ${prefix} train_reader.py \
   --retrieval_aggregation_method ${retrieval_aggregation_method} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 1000 \
-  --warmup_step 100 \
+  --total_step 500 \
+  --warmup_step 50 \
   --save_freq 500 \
-  --eval_freq 200 \
+  --eval_freq 100 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \

@@ -9,6 +9,8 @@ from typing import List, Tuple, Dict
 import argparse
 from collections import defaultdict
 from tqdm import tqdm
+import sys
+from pathlib import Path
 import logging
 from pathlib import Path
 import pickle
@@ -23,6 +25,10 @@ import src.data
 import src.util
 import src.slurm
 import src.index
+
+sys.path.insert(0, f'{Path.home()}/exp/ColBERT')
+from colbert.infra import Run, RunConfig, ColBERTConfig
+from colbert.modeling.checkpoint import Checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +59,7 @@ def encode_context(
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=8, collate_fn=collator)
   results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': []}
   with torch.no_grad():
-    for k, (ids, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
+    for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
       input_ids = input_ids.cuda()
       attention_mask = attention_mask.cuda()
       if opt.model_type == 'fid':
@@ -63,6 +69,15 @@ def encode_context(
           attention_mask=attention_mask,
           max_query_len=opt.query_maxlength if opt.use_position_bias else None)
         flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
+      elif opt.model_type == 'colbert':
+        # (num_docs, seq_len, emb_size)
+        embeddings, input_ids, attention_mask = model.docFromText(
+          texts,
+          keep_dims=True,
+          return_more=True)
+        embeddings = embeddings.unsqueeze(1).unsqueeze(1)
+        attention_mask = attention_mask.bool()
+        flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=0)
       elif opt.model_type == 'dpr':
         # (num_docs, emb_size)
         embeddings = model(input_ids=input_ids, attention_mask=attention_mask).pooler_output
@@ -90,7 +105,7 @@ def encode_query_and_search(
   qid2tokens2did2score: Dict[str, List[Dict[str, float]]] = defaultdict(list)
   qid2did2score: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(lambda: 0))
   with torch.no_grad():
-    for k, (ids, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
+    for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
       results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': []}
       input_ids = input_ids.cuda()
       attention_mask = attention_mask.cuda()
@@ -107,13 +122,19 @@ def encode_query_and_search(
         results['embeddings'].append(embeddings.cpu())
         results['words'].append(input_ids[:, 0].cpu())  # TODO: store text
         results['ids'].extend(ids)
+      elif opt.model_type == 'colbert':
+        # (num_docs, seq_len, emb_size)
+        embeddings, input_ids, attention_mask = model.queryFromText(texts, return_more=True)
+        embeddings = embeddings.unsqueeze(1).unsqueeze(1)
+        attention_mask = attention_mask.bool()
+        flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=0)
       else:
         raise NotImplementedError
       results['embeddings']: np.ndarray = torch.cat(results['embeddings'], dim=0).numpy()
       results['words']: np.ndarray = torch.cat(results['words'], dim=0).numpy()
       results['ids']: np.ndarray = np.array(results['ids'], dtype=str)
 
-      if opt.model_type == 'fid':
+      if opt.model_type in {'fid', 'colbert'}:
         top_ids_and_scores = index.search_knn(results['embeddings'], opt.token_topk)
         for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
           qid = results['ids'][i]
@@ -134,7 +155,7 @@ def encode_query_and_search(
       else:
         raise NotImplementedError
 
-  if opt.model_type == 'fid':  # aggregate token-level scores
+  if opt.model_type in {'fid', 'colbert'}:  # aggregate token-level scores
     for qid, tokens in qid2tokens2did2score.items():
       for token in tokens:
         for did, score in token.items():
@@ -160,6 +181,13 @@ def main(opt):
     else:
       tokenizer = DPRContextEncoderTokenizer.from_pretrained(opt.model_path, return_dict=False)
       model = DPRContextEncoder.from_pretrained(opt.model_path)
+  elif opt.model_type == 'colbert':
+    tokenizer = T5Tokenizer.from_pretrained('t5-base', return_dict=False)  # placeholder
+    with Run().context(RunConfig(nranks=1, experiment='test')):
+      ckpt_config = ColBERTConfig.load_from_checkpoint(opt.model_path)
+      config = ColBERTConfig(doc_maxlen=opt.passage_maxlength, nbits=2)
+      config = ColBERTConfig.from_existing(ckpt_config, config, Run().config)
+      model = Checkpoint(opt.model_path, colbert_config=config)
   else:
     raise NotImplementedError
   model.eval()
@@ -183,7 +211,7 @@ def main(opt):
     index.load_from_npz(args.passages, args.save_or_load_index)
     # query
     qid2rank = encode_query_and_search(opt, queries, model, tokenizer, index)
-    if opt.model_type == 'fid':
+    if opt.model_type in {'fid', 'colbert'}:
       rank_file = output_path / f'qid2rank_{opt.token_topk}.pkl'
     elif opt.model_type == 'dpr':
       rank_file = output_path / f'qid2rank_{opt.doc_topk}.pkl'
@@ -213,7 +241,7 @@ def main(opt):
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
-  parser.add_argument('--model_type', type=str, default='fid', help='type of models', choices=['fid', 'dpr'])
+  parser.add_argument('--model_type', type=str, default='fid', help='type of models', choices=['fid', 'dpr', 'colbert'])
   parser.add_argument('--queries', type=str, default=None, help='path to queries (.json file)')
   parser.add_argument('--passages', type=str, default=None, help='path to passages (.tsv file)')
   parser.add_argument('--output_path', type=str, default=None, help='prefix path to save embeddings')

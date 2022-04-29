@@ -5,20 +5,14 @@
 #SBATCH --nodelist=tir-0-19
 #SBATCH --time=0
 
-for data in bioasq_500k_test cqadupstack_programmers; do
-  for model in trained_reader/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_bs64_step8k_inbatchneg32; do
-    echo ${data} ${model}
-    ./retrieval.sh ${data} ${model} 3 false
-    ./query.sh ${data} ${model} 3 100 false
-    ./query.sh ${data} ${model} 3 1000 false
-  done
-done
+model=$1
+head=$2
 
-for data in bioasq_500k_test cqadupstack_programmers; do
-  for model in trained_reader/nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_step8k; do
-    echo ${data} ${model}
-    ./retrieval.sh ${data} ${model} 6 false
-    ./query.sh ${data} ${model} 6 100 false
-    ./query.sh ${data} ${model} 6 1000 false
-  done
+for data in bioasq_500k_test cqadupstack_programmers msmarcoqa_dev fiqa cqadupstack_mathematica cqadupstack_physics; do
+  echo ${data} ${model}
+  ./retrieval.sh ${data} ${model} ${head} false
+  ./query.sh ${data} ${model} ${head} 100 false
+  ./query.sh ${data} ${model} ${head} 1000 false
+  ./query.sh ${data} ${model} ${head} 2048 false
+  ./query.sh ${data} ${model} ${head} 4096 false
 done

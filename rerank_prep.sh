@@ -3,8 +3,8 @@
 index_short_name=$1
 model_path=$2
 topk=$3
-pkl=${model_path}/checkpoint/latest.index/${index_short_name}/qid2rank_${topk}.pkl
-json=${model_path}/checkpoint/latest.index/${index_short_name}/qid2rank_${topk}.json
+pkl=${model_path}.index/${index_short_name}/qid2rank_${topk}.pkl
+json=${model_path}.index/${index_short_name}/qid2rank_${topk}.json
 
 split=test
 if [[ ${index_short_name} == 'nq_test_top10' ]]; then

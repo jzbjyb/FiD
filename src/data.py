@@ -316,12 +316,13 @@ class TextCollator(object):
 
     def __call__(self, batch):
         index = [x[0] for x in batch]
+        texts: List[str] = [x[1] for x in batch]
         encoded_batch = self.tokenizer.batch_encode_plus(
-            [x[1] for x in batch],
+            texts,
             padding='max_length',
             return_tensors='pt',
             max_length=self.maxlength,
             truncation=True)
         text_ids = encoded_batch['input_ids']
         text_mask = encoded_batch['attention_mask'].bool()
-        return index, text_ids, text_mask
+        return index, texts, text_ids, text_mask

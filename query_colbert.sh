@@ -3,45 +3,35 @@
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
 num_gpu=1
-model_path=facebook/dpr-ctx_encoder-multiset-base
+model_path=../ColBERT/downloads/colbert-60000.dnn
 index_short_name=$1
+passages=${model_path}.index/${index_short_name}/embedding_*.npz
+output_path=${model_path}.index/${index_short_name}
+token_topk=$2
+per_gpu_batch_size=128
 
 if [[ ${index_short_name} == 'nq_test_top10' ]]; then
-  passages=open_domain_data/NQ/psgs_w100.test_top10_aggregate.tsv
-  passage_maxlength=200
-  per_gpu_batch_size=512
+  queries=open_domain_data/NQ/test.json
 elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
-  passages=open_domain_data/msmarco_qa/psgs.dev_aggregate.tsv
-  passage_maxlength=200
-  per_gpu_batch_size=512
+  queries=open_domain_data/msmarco_qa/dev.json
 elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
-  passages=open_domain_data/bioasq_500k.nosummary/psgs.test_aggregate.tsv
-  passage_maxlength=512
-  per_gpu_batch_size=256
+  queries=open_domain_data/bioasq_500k.nosummary/test.json
 elif [[ ${index_short_name} == 'fiqa' ]]; then
-  passages=open_domain_data/fiqa/psgs.tsv
-  passage_maxlength=512
-  per_gpu_batch_size=256
+  queries=open_domain_data/fiqa/test.json
 elif [[ ${index_short_name} == 'cqadupstack_mathematica' ]]; then
-  passages=open_domain_data/cqadupstack/mathematica/psgs.tsv
-  passage_maxlength=512
-  per_gpu_batch_size=256
+  queries=open_domain_data/cqadupstack/mathematica/test.json
 elif [[ ${index_short_name} == 'cqadupstack_physics' ]]; then
-  passages=open_domain_data/cqadupstack/physics/psgs.tsv
-  passage_maxlength=512
-  per_gpu_batch_size=256
+  queries=open_domain_data/cqadupstack/physics/test.json
 elif [[ ${index_short_name} == 'cqadupstack_programmers' ]]; then
-  passages=open_domain_data/cqadupstack/programmers/psgs.tsv
-  passage_maxlength=512
-  per_gpu_batch_size=256
+  queries=open_domain_data/cqadupstack/programmers/test.json
 else
   exit
 fi
 
-output_path=pretrained_models/dpr.index/${index_short_name}
-
-shard_id=0
-num_shards=1
+use_faiss_gpu="--use_faiss_gpu"
+if (( ${token_topk} > 2048 )); then
+  use_faiss_gpu=""
+fi
 
 if (( ${num_gpu} == 1 )); then
   echo 'single-GPU'
@@ -58,11 +48,16 @@ else
 fi
 
 python ${prefix} retrieval.py \
-  --model_type dpr \
-  --model_path ${model_path} \
+  --model_type colbert \
+  --queries ${queries} \
   --passages ${passages} \
+  --model_path ${model_path} \
   --output_path ${output_path} \
-  --shard_id ${shard_id} \
-  --num_shards ${num_shards} \
   --per_gpu_batch_size ${per_gpu_batch_size} \
-  --passage_maxlength ${passage_maxlength}
+  --indexing_dimension 128 \
+  --query_maxlength 50 \
+  --hnsw_m 0 \
+  --token_topk ${token_topk} \
+  --doc_topk 10 \
+  --save_or_load_index \
+  ${use_faiss_gpu}

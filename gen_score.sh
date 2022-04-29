@@ -11,7 +11,7 @@ other="${@:5}"
 if [[ ${dataname} == 'nq' ]]; then
   data=open_domain_data/NQ/test.json
   text_maxlength=250
-  per_gpu_batch_size=8
+  per_gpu_batch_size=4
 elif [[ ${dataname} == 'bioasq' ]]; then
   data=open_domain_data/bioasq_500k.nosummary/test.json
   text_maxlength=1024
