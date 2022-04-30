@@ -1,61 +1,56 @@
 #!/usr/bin/env bash
+source utils.sh
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
+MAX_NUM_GPU_PER_NODE=8
+gpu=a100
 num_gpu=1
-index_short_name=$1
-
-#trained_reader/t5_base_v11lm
-#trained_reader/nq_reader_base_v11lm_separate_layer6_continue
-#trained_reader/nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001
-#trained_reader/nq_reader_base_v11lm_separate_layer6_continue_decoder50_decattnnorm_tau0001
-model_path=$2/checkpoint/latest
-head_idx=$3
-use_position_bias=$4
-
-query_maxlength=50
-if [[ ${index_short_name} == 'nq_test_top10' ]]; then
-  passages=open_domain_data/NQ/psgs_w100.test_top10_aggregate.tsv
-  passage_maxlength=200
-  per_gpu_batch_size=128
-elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
-  passages=open_domain_data/msmarco_qa/psgs.dev_aggregate.tsv
-  passage_maxlength=200
-  per_gpu_batch_size=128
-elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
-  passages=open_domain_data/bioasq_500k.nosummary/psgs.test_aggregate.tsv
-  passage_maxlength=1024  # TODO use 512?
-  per_gpu_batch_size=32
-elif [[ ${index_short_name} == 'fiqa' ]]; then
-  passages=open_domain_data/fiqa/psgs.tsv
-  passage_maxlength=512
-  per_gpu_batch_size=64
-elif [[ ${index_short_name} == 'cqadupstack_mathematica' ]]; then
-  passages=open_domain_data/cqadupstack/mathematica/psgs.tsv
-  passage_maxlength=512
-  per_gpu_batch_size=64
-elif [[ ${index_short_name} == 'cqadupstack_physics' ]]; then
-  passages=open_domain_data/cqadupstack/physics/psgs.tsv
-  passage_maxlength=512
-  per_gpu_batch_size=64
-elif [[ ${index_short_name} == 'cqadupstack_programmers' ]]; then
-  passages=open_domain_data/cqadupstack/programmers/psgs.tsv
-  passage_maxlength=512
-  per_gpu_batch_size=64
-else
-  exit
-fi
-
-if [[ ${use_position_bias} == 'true' ]]; then
-  output_path=${model_path}.index/${index_short_name}.position
-  extra="--use_position_bias"
-else
-  output_path=${model_path}.index/${index_short_name}
-  extra=""
-fi
-
 shard_id=0
 num_shards=1
+
+model_type=$1  # fid dpr colbert
+
+# default arguments
+head_idx=""
+extra=""
+
+# model specific arguments
+if [[ ${model_type} == 'fid' ]]; then
+  model_path=$2/checkpoint/latest
+  index_name=$3
+  head_idx="--head_idx $4"
+  use_position_bias=$5
+
+  output_path=${model_path}.index/${index_name}
+  if [[ ${use_position_bias} == 'true' ]]; then
+    output_path=${output_path}.position
+    extra="--use_position_bias"
+  fi
+  get_dataset_settings ${index_name} 1024 ${gpu}  # t5's limit is 1024
+
+elif [[ ${model_type} == 'dpr' ]]; then
+  model_path=facebook/dpr-ctx_encoder-multiset-base
+  index_name=$2
+
+  output_path=pretrained_models/dpr.index/${index_name}
+  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 1024
+
+elif [[ ${model_type} == 'colbert' ]]; then
+  model_name=$2
+  if [[ ${model_name} == 'ms' ]]; then
+    model_path=../ColBERT/downloads/colbertv2.0
+  elif [[ ${model_name} == 'nq' ]]; then
+    model_path=../ColBERT/downloads/colbert-60000.dnn
+  fi
+  index_name=$3
+  
+  output_path=${model_path}.index/${index_name}
+  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 1024
+
+else
+  exit 1
+fi
 
 if (( ${num_gpu} == 1 )); then
   echo 'single-GPU'
@@ -72,14 +67,13 @@ else
 fi
 
 python ${prefix} retrieval.py \
-  --model_type fid \
+  --model_type ${model_type} \
   --model_path ${model_path} \
   --passages ${passages} \
   --output_path ${output_path} \
   --shard_id ${shard_id} \
   --num_shards ${num_shards} \
-  --per_gpu_batch_size ${per_gpu_batch_size} \
+  --per_gpu_batch_size ${passage_per_gpu_batch_size} \
   --passage_maxlength ${passage_maxlength} \
   --query_maxlength ${query_maxlength} \
-  --head_idx ${head_idx} \
-  ${extra}
+  ${head_idx} ${extra}

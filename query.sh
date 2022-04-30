@@ -1,50 +1,74 @@
 #!/usr/bin/env bash
+source utils.sh
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
+MAX_NUM_GPU_PER_NODE=8
+gpu=a100
 num_gpu=1
 
-index_short_name=$1
-model_path=$2/checkpoint/latest
-head_idx=$3
-token_topk=$4
-use_position_bias=$5
-per_gpu_batch_size=128
-query_maxlength=50
+model_type=$1  # fid dpr colbert
 
-if [[ ${index_short_name} == 'nq_test_top10' ]]; then
-  queries=open_domain_data/NQ/test.json
-elif [[ ${index_short_name} == 'msmarcoqa_dev' ]]; then
-  queries=open_domain_data/msmarco_qa/dev.json
-elif [[ ${index_short_name} == 'bioasq_500k_test' ]]; then
-  queries=open_domain_data/bioasq_500k.nosummary/test.json
-elif [[ ${index_short_name} == 'fiqa' ]]; then
-  queries=open_domain_data/fiqa/test.json
-elif [[ ${index_short_name} == 'cqadupstack_mathematica' ]]; then
-  queries=open_domain_data/cqadupstack/mathematica/test.json
-elif [[ ${index_short_name} == 'cqadupstack_physics' ]]; then
-  queries=open_domain_data/cqadupstack/physics/test.json
-elif [[ ${index_short_name} == 'cqadupstack_programmers' ]]; then
-  queries=open_domain_data/cqadupstack/programmers/test.json
-else
-  exit
-fi
-
+# default arguments
+head_idx=""
+extra=""
+token_topk=0
+doc_topk=10
 use_faiss_gpu="--use_faiss_gpu"
-if (( ${token_topk} > 2048 )); then
-  use_faiss_gpu=""
-fi
 
-if [[ ${use_position_bias} == 'true' ]]; then
-  passages=${model_path}.index/${index_short_name}.position/embedding_*.npz
-  output_path=${model_path}.index/${index_short_name}.position
-  indexing_dimension=$((64 + ${query_maxlength}))
-  extra="--use_position_bias"
+# model specific arguments
+if [[ ${model_type} == 'fid' ]]; then
+  model_path=$2/checkpoint/latest
+  index_name=$3
+  head_idx="--head_idx $4"
+  use_position_bias=$5
+  token_topk=$6
+  index_dim=64
+
+  get_dataset_settings ${index_name} 1024 ${gpu}  # t5's limit is 1024
+  output_path=${model_path}.index/${index_name}
+  if [[ ${use_position_bias} == 'true' ]]; then
+    index_dim=$(( 64 + ${query_maxlength} ))
+    output_path=${output_path}.position
+    extra="--use_position_bias"
+  fi
+  passages=${output_path}/embedding_*.npz
+  if (( ${token_topk} > 2048 )); then
+    use_faiss_gpu=""
+  fi
+
+elif [[ ${model_type} == 'dpr' ]]; then
+  model_path=facebook/dpr-question_encoder-multiset-base
+  index_name=$2
+  index_dim=768
+  
+  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 1024
+  output_path=pretrained_models/dpr.index/${index_name}
+  passages=${output_path}/embedding_*.npz
+  if (( ${doc_topk} > 2048 )); then
+    use_faiss_gpu=""
+  fi
+  
+elif [[ ${model_type} == 'colbert' ]]; then
+  model_name=$2
+  if [[ ${model_name} == 'ms' ]]; then
+    model_path=../ColBERT/downloads/colbertv2.0
+  elif [[ ${model_name} == 'nq' ]]; then
+    model_path=../ColBERT/downloads/colbert-60000.dnn
+  fi
+  index_name=$3
+  token_topk=$4
+  index_dim=128
+
+  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 1024
+  output_path=${model_path}.index/${index_name}
+  passages=${output_path}/embedding_*.npz
+  if (( ${token_topk} > 2048 )); then
+    use_faiss_gpu=""
+  fi
+  
 else
-  passages=${model_path}.index/${index_short_name}/embedding_*.npz
-  output_path=${model_path}.index/${index_short_name}
-  indexing_dimension=64
-  extra=""
+  exit 1
 fi
 
 if (( ${num_gpu} == 1 )); then
@@ -62,18 +86,16 @@ else
 fi
 
 python ${prefix} retrieval.py \
-  --model_type fid \
+  --model_type ${model_type} \
   --queries ${queries} \
   --passages ${passages} \
   --model_path ${model_path} \
   --output_path ${output_path} \
-  --per_gpu_batch_size ${per_gpu_batch_size} \
-  --indexing_dimension ${indexing_dimension} \
+  --per_gpu_batch_size ${query_per_gpu_batch_size} \
+  --indexing_dimension ${index_dim} \
   --query_maxlength ${query_maxlength} \
   --hnsw_m 0 \
   --token_topk ${token_topk} \
-  --doc_topk 10 \
-  --head_idx ${head_idx} \
+  --doc_topk ${doc_topk} \
   --save_or_load_index \
-  ${use_faiss_gpu} \
-  ${extra}
+   ${head_idx} ${use_faiss_gpu} ${extra}
