@@ -96,14 +96,13 @@ def encode_query_and_search(
      queries: List[Tuple[str, str]],
      model,
      tokenizer,
-     index,
+     index: src.index.Indexer,
      debug: bool = False) -> Dict[str, List[Tuple[str, float]]]:
   batch_size = opt.per_gpu_batch_size
   collator = src.data.TextCollator(tokenizer, opt.query_maxlength)
   dataset = src.data.QuestionDataset(queries)
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=8, collate_fn=collator)
-  qid2tokens2did2score: Dict[str, List[Dict[str, float]]] = defaultdict(list)
-  qid2did2score: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(lambda: 0))
+  qid2rank: Dict[str, List[Tuple[str, float]]] = {}
   with torch.no_grad():
     for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
       results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': []}
@@ -134,9 +133,11 @@ def encode_query_and_search(
       results['words']: np.ndarray = torch.cat(results['words'], dim=0).numpy()
       results['ids']: np.ndarray = np.array(results['ids'], dtype=str)
 
+      qid2did2score: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(lambda: 0))
       if opt.model_type in {'fid', 'colbert'}:
         top_ids_and_scores = index.search_knn(results['embeddings'], opt.token_topk)
-        for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
+        qid2tokens2did2score: Dict[str, List[Dict[str, float]]] = defaultdict(list)
+        for i, (docids, scores, texts) in enumerate(top_ids_and_scores):  # token-level scores
           qid = results['ids'][i]
           qid2tokens2did2score[qid].append(defaultdict(lambda: -1e10))
           for did, score, text in zip(docids, scores, texts):
@@ -146,6 +147,10 @@ def encode_query_and_search(
               print(qword, dword, score, did)
               input()
             qid2tokens2did2score[qid][-1][did] = max(score, qid2tokens2did2score[qid][-1][did])
+        for qid, tokens in qid2tokens2did2score.items():  # aggregate token-level scores
+          for token in tokens:
+            for did, score in token.items():
+              qid2did2score[qid][did] += score
       elif opt.model_type == 'dpr':
         top_ids_and_scores = index.search_knn(results['embeddings'], opt.doc_topk)
         for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
@@ -154,16 +159,10 @@ def encode_query_and_search(
             qid2did2score[qid][did] = score
       else:
         raise NotImplementedError
+      
+      for qid, did2score in qid2did2score.items():  # rank and only keep top docs
+        qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))[:opt.doc_topk]
 
-  if opt.model_type in {'fid', 'colbert'}:  # aggregate token-level scores
-    for qid, tokens in qid2tokens2did2score.items():
-      for token in tokens:
-        for did, score in token.items():
-          qid2did2score[qid][did] += score
-
-  qid2rank: Dict[str, List[Tuple[str, float]]] = {}
-  for qid, did2score in qid2did2score.items():
-    qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))[:opt.doc_topk]
   return qid2rank
 
 def main(opt):
