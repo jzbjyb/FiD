@@ -56,7 +56,7 @@ function get_dataset_settings() {
 
   if [[ ${gpu} == 'a100' ]]; then  # 80G
     passage_per_gpu_batch_size=256
-    query_per_gpu_batch_size=512
+    query_per_gpu_batch_size=256
   elif [[ ${gpu} == 'v100' ]]; then  # 32G
     passage_per_gpu_batch_size=128
     query_per_gpu_batch_size=256
