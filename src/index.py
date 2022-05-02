@@ -34,7 +34,7 @@ class Indexer(object):
     else:
       self.index = faiss.IndexFlatIP(vector_sz)
     if self.use_gpu:
-      logger.info('Move FAISS index to gpu')
+      logger.info(f'Move FAISS index to gpu {self.cuda_device}')
       self.index = faiss.index_cpu_to_gpu(self.res, self.cuda_device, self.index)
     self.ids = np.empty((0), dtype=str)
     self.texts = np.empty((0), dtype=str)

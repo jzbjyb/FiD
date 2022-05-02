@@ -96,12 +96,47 @@ def all_gather_list(data, group=None, max_size=16384):
         )
 
 
-def _gather_tensor(t: torch.Tensor):
+def _all_gather_tensor(t: torch.Tensor):
   all_tensors = [torch.empty_like(t) for _ in range(get_world_size())]
   dist.all_gather(all_tensors, t)
   all_tensors[get_rank()] = t
   return all_tensors
 
-def gather_tensors(*tt: torch.Tensor):
-  tt = [_gather_tensor(t) for t in tt]
+def all_gather_tensors(*tt: torch.Tensor):
+  tt = [_all_gather_tensor(t) for t in tt]
+  return tt
+
+def _gather_tensor(t: torch.Tensor, dst: int = 0):
+  all_tensors = None
+  if get_rank() == dst:
+    all_tensors = [torch.empty_like(t) for _ in range(get_world_size())]
+  dist.gather(t, all_tensors, dst=dst)
+  if get_rank() == dst:
+    all_tensors[get_rank()] = t
+  return all_tensors
+
+def gather_tensors(*tt: torch.Tensor, dst: int = 0):
+  tt = [_gather_tensor(t, dst=dst) for t in tt]
+  return tt
+
+
+def _scatter_tensor(t: torch.Tensor, src: int = 0):
+  inp_tensors = None
+  if get_rank() == src:
+    inp_tensors = list(torch.chunk(t, get_world_size(), dim=0))
+    out_tensor = torch.zeros_like(inp_tensors[0])
+  else:
+    out_tensor = t
+  dist.scatter(out_tensor, inp_tensors, src=src)
+  return out_tensor
+
+def _scatter_tensor_by_broadcast(t: torch.Tensor, src: int = 0):
+  if get_rank() != src:
+    t = t.repeat(get_world_size(), *([1] * (t.dim() - 1)))
+  dist.broadcast(t, src=src)
+  rec = list(torch.chunk(t, get_world_size(), dim=0))[get_rank()]
+  return rec
+
+def scatter_tensors(*tt: torch.Tensor, src: int = 0, by_broadcast: bool = False):
+  tt = [_scatter_tensor_by_broadcast(t, src=src) if by_broadcast else _scatter_tensor(t, src=src) for t in tt]
   return tt

@@ -4,15 +4,13 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Callable, List, Dict
+from mimetypes import init
+from typing import Callable, List
 import types
 import warnings
 import torch
 import transformers
 import functools
-import random
-from collections import defaultdict
-import math
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -21,9 +19,10 @@ from transformers.models.t5.modeling_t5 import \
   T5Attention, T5Stack, T5LayerSelfAttention, T5ForConditionalGeneration, __HEAD_MASK_WARNING_MSG, logger
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, BaseModelOutput, Seq2SeqLMOutput
 from entmax import sparsemax
-from .util import max_sparsify, WandbLogger, global_context
-from .dist_utils import gather_tensors, get_rank
-from .index import Indexer
+from src.util import max_sparsify, WandbLogger, global_context
+from src.dist_utils import all_gather_tensors
+from src.index import Indexer
+from src.memory_bank import MemoryBank, MemoryBankProcessHelper
 
 
 def t5forconditionalgeneration_forward(
@@ -878,8 +877,6 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         """
         all_ckpt = lambda i: True  # checkpoint all layers
         later_ckpt = lambda i: i > self.n_layer_two_tower  # only checkpoint layers after bi-encoder
-        # TODO: (to remove) disable memory bank implemented here
-        #use_ckpt_per_layer = later_ckpt if self.memory_bank_recompute else all_ckpt
         use_ckpt_per_layer = all_ckpt
         for i, layer in enumerate(self.encoder.encoder.block):
             layer.use_checkpoint = use_checkpoint and use_ckpt_per_layer(i)
@@ -1151,14 +1148,24 @@ class EncoderWrapper(torch.nn.Module):
         self.encoder_encoder_kl_ratio = config.encoder_encoder_kl_ratio
         self.encoder_encoder_kl = config.encoder_encoder_kl
         self.encoder_encoder_kl_sparsity = config.encoder_encoder_kl_sparsity
-        self.memory_bank = MemoryBank(config.memory_bank, indexing_dimension=config.d_kv) if config.memory_bank else None
         self.memory_bank_topk = config.memory_bank_topk
         self.memory_use_random = config.memory_use_random
         self.memory_bank_additional_encode = config.memory_bank_additional_encode
-        self.memory_bank_inference = True  # use inference mode to run memory bank
-        if self.memory_bank_inference and self.memory_bank is not None:
-          assert config.memory_bank_recompute and self.memory_bank_additional_encode, 'not implemented'
+        self.use_head_idx = get_single_head_idx(self.num_heads, self.n_layer_two_tower)
         self.pad_token_id = config.pad_token_id
+        self.memory_bank_inference = True  # use inference mode to run memory bank
+        self.separate_process = True  # use another process to handle memory bank
+        # setup memory bank directly or a process to handle memory bank
+        self.memory_bank = None
+        if config.memory_bank:
+          use_gpu = True if not self.separate_process else torch.cuda.device_count() - 1  # use the last gpu when using a separate process for memory bank
+          init_kwargs={
+            'max_size': config.memory_bank, 'indexing_dimension': config.d_kv, 'use_gpu': use_gpu, 
+            'use_head_idx': self.use_head_idx, 'pad_token_id': self.pad_token_id, 
+            'bank_topk': self.memory_bank_topk, 'use_random': self.memory_use_random}
+          self.memory_bank = MemoryBankProcessHelper(**init_kwargs) if self.separate_process else MemoryBank(**init_kwargs)
+          if self.memory_bank_inference:
+            assert config.memory_bank_recompute and self.memory_bank_additional_encode, 'not implemented'
         def bi_encoder_forward(
              input_ids,  # (bs, seq_len)
              attention_mask):  # (bs, seq_len, seq_len)
@@ -1187,26 +1194,18 @@ class EncoderWrapper(torch.nn.Module):
           self.eval()
           if use_memory_bank:  # generate bi-encoder representations
             n_context = self.n_passages
-            use_head_idx = get_single_head_idx(self.num_heads, self.n_layer_two_tower)
             reg_point = self.encoder.block[self.n_layer_two_tower].module.layer[0].SelfAttention
             reg_point.just_collect = True
             self.bi_encoder_forward(input_ids, attention_mask)
             del reg_point.just_collect
             query_states, key_states = reg_point.retrieval['query_states'], reg_point.retrieval['key_states']
-          if use_memory_bank_and_retrieve:  # retrieve
-            _input_ids, _attention_mask = self.memory_bank.query_from_t5(
-              query_states, key_states, attention_mask, input_ids,
-              n_context=n_context,
-              memory_bank_topk=self.memory_bank_topk,
-              memory_use_random=self.memory_use_random,
-              use_head_idx=use_head_idx)
+            if self.separate_process:
+              self.memory_bank.start()
+          if use_memory_bank_and_retrieve:  # retrieve, store, then update the input_ids and attention_mask
+            _input_ids, _attention_mask = self.memory_bank.query_then_add_from_t5(
+              query_states, key_states, attention_mask, input_ids, n_context=n_context)
             if self.memory_bank_additional_encode:
               self.attention_mask = _attention_mask  # for decoder
-          if use_memory_bank:  # store
-            self.memory_bank.add_from_t5(
-              query_states, key_states, attention_mask, input_ids,
-              n_context=n_context, use_head_idx=use_head_idx, pad_token_id=self.pad_token_id)
-          if use_memory_bank_and_retrieve:  # update
             def cat_by_doc(raw_tensor, memory_bank_tensor):  # concat along the document dimension
               return torch.cat([
                 raw_tensor.view(-1, self.n_passages, *raw_tensor.size()[1:]),
@@ -1216,6 +1215,9 @@ class EncoderWrapper(torch.nn.Module):
             input_ids = cat_by_doc(input_ids, _input_ids)
             attention_mask = cat_by_doc(attention_mask, _attention_mask)
             self.n_passages = self.n_passages + self.memory_bank_topk
+          elif use_memory_bank:  # only store
+            self.memory_bank.add_from_t5(
+              query_states, key_states, attention_mask, input_ids, n_context=n_context)            
           if was_training:
             self.train()
 
@@ -1392,9 +1394,6 @@ class T5blockWrapper(torch.nn.Module):
         self.pad_token_id = config.pad_token_id
         self.num_heads = config.num_heads
         self.n_layer_two_tower = config.n_layer_two_tower
-        # TODO: (to remove) disable memory bank implemented here
-        #if self.use_for_retrieval and config.memory_bank:
-        #  self.memory_bank = MemoryBank(config.memory_bank, indexing_dimension=config.d_kv)
         self.need_collect = FiDT5.need_wrap_decoder(config) or bool(config.encoder_encoder_kl_ratio)
 
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
@@ -1410,19 +1409,7 @@ class T5blockWrapper(torch.nn.Module):
                     field='query',
                     use_hidden_states=False,
                     n_context=self.n_passages if hasattr(self, 'n_passages') else None,
-                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower),
-                    # TODO: (to remove) disable memory bank implemented here
-                    #memory_bank=self.memory_bank if self.training else None,
-                    #memory_bank_topk=self.memory_bank_topk if self.training else 0,
-                    #memory_use_random=self.memory_use_random,
-                    #memory_bank_recompute=self.memory_bank_recompute,
-                    #memory_bank_additional_encode=self.memory_bank_additional_encode,
-                    #pad_token_id=self.pad_token_id,
-                    #bi_encoder_forward=self.bi_encoder_forward
-                ), reg_point.SelfAttention)
-            # TODO: (to remove) disable memory bank implemented here
-            #if self.memory_bank_additional_encode and self.training:
-            #  reg_point.additional_encode = True
+                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower)), reg_point.SelfAttention)
             if self.in_batch_negative and self.training:
               reg_point.SelfAttention.in_batch_negative = types.MethodType(functools.partial(
                 in_batch_negative, n_context=self.n_passages, in_batch_negative_size=self.in_batch_negative_size,
@@ -1463,251 +1450,6 @@ class T5blockWrapper(torch.nn.Module):
     def get_collected_for_retrieval(self):
         reg_point = self.module.layer[0].SelfAttention
         return reg_point.retrieval
-
-class MemoryBank:
-  def __init__(self, max_size: int, indexing_dimension: int, use_gpu: bool = True):
-    self.max_size = max_size
-    self.indexing_dimension = indexing_dimension
-    if not use_gpu:
-      cuda_device = -1
-    else:
-      cuda_device = get_rank() if global_context['opt'].is_distributed else 0
-    self.get_index = lambda: Indexer(indexing_dimension, n_subquantizers=0, n_bits=0, hnsw_m=0, cuda_device=cuda_device)
-    self.index = self.get_index()
-    self.ids: List[int] = []
-    self.keys: List[torch.FloatTensor] = []
-    self.queries: List[torch.FloatTensor] = []
-    self.masks: List[torch.BoolTensor] = []
-    self.token_ids: List[torch.LongTensor] = []
-
-  def __len__(self):
-    return len(self.ids)
-
-  @property
-  def doc_seq_len(self):
-    if len(self.keys) <= 0:
-      return None
-    return self.keys[0].size(0)
-
-  def add(self,
-          key: torch.FloatTensor,  # (bs, seq_len, emb_size)
-          query: torch.FloatTensor,  # (bs, seq_len, emb_size)
-          mask: torch.BoolTensor,  # (bs, seq_len)
-          token_id: torch.LongTensor = None,  # (bs, seq_len)
-          debug: bool = False):
-    bs, emb_size = key.size(0), key.size(-1)
-    assert key.size(-1) == query.size(-1) == self.indexing_dimension
-    assert key.size(0) == query.size(0) == mask.size(0)
-    assert key.size(1) == query.size(1) == mask.size(1)
-    prev_id = (self.ids[-1] + 1) if len(self.ids) else 0
-
-    # add torch data
-    key = key.detach().cpu()
-    query = query.detach().cpu()
-    mask = mask.detach().cpu()
-    for i in range(bs):
-      self.ids.append(prev_id + i)
-      self.keys.append(key[i])
-      self.queries.append(query[i])
-      self.masks.append(mask[i])
-      if token_id is not None:
-        self.token_ids.append(token_id[i])
-    # add index data
-    embs_for_index = torch.masked_select(key, mask.unsqueeze(-1)).view(-1, emb_size).numpy()
-    ids_for_index = []
-    for i in range(bs):
-      for j in range(mask[i].sum()):
-        ids_for_index.append(str(prev_id + i))
-    ids_for_index = np.array(ids_for_index, dtype=str)
-    assert len(ids_for_index) == len(embs_for_index)
-    self.index.index_data(ids_for_index, embs_for_index, disable_log=True)
-    if debug:
-      print('add', len(self.ids), len(self.index.ids), self.ids[-3:], self.index.ids[-3:])
-    # remove if needed
-    if len(self) > self.max_size:  # TODO: add remove or shrink
-      self.remove(len(self))
-      if debug:
-        print('remove', len(self.ids), len(self.index.ids), self.ids[-3:], self.index.ids[-3:])
-
-  def remove(self, num_remove: int):
-    assert num_remove > 0
-    to_empty = num_remove == len(self)
-    num_remove = min(num_remove, len(self))
-    # remove torch data
-    self.ids = self.ids[num_remove:]
-    self.keys = self.keys[num_remove:]
-    self.queries = self.queries[num_remove:]
-    self.masks = self.masks[num_remove:]
-    self.token_ids = self.token_ids[num_remove:]
-    # remove index data
-    if to_empty:
-      self.index = self.get_index()
-    else:
-      self.index.remove_data(num_remove)
-    if len(self) > 0:
-      assert str(self.index.ids[0]) == str(self.ids[0])
-
-  def query(self,
-            key: torch.FloatTensor,  # (bs, max_qry_len, emb_size)
-            query: torch.FloatTensor,  # (bs, max_qry_len, emb_size)
-            mask: torch.BoolTensor,  # (bs, max_qry_len)
-            token_id: torch.LongTensor = None,  # (bs, max_qry_len)
-            token_topk: int = 1,
-            doc_topk: int = 1,
-            use_random: bool = False,
-            debug: bool = False):
-    assert doc_topk <= len(self)
-    bs, emb_size = key.size(0), key.size(-1)
-    assert key.size(-1) == query.size(-1) == self.indexing_dimension
-    assert key.size(0) == query.size(0) == mask.size(0)
-    assert key.size(1) == query.size(1) == mask.size(1)
-
-    # token-level retrieval
-    embs_for_query = torch.masked_select(query, mask.unsqueeze(-1)).view(-1, emb_size).detach().cpu().numpy()
-    qids = [i for i in range(bs) for j in range(mask[i].sum())]
-    top_ids_and_scores = self.index.search_knn(embs_for_query, token_topk)
-    assert len(embs_for_query) == len(qids) == len(top_ids_and_scores)
-
-    # aggregate
-    qid2tokens2did2score: Dict[int, List[Dict[int, float]]] = defaultdict(list)
-    for i, (dids, scores, texts) in enumerate(top_ids_and_scores):
-      qid = qids[i]
-      qid2tokens2did2score[qid].append(defaultdict(lambda: -1e10))
-      for did, score in zip(dids, scores):
-        did = int(did)
-        qid2tokens2did2score[qid][-1][did] = max(score, qid2tokens2did2score[qid][-1][did])
-    qid2did2score: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(lambda: 0))
-    for qid, tokens in qid2tokens2did2score.items():
-      for token in tokens:
-        for did, score in token.items():
-          qid2did2score[qid][did] += score
-
-    # concatenate
-    concat_key, concat_qry, concat_mask, concat_tokid = [], [], [], []
-    retrieved_count: List[int] = []
-    for qid in range(bs):
-      did2score = qid2did2score[qid]
-      query_len = mask[qid].sum().item()
-      dids = list(sorted(did2score.items(), key=lambda x: -x[1]))[:doc_topk]
-      retrieved_count.append(len(dids))
-      dids = [did - self.ids[0] for did, _ in dids]  # use the first id as offset
-
-      if debug:
-        print(tokenizer.decode(tokid[qid][:query_len]))
-        for did in dids[:3]:
-          print(tokenizer.decode(self.tokids[did]))
-        input()
-
-      if use_random:
-        dids = list(random.sample(range(len(self)), doc_topk))
-      elif len(dids) < doc_topk:
-        dids += list(random.sample(range(len(self)), doc_topk - len(dids)))
-      assert len(dids) == doc_topk
-
-      query_qry = query[qid][:query_len].unsqueeze(0).repeat(doc_topk, 1, 1)  # (doc_topk, qry_len, emb_size)
-      doc_qry = torch.stack([self.queries[did] for did in dids], dim=0).to(query)  # (doc_topk, seq_len, emb_size)
-      concat_qry.append(torch.cat([query_qry, doc_qry], dim=1)[:, :self.doc_seq_len])  # (doc_topk, seq_len, emb_size)
-
-      query_key = key[qid][:query_len].unsqueeze(0).repeat(doc_topk, 1, 1)  # (doc_topk, qry_len, emb_size)
-      doc_key = torch.stack([self.keys[did] for did in dids], dim=0).to(key)  # (doc_topk, seq_len, emb_size)
-      concat_key.append(torch.cat([query_key, doc_key], dim=1)[:, :self.doc_seq_len]) # (doc_topk, seq_len, emb_size)
-
-      query_mask = torch.cat([mask[qid][:query_len], torch.zeros(self.doc_seq_len - query_len).to(mask)])  # (seq_len)
-      query_mask = query_mask.unsqueeze(0).unsqueeze(0).repeat(doc_topk, query_len, 1)  # (doc_topk, query_len, seq_len)
-      doc_mask = torch.stack([self.masks[did] for did in dids], dim=0).to(mask)  # (doc_topk, seq_len)
-      doc_mask = torch.cat([torch.zeros((doc_topk, query_len)).to(mask), doc_mask], dim=1)[:, :self.doc_seq_len]
-      doc_mask = doc_mask.unsqueeze(1).repeat(1, self.doc_seq_len - query_len, 1)  # (doc_topk, seq_len - query_len, seq_len)
-      concat_mask.append(torch.cat([query_mask, doc_mask], dim=1))  # (doc_topk, seq_len, seq_len)
-
-      query_tokid = token_id[qid][:query_len].unsqueeze(0).repeat(doc_topk, 1)  # (doc_topk, qry_len)
-      doc_tokid = torch.stack([self.token_ids[did] for did in dids], dim=0).to(token_id)  # (doc_topk, seq_len)
-      concat_tokid.append(torch.cat([query_tokid, doc_tokid], dim=1)[:, :self.doc_seq_len])  # (doc_topk, seq_len, emb_size)
-
-    WandbLogger.log_w_step({'memory-band-retrieved-count': np.mean(retrieved_count)})
-    concat_key = torch.stack(concat_key, dim=0)  # (bs, doc_topk, seq_len, emb_size)
-    concat_qry = torch.stack(concat_qry, dim=0)  # (bs, doc_topk, seq_len, emb_size)
-    concat_mask = torch.stack(concat_mask, dim=0)  # (bs, doc_topk, seq_len, seq_len)
-    concat_tokid = torch.stack(concat_tokid, dim=0)  # (bs, doc_topk, seq_len)
-    return concat_key, concat_qry, concat_mask, concat_tokid
-
-  def add_from_t5(
-       self,
-       query_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
-       key_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
-       attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
-       input_ids: torch.LongTensor,  # (bs * n_context, seq_len)
-       n_context: int,
-       use_head_idx: int = None,
-       pad_token_id: int = 0):
-    assert use_head_idx is not None  # TODO: add multi-head?
-    # reshape
-    n_heads, seq_len, emb_size = key_states.size()[1:]
-    # (bs, n_context, seq_len, emb_size_per_head)
-    key_states = key_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
-    query_states = query_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
-    # (bs, n_context, seq_len, seq_len)
-    attention_mask = attention_mask.view(-1, n_context, seq_len, seq_len)
-    # (bs, n_context, seq_len)
-    input_ids = input_ids.view(-1, n_context, seq_len)
-    query_len = attention_mask[:, 0, 0].sum(-1)  # (bs)
-
-    for i in range(len(query_len)):
-      pad = torch.zeros(n_context, query_len[i], emb_size).to(key_states)  # (n_context, qry_len, emb_size_per_head)
-      pad_mask = torch.zeros(n_context, query_len[i]).to(attention_mask)  # (n_context, qry_len)
-      pad_input_ids = torch.full((n_context, query_len[i]), pad_token_id).to(input_ids)  # (n_context, qry_len)
-      # always use the same seq_len
-      # (n_context, seq_len, emb_size_per_head)
-      key_to_add = torch.cat([key_states[i, :, query_len[i]:], pad], dim=1)
-      query_to_add = torch.cat([query_states[i, :, query_len[i]:], pad], dim=1)
-      # (n_context, seq_len)
-      mask_to_add = torch.cat([attention_mask[i, :, query_len[i], query_len[i]:], pad_mask], dim=1)
-      # (n_context, seq_len)
-      input_ids_to_add = torch.cat([input_ids[i, :, query_len[i]:], pad_input_ids], dim=1)
-      self.add(key_to_add, query_to_add, mask_to_add, input_ids_to_add)
-
-  def query_from_t5(
-       self,
-       query_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
-       key_states: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
-       attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
-       input_ids: torch.LongTensor,  # (bs * n_context, seq_len)
-       n_context: int,
-       memory_bank_topk: int,
-       memory_use_random: bool = False,
-       use_head_idx: int = None):
-    assert use_head_idx is not None  # TODO: add multi-head?
-    assert len(self) >= memory_bank_topk  # query memory bank when there are enough
-    assert memory_bank_topk % n_context == 0
-    assert memory_bank_topk <= 2048, 'faiss does not support topk > 2048'
-
-    # reshape
-    n_heads, seq_len, emb_size = key_states.size()[1:]
-    # (bs, n_context, seq_len, emb_size_per_head)
-    key_states = key_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
-    query_states = query_states.view(-1, n_context, n_heads, seq_len, emb_size)[:, :, use_head_idx]
-    # (bs, n_context, seq_len, seq_len)
-    attention_mask = attention_mask.view(-1, n_context, seq_len, seq_len)
-    # (bs, n_context, seq_len)
-    input_ids = input_ids.view(-1, n_context, seq_len)
-    query_len = attention_mask[:, 0, 0].sum(-1)  # (bs)
-
-    # extract query
-    max_qry_len = query_len.max().item()
-    key_to_query = key_states[:, 0, :max_qry_len]  # (bs, max_qry_len, emb_size_per_head)
-    query_to_query = query_states[:, 0, :max_qry_len]  # (bs, max_qry_len, emb_size_per_head)
-    mask_to_query = attention_mask[:, 0, 0, :max_qry_len]  # (bs, max_qry_len)
-    input_ids_to_query = input_ids[:, 0, :max_qry_len]  # (bs, max_qry_len)
-
-    # retrieve
-    # (bs, memory_bank_topk, seq_len, emb_size_per_head) * 2
-    # (bs, memory_bank_topk, seq_len, seq_len)
-    # (bs, memory_bank_topk, seq_len)
-    _key_states, _query_states, _attention_mask, _input_ids = self.query(
-      key_to_query, query_to_query, mask_to_query, input_ids_to_query,
-      token_topk=2048, doc_topk=memory_bank_topk, use_random=memory_use_random)
-    # (bs * memory_bank_topk, seq_len)
-    # (bs * memory_bank_topk, seq_len, seq_len)
-    return _input_ids.view(-1, seq_len), _attention_mask.view(-1, seq_len, seq_len)
 
 def collect_cross_attention(
      self,
@@ -1799,7 +1541,7 @@ def encoder_decoder_kl(
   else:
     dec_attn = torch.softmax(s, dim=-1)  # no grad to decoder
   if in_batch_negative:  # collect dec_attn across gpus
-    dec_attn, = gather_tensors(dec_attn)
+    dec_attn, = all_gather_tensors(dec_attn)
     dec_attn = torch.cat(dec_attn, dim=0).to(dec_attn[0]).detach()  # (n_gpu * bs, n_context)
   #WandbLogger.log_w_step({'decoder-dist-kl': torch.sort(dec_attn[0], descending=True)[0][:10]})
   if encoder_score_pre_softmaxed:
@@ -2247,10 +1989,10 @@ def in_batch_negative(self,
                       max_num_query_per_compute: int = None):
   # collect query, key, and attn across all gpus
   if head_idx is not None:
-    global_q, global_k, global_attn = gather_tensors(
+    global_q, global_k, global_attn = all_gather_tensors(
       query_states[:, head_idx:head_idx + 1].contiguous(), key_states[:, head_idx:head_idx + 1].contiguous(), attention_mask)
   else:
-    global_q, global_k, global_attn = gather_tensors(query_states, key_states, attention_mask)
+    global_q, global_k, global_attn = all_gather_tensors(query_states, key_states, attention_mask)
   # (n_q, n_context, seq_len, n_heads, emb_size_per_head)  n_q = world_size * bs
   global_q = torch.cat(global_q, dim=0).view(-1, n_context, *global_q[0].size()[1:]).transpose(2, 3)
   global_k = torch.cat(global_k, dim=0).view(-1, n_context, *global_k[0].size()[1:]).transpose(2, 3)

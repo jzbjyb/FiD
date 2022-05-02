@@ -13,6 +13,7 @@ import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
+from torch.multiprocessing import set_start_method
 #from fairscale.optim.oss import OSS
 #from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
 
@@ -144,6 +145,8 @@ def evaluate(model, dataset, tokenizer, collator, opt):
     return exactmatch
 
 if __name__ == "__main__":
+    set_start_method('spawn')
+
     options = Options()
     options.add_reader_options()
     options.add_optim_options()
