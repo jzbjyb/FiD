@@ -67,19 +67,21 @@ class Dataset(torch.utils.data.Dataset):
             passages = [f.format(c['title'], c['text']) for c in contexts]
             scores = [float(c['score']) for c in contexts]
             scores = torch.tensor(scores)
+            passage_ids = [str(c['id']) for c in contexts]
             # TODO(egrave): do we want to keep this?
             if len(contexts) == 0:
                 contexts = [question]
             assert len(contexts) == self.n_context
         else:
-            passages, scores = None, None
+            passages, scores, passage_ids = None, None, None
 
         return {
             'index' : index,
             'question' : question,
             'target' : target,
             'passages' : passages,
-            'scores' : scores
+            'scores' : scores,
+            'passage_ids': passage_ids
         }
 
     def sort_data(self):
@@ -204,8 +206,11 @@ class Collator(object):
                                                          self.tokenizer,
                                                          self.text_maxlength)
             passage_sep_masks = None
-
-        return (index, target_ids, target_mask, passage_ids, passage_masks, passage_sep_masks)
+        
+        # passage ids (from memory bank) 
+        passage_idx: np.ndarray = np.array([example['passage_ids'] for example in batch], dtype=str)
+        
+        return (index, target_ids, target_mask, passage_ids, passage_masks, passage_sep_masks, passage_idx)
 
 def load_data(data_path=None, global_rank=-1, world_size=-1, n_context=None):
     assert data_path

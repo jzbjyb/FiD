@@ -5,12 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from typing import List, Tuple, Set
+from typing import List, Tuple, Set, Union
 import time
 import glob
 from pathlib import Path
 from tqdm import tqdm
-import torch
 import faiss
 import numpy as np
 
@@ -22,20 +21,13 @@ class Indexer(object):
                n_subquantizers: int = 0,
                n_bits: int = 8,
                hnsw_m: int = 0,
-               cuda_device: int = -1):
+               cuda_device: Union[int, List[int]] = -1):
     self.cuda_device = cuda_device
-    self.use_gpu = cuda_device >= 0
-    if self.use_gpu:
-      self.res = faiss.StandardGpuResources()
-    if n_subquantizers > 0:
-      self.index = faiss.IndexPQ(vector_sz, n_subquantizers, n_bits, faiss.METRIC_INNER_PRODUCT)
-    elif hnsw_m > 0:
-      self.index = faiss.IndexHNSWFlat(vector_sz, hnsw_m, faiss.METRIC_INNER_PRODUCT)
-    else:
-      self.index = faiss.IndexFlatIP(vector_sz)
-    if self.use_gpu:
-      logger.info(f'Move FAISS index to gpu {self.cuda_device}')
-      self.index = faiss.index_cpu_to_gpu(self.res, self.cuda_device, self.index)
+    self.vector_sz = vector_sz
+    self.n_subquantizers = n_subquantizers
+    self.n_bits = n_bits
+    self.hnsw_m = hnsw_m
+    self.create_index()
     self.ids = np.empty((0), dtype=str)
     self.texts = np.empty((0), dtype=str)
 
@@ -58,6 +50,35 @@ class Indexer(object):
       logger.info(f'data indexing completed with time {time.time() - start_time_indexing:.1f} s.')
       if save_or_load_index:
         self.serialize(embeddings_dir)
+  
+  @property
+  def use_gpu(self):
+    if type(self.cuda_device) is int and self.cuda_device == -1:
+      return False
+    return True
+
+  def create_index(self):
+    metric = faiss.METRIC_INNER_PRODUCT
+    if self.n_subquantizers > 0:
+      self.index = faiss.IndexPQ(self.vector_sz, self.n_subquantizers, self.n_bits, metric)
+    elif self.hnsw_m > 0:
+      self.index = faiss.IndexHNSWFlat(self.vector_sz, self.hnsw_m, metric)
+    else:
+      self.index = faiss.IndexFlatIP(self.vector_sz)
+    self.move_to_gpu()
+
+  def move_to_gpu(self):
+    if not self.use_gpu:
+      return
+    if type(self.cuda_device) is list:  # multiple gpu
+      logger.info(f'Move FAISS index to gpu {self.cuda_device}')
+      print(f'Move FAISS index to gpu {self.cuda_device}', flush=True)
+      self.index = faiss.index_cpu_to_gpus_list(self.index, gpus=self.cuda_device)
+    else:  # single gpu
+      logger.info(f'Move FAISS index to gpu {self.cuda_device}')
+      print(f'Move FAISS index to gpu {self.cuda_device}', flush=True)
+      res = faiss.StandardGpuResources()
+      self.index = faiss.index_cpu_to_gpu(res, self.cuda_device, self.index)
 
   def index_data(self,
                  ids: np.ndarray,
@@ -65,6 +86,9 @@ class Indexer(object):
                  texts: np.ndarray = None,
                  indexing_batch_size: int = 50000,
                  disable_log: bool = False):
+      assert len(ids) == len(embeddings)
+      if texts is not None:
+        assert len(ids) == len(texts)
       self._update_id_mapping(ids)
       self._update_texts(texts)
       embeddings = embeddings.astype('float32')
@@ -79,15 +103,23 @@ class Indexer(object):
     unique_ids: Set[str] = set()
     stop = False
     for i, id in enumerate(self.ids):
-      if len(unique_ids) == num_unique_id and id not in unique_ids:
+      if len(unique_ids) == num_unique_id and id not in unique_ids:  # do not need to remove all
         stop = True
         break
       unique_ids.add(id)
     if not stop:  # remove all
       i = len(self.ids)
-    self.index.remove_ids(np.arange(i))
+    try:
+      self.index.remove_ids(np.arange(i))
+    except:  # remove is not supported for some index
+      assert i <= self.index.ntotal
+      keep = self.index.reconstruct_n(i, self.index.ntotal - i)
+      del self.index
+      self.create_index()
+      self.index.add(keep)
     self.ids = self.ids[i:]
     self.texts = self.texts[i:]
+    assert len(self.ids) == self.index.ntotal
 
   def search_knn(self,
                  query_vectors: np.array,
@@ -112,10 +144,7 @@ class Indexer(object):
     index_file = dir_path / 'index.faiss'
     meta_file = dir_path / 'index.meta'
     logger.info(f'Serializing index to {index_file}, meta data to {meta_file}')
-    if self.use_gpu:
-      faiss.write_index(faiss.index_gpu_to_cpu(self.index), str(index_file))
-    else:
-      faiss.write_index(self.index, str(index_file))
+    faiss.write_index(faiss.index_gpu_to_cpu(self.index) if self.use_gpu else self.index, str(index_file))
     with open(meta_file, mode='wb') as f:
       np.savez(f, ids=self.ids, texts=self.texts)
 
@@ -123,13 +152,9 @@ class Indexer(object):
     index_file = dir_path / 'index.faiss'
     meta_file = dir_path / 'index.meta'
     logger.info(f'Loading index from {index_file}, meta data from {meta_file}')
-
     self.index = faiss.read_index(str(index_file))
-    if self.use_gpu:
-      logger.info('Move FAISS index to gpu')
-      self.index = faiss.index_cpu_to_gpu(self.res, self.cuda_device, self.index)
+    self.move_to_gpu()
     logger.info('Loaded index of type %s and size %d', type(self.index), self.index.ntotal)
-
     with open(meta_file, 'rb') as reader:
       npzfile = np.load(reader)
       self.ids, self.texts = npzfile['ids'], npzfile['texts']

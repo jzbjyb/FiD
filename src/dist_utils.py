@@ -9,8 +9,8 @@
 Utilities for distributed model training
 """
 
+from typing import Any
 import pickle
-
 import torch
 import torch.distributed as dist
 
@@ -106,6 +106,16 @@ def all_gather_tensors(*tt: torch.Tensor):
   tt = [_all_gather_tensor(t) for t in tt]
   return tt
 
+def _all_gather_object(t: Any):
+  all_objs = [None for _ in range(get_world_size())]
+  dist.all_gather_object(all_objs, t)
+  all_objs[get_rank()] = t
+  return all_objs
+
+def all_gather_objects(*tt: Any):
+  tt = [_all_gather_object(t) for t in tt]
+  return tt
+
 def _gather_tensor(t: torch.Tensor, dst: int = 0):
   all_tensors = None
   if get_rank() == dst:
@@ -118,7 +128,6 @@ def _gather_tensor(t: torch.Tensor, dst: int = 0):
 def gather_tensors(*tt: torch.Tensor, dst: int = 0):
   tt = [_gather_tensor(t, dst=dst) for t in tt]
   return tt
-
 
 def _scatter_tensor(t: torch.Tensor, src: int = 0):
   inp_tensors = None

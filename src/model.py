@@ -43,6 +43,7 @@ def t5forconditionalgeneration_forward(
      output_attentions=None,
      output_hidden_states=None,
      return_dict=None,
+     input_doc_ids=None  # document identifiers 
 ):
   r"""
   labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -86,7 +87,7 @@ def t5forconditionalgeneration_forward(
       output_attentions=output_attentions,
       output_hidden_states=output_hidden_states,
       return_dict=return_dict,
-    )
+      input_doc_ids=input_doc_ids)
   elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
     encoder_outputs = BaseModelOutput(
       last_hidden_state=encoder_outputs[0],
@@ -1158,7 +1159,10 @@ class EncoderWrapper(torch.nn.Module):
         # setup memory bank directly or a process to handle memory bank
         self.memory_bank = None
         if config.memory_bank:
-          use_gpu = True if not self.separate_process else torch.cuda.device_count() - 1  # use the last gpu when using a separate process for memory bank
+          if global_context['opt'].memory_bank_gpu is None:
+            use_gpu = True if not self.separate_process else torch.cuda.device_count() - 1  # use the last gpu when using a separate process for memory bank
+          else:
+            use_gpu = list(map(int, global_context['opt'].memory_bank_gpu.split(',')))
           init_kwargs={
             'max_size': config.memory_bank, 'indexing_dimension': config.d_kv, 'use_gpu': use_gpu, 
             'use_head_idx': self.use_head_idx, 'pad_token_id': self.pad_token_id, 
@@ -1173,7 +1177,7 @@ class EncoderWrapper(torch.nn.Module):
         self.bi_encoder_forward = bi_encoder_forward
         self.apply_t5block_wrapper(config)
 
-    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+    def forward(self, input_ids=None, attention_mask=None, input_doc_ids=None, **kwargs):
         if 'direct' in kwargs and kwargs['direct']:  # no reshaping, used in retrieval
           del kwargs['direct']
           return self.encoder(input_ids, attention_mask, **kwargs)
@@ -1181,6 +1185,8 @@ class EncoderWrapper(torch.nn.Module):
         bsz, total_length = input_ids.shape
         passage_length = total_length // self.n_passages
         input_ids = input_ids.view(bsz * self.n_passages, passage_length)
+        if input_doc_ids is not None:
+            input_doc_ids = input_doc_ids.reshape(-1)  # (bs * n_passage)
         if hasattr(self, 'attention_separate_mask') and self.attention_separate_mask is not None:  # use separate attention mask
           attention_mask = self.attention_separate_mask.view(
             *((bsz * self.n_passages,) + self.attention_separate_mask.size()[2:]))  # (bs * n_passage, seq_len * seq_len)
@@ -1188,7 +1194,7 @@ class EncoderWrapper(torch.nn.Module):
           attention_mask = attention_mask.view(bsz * self.n_passages, passage_length)  # (bs * n_passage, seq_len)
 
         use_memory_bank = self.training and self.memory_bank_inference and self.memory_bank is not None
-        use_memory_bank_and_retrieve = use_memory_bank and self.memory_bank_topk and len(self.memory_bank) >= self.memory_bank_topk
+        use_memory_bank_and_retrieve = use_memory_bank and self.memory_bank_topk and len(self.memory_bank) >= (self.memory_bank_topk + self.n_passages)
         with torch.no_grad():
           was_training = self.training
           self.eval()
@@ -1203,7 +1209,7 @@ class EncoderWrapper(torch.nn.Module):
               self.memory_bank.start()
           if use_memory_bank_and_retrieve:  # retrieve, store, then update the input_ids and attention_mask
             _input_ids, _attention_mask = self.memory_bank.query_then_add_from_t5(
-              query_states, key_states, attention_mask, input_ids, n_context=n_context)
+              query_states, key_states, attention_mask, input_ids, input_doc_ids, n_context=n_context)[:2]
             if self.memory_bank_additional_encode:
               self.attention_mask = _attention_mask  # for decoder
             def cat_by_doc(raw_tensor, memory_bank_tensor):  # concat along the document dimension
@@ -1217,7 +1223,7 @@ class EncoderWrapper(torch.nn.Module):
             self.n_passages = self.n_passages + self.memory_bank_topk
           elif use_memory_bank:  # only store
             self.memory_bank.add_from_t5(
-              query_states, key_states, attention_mask, input_ids, n_context=n_context)            
+              query_states, key_states, attention_mask, input_ids, input_doc_ids, n_context=n_context)            
           if was_training:
             self.train()
 

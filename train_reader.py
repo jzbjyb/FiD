@@ -63,13 +63,14 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             if step > opt.total_steps:
                 break
 
-            (idx, labels, _, context_ids, context_mask, context_sep_mask) = batch
+            idx, labels, _, context_ids, context_mask, context_sep_mask, doc_ids = batch
             context_sep_mask = context_sep_mask.cuda() if context_sep_mask is not None else context_sep_mask
             train_loss = model(
                 input_ids=context_ids.cuda(),
                 attention_mask=context_mask.cuda(),
                 attention_separate_mask=context_sep_mask,
                 labels=labels.cuda(),
+                input_doc_ids=doc_ids
             )[0]
             train_loss.backward()
 
@@ -121,7 +122,7 @@ def evaluate(model, dataset, tokenizer, collator, opt):
     model = model.module if hasattr(model, "module") else model
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
-            (idx, _, _, context_ids, context_mask, context_sep_mask) = batch
+            idx, _, _, context_ids, context_mask, context_sep_mask, _ = batch
             context_sep_mask = context_sep_mask.cuda() if context_sep_mask is not None else context_sep_mask
             outputs = model.generate(
                 input_ids=context_ids.cuda(),

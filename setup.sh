@@ -19,3 +19,4 @@ pip install datasets==1.18.3
 pip install spacy==3.2.3
 pip install ujson==5.2.0
 pip install cupy-cuda110==10.3.1
+pip install indexed==1.2.1

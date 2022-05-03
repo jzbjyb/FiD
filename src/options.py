@@ -99,6 +99,7 @@ class Options():
                                  help='recompute the representation of docs from memory bank')
         self.parser.add_argument('--memory_bank_additional_encode', action='store_true',
                                  help='compute decoder-attention for docs from memory bank')
+        self.parser.add_argument('--memory_bank_gpu', type=str, default=None, help='gpu index connected by , used for memory bank')
 
     def add_retriever_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')
