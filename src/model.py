@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from mimetypes import init
-from typing import Callable, List
+from typing import Callable, List, Dict
 import types
 import warnings
 import torch
@@ -732,6 +732,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
             input_ids = input_ids.view(input_ids.size(0), -1)
         if attention_mask != None:
             attention_mask = attention_mask.view(attention_mask.size(0), -1)
+        if 'context_annotation' in kwargs:  # pass it to decoder
+            self.decoder.context_annotation = kwargs['context_annotation']
         result = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1124,7 +1126,8 @@ class DecoderWrapper(torch.nn.Module):
         in_batch_negative=self.in_batch_negative and self.training,
         pairwise_loss=self.pairwise_loss,
         memory_bank_topk=self.memory_bank_topk if self.training else 0,
-        memory_bank_additional_encode=self.memory_bank_additional_encode if self.training else 0
+        memory_bank_additional_encode=self.memory_bank_additional_encode if self.training else 0,
+        context_annotation=self.context_annotation if hasattr(self, 'context_annotation') else None
       ), reg_point)
     else:
       raise NotImplementedError
@@ -1505,7 +1508,8 @@ def encoder_decoder_kl(
      in_batch_negative: bool = False,
      pairwise_loss: str = None,
      memory_bank_topk: int = 0,
-     memory_bank_additional_encode: bool = False):
+     memory_bank_additional_encode: bool = False,
+     context_annotation: Dict = None):
   bs, _, _, enc_seq_len = decoder_score.size()
   has_token = encoder_score.dim() == 3
   use_memory_bank = memory_bank_topk and \
