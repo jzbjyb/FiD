@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 import os
 import errno
 import torch
@@ -12,6 +12,7 @@ import sys
 import logging
 import json
 import contextlib
+from collections import defaultdict
 from pathlib import Path
 import torch.distributed as dist
 #from fairscale.optim.oss import OSS
@@ -34,12 +35,15 @@ def open_file(path_to_file: str, mode: str = 'r'):
 
 class WandbLogger:
   _wandb_logger = None
-  _step = None
+  _step: int = None
+  _name2intervalandlast: Dict[str, Tuple[int, int]] = {}
+  _default_interval: int = None
 
   @classmethod
   def init(cls, opt):
     if opt.wandb_entity and opt.wandb_name.split('/')[-1] != 'test':
       cls._wandb_logger = wandb.init(entity=opt.wandb_entity, project=opt.wandb_project, name=opt.wandb_name)
+      cls._default_interval = opt.wandb_log_freq
 
   @classmethod
   def enabled(cls):
@@ -50,9 +54,15 @@ class WandbLogger:
     cls._step = step
 
   @classmethod
-  def log_w_step(cls, data):
+  def log_w_step(cls, data, name: str = 'default', interval: int = None):
+    interval = interval or cls._default_interval
     if not cls.enabled():
       return
+    _nandi = cls._name2intervalandlast
+    if name in _nandi:
+      assert _nandi[name][0] == interval, 'the same name should use the same interval'
+      if 0 < (cls._step - _nandi[name][1]) < interval:
+        return
     _data = {}
     for k in data:
       if type(data[k]) is torch.Tensor:
@@ -63,6 +73,7 @@ class WandbLogger:
       else:
         _data[k] = data[k]
     cls._wandb_logger.log(_data, step=cls._step)
+    cls._name2intervalandlast[name] = (interval, cls._step)
 
 def init_logger(is_main=True, is_distributed=False, filename=None):
     if is_distributed:

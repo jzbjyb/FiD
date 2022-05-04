@@ -106,12 +106,13 @@ python ${prefix} train_reader.py \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
+  --wandb_log_freq 10 \
   --init_from ${init_from} \
   --memory_bank 500000 \
   --memory_bank_topk 100 \
   --memory_bank_recompute \
   --memory_bank_additional_encode \
-  --memory_bank_gpu 4,5,6,7 &>> ${ckpt_dir}/${name}.out
+  --memory_bank_gpu 6,7 &>> ${ckpt_dir}/${name}.out
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
 # --decoder_attn_ctx_normalize \

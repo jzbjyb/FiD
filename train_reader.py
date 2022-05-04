@@ -30,12 +30,6 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
     tb_logger = None
     if opt.is_main:
         WandbLogger.init(opt)
-        '''
-        try:
-            tb_logger = torch.utils.tensorboard.SummaryWriter(Path(opt.checkpoint_dir)/opt.name)
-        except:
-            logger.warning('Tensorboard is not available.')
-        '''
 
     torch.manual_seed(opt.global_rank + opt.seed) #different seed for different sampling depending on global_rank
     train_sampler = RandomSampler(train_dataset)
@@ -96,7 +90,7 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
                         log += f"evaluation: {100*dev_metric:.2f}EM |"
                         log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
                         logger.info(log)
-                        WandbLogger.log_w_step({f'dev-{opt.metric}': dev_metric})
+                        WandbLogger.log_w_step({f'dev-{opt.metric}': dev_metric}, name='eval', interval=1)
                         if tb_logger is not None:
                             tb_logger.add_scalar("Evaluation", dev_metric, step)
                             tb_logger.add_scalar("Training", curr_loss / (opt.eval_freq), step)

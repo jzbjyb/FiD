@@ -152,6 +152,7 @@ class Options():
         self.parser.add_argument('--wandb_entity', type=str, default='jzbjyb')
         self.parser.add_argument('--wandb_project', type=str, default='adapt-knowledge')
         self.parser.add_argument('--wandb_name', type=str, default='test')
+        self.parser.add_argument('--wandb_log_freq', type=int, default=1)
 
 
     def print_options(self, opt):

@@ -1159,7 +1159,9 @@ class EncoderWrapper(torch.nn.Module):
         # setup memory bank directly or a process to handle memory bank
         self.memory_bank = None
         if config.memory_bank:
-          if global_context['opt'].memory_bank_gpu is None:
+          if not hasattr(global_context['opt'], 'memory_bank_gpu'):
+            use_gpu = False
+          elif global_context['opt'].memory_bank_gpu is None:
             use_gpu = True if not self.separate_process else torch.cuda.device_count() - 1  # use the last gpu when using a separate process for memory bank
           else:
             use_gpu = list(map(int, global_context['opt'].memory_bank_gpu.split(',')))
