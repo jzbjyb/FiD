@@ -537,11 +537,13 @@ def eval_retrieval(
 
   print(f'use qid {use_qid}')
   for topk in topks:
-    print(np.mean(topk2has[topk]), sep='\t')
+    print(np.mean(topk2has[topk]), sep='\t', end='\t')
+  print()
   for qtype in type2topk2has:
     print(qtype)
     for topk in topks:
-      print(np.mean(type2topk2has[qtype][topk]), sep='\t')
+      print(np.mean(type2topk2has[qtype][topk]), sep='\t', end='\t')
+    print()
 
 
 def eval_answer(ret_file: str,

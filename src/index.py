@@ -5,7 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from typing import List, Tuple, Set, Union
+from re import I
+from typing import List, Tuple, Set, Union, Dict
 import time
 import glob
 from pathlib import Path
@@ -21,15 +22,18 @@ class Indexer(object):
                n_subquantizers: int = 0,
                n_bits: int = 8,
                hnsw_m: int = 0,
-               cuda_device: Union[int, List[int]] = -1):
+               cuda_device: Union[int, List[int]] = -1,
+               keep_raw_vector: bool = False):
     self.cuda_device = cuda_device
     self.vector_sz = vector_sz
     self.n_subquantizers = n_subquantizers
     self.n_bits = n_bits
     self.hnsw_m = hnsw_m
+    self.keep_raw_vector = keep_raw_vector
     self.create_index()
     self.ids = np.empty((0), dtype=str)
     self.texts = np.empty((0), dtype=str)
+    self.embs = np.empty((0, vector_sz), dtype=np.float32)
 
   def load_from_npz(self, filepath_pattern: str, save_or_load_index: bool = True):
     input_paths = glob.glob(filepath_pattern)
@@ -50,6 +54,7 @@ class Indexer(object):
       logger.info(f'data indexing completed with time {time.time() - start_time_indexing:.1f} s.')
       if save_or_load_index:
         self.serialize(embeddings_dir)
+    self.build_length_offset()
   
   @property
   def use_gpu(self):
@@ -89,15 +94,37 @@ class Indexer(object):
       assert len(ids) == len(embeddings)
       if texts is not None:
         assert len(ids) == len(texts)
+      embeddings = embeddings.astype('float32')
       self._update_id_mapping(ids)
       self._update_texts(texts)
-      embeddings = embeddings.astype('float32')
+      self._update_emb(embeddings)
       if not self.index.is_trained:
-          self.index.train(embeddings)
+        self.index.train(embeddings)
       for b in tqdm(range(0, len(embeddings), indexing_batch_size), desc='indexing', disable=disable_log):
         self.index.add(embeddings[b:b + indexing_batch_size])
       if not disable_log:
         logger.info(f'total data indexed {len(self.ids)}')
+  
+  def build_length_offset(self):
+    self.id2offset: Dict[str, int] = {}
+    self.id2len: Dict[str, int] = {}
+    self.id2indices: Dict[str, List[int]] = {}
+    for i, _id in enumerate(self.ids):
+      if _id not in self.id2offset:
+        self.id2offset[_id] = i
+        self.id2len[_id] = 1
+      else:
+        assert i == self.id2offset[_id] + self.id2len[_id]  # make sure ids are consecutive
+        self.id2len[_id] += 1
+    for _id, offset in self.id2offset.items():
+      length = self.id2len[_id]
+      self.id2indices[_id] = [offset + i for i in range(length)]
+  
+  def ids2indices(self, ids: List[str]):
+    indices: List[int] = []
+    for _id in ids:
+      indices.extend(self.id2indices[_id])
+    return indices
 
   def remove_data(self, num_unique_id: int):
     unique_ids: Set[str] = set()
@@ -119,6 +146,7 @@ class Indexer(object):
       self.index.add(keep)
     self.ids = self.ids[i:]
     self.texts = self.texts[i:]
+    self.embs = self.embs[i:]
     assert len(self.ids) == self.index.ntotal
 
   def search_knn(self,
@@ -139,6 +167,20 @@ class Indexer(object):
       texts = [(self.texts[query_top_idxs] if len(self.texts) else None) for query_top_idxs in indexes]
       result.extend([(ids[i], scores[i], texts[i]) for i in range(len(ids))])
     return result
+  
+  def get_by_ids_by_mask(self, ids: List[str]):
+    mask = np.isin(self.ids, ids)
+    _ids = self.ids[mask]
+    assert self.keep_raw_vector, 'require raw vectors'
+    _embs = self.embs[mask]
+    return _embs, _ids
+
+  def get_by_ids(self, ids: List[str]):
+    indices = self.ids2indices(ids)
+    _ids = self.ids[indices]
+    assert self.keep_raw_vector, 'require raw vectors'
+    _embs = self.embs[indices]
+    return _embs, _ids
 
   def serialize(self, dir_path):
     index_file = dir_path / 'index.faiss'
@@ -146,7 +188,7 @@ class Indexer(object):
     logger.info(f'Serializing index to {index_file}, meta data to {meta_file}')
     faiss.write_index(faiss.index_gpu_to_cpu(self.index) if self.use_gpu else self.index, str(index_file))
     with open(meta_file, mode='wb') as f:
-      np.savez(f, ids=self.ids, texts=self.texts)
+      np.savez(f, ids=self.ids, texts=self.texts, embs=self.embs)
 
   def deserialize_from(self, dir_path):
     index_file = dir_path / 'index.faiss'
@@ -158,6 +200,8 @@ class Indexer(object):
     with open(meta_file, 'rb') as reader:
       npzfile = np.load(reader)
       self.ids, self.texts = npzfile['ids'], npzfile['texts']
+      if 'embs' in npzfile:
+        self.embs = npzfile['embs']
     assert len(self.ids) == self.index.ntotal, 'Deserialized ids should match faiss index size'
 
   def _update_id_mapping(self, ids):
@@ -168,3 +212,8 @@ class Indexer(object):
     if texts is None:
       return
     self.texts = np.concatenate((self.texts, texts), axis=0)
+
+  def _update_emb(self, emb):
+    if not self.keep_raw_vector:
+      return
+    self.embs = np.concatenate((self.embs, emb), axis=0)

@@ -20,3 +20,4 @@ pip install spacy==3.2.3
 pip install ujson==5.2.0
 pip install cupy-cuda110==10.3.1
 pip install indexed==1.2.1
+pip install https://data.pyg.org/whl/torch-1.7.0%2Bcu110/torch_scatter-2.0.7-cp37-cp37m-linux_x86_64.whl

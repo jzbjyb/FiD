@@ -19,6 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import T5Tokenizer, DPRContextEncoderTokenizer, DPRContextEncoder, \
   DPRQuestionEncoderTokenizer, DPRQuestionEncoder
+import torch_scatter
 
 import src.model
 import src.data
@@ -45,7 +46,9 @@ def flatten_embedding(
   results['embeddings'].append(torch.masked_select(embeddings[:, 0, head_idx], attention_mask.unsqueeze(-1)).view(-1, emb_size_ph).cpu())
   results['words'].append(torch.masked_select(input_ids, attention_mask).cpu())  # (num_tokens,)
   for i in range(bs):
-    for j in range(attention_mask[i].sum()):
+    num_toks = attention_mask[i].sum().item()
+    results['splits'].append((num_toks + results['splits'][-1]) if len(results['splits']) else num_toks)
+    for _ in range(num_toks):
       results['ids'].append(ids[i])
 
 def encode_context(
@@ -57,7 +60,7 @@ def encode_context(
   collator = src.data.TextCollator(tokenizer, opt.passage_maxlength)
   dataset = src.data.ContextDataset(passages)
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=8, collate_fn=collator)
-  results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': []}
+  results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': [], 'splits': []}
   with torch.no_grad():
     for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
       input_ids = input_ids.cuda()
@@ -84,11 +87,13 @@ def encode_context(
         results['embeddings'].append(embeddings.cpu())
         results['words'].append(input_ids[:, 0].cpu())  # TODO: store text
         results['ids'].extend(ids)
+        # TODO: add splits?
       else:
         raise NotImplementedError
-  results['embeddings']: np.ndarray = torch.cat(results['embeddings'], dim=0).numpy()
-  results['words']: np.ndarray = torch.cat(results['words'], dim=0).numpy()
-  results['ids']: np.ndarray = np.array(results['ids'], dtype=str)
+  results['embeddings'] = torch.cat(results['embeddings'], dim=0).numpy()
+  results['words'] = torch.cat(results['words'], dim=0).numpy()
+  results['ids'] = np.array(results['ids'], dtype=str)
+  results['splits'] = np.array(results['splits'], dtype=int)
   return results
 
 def encode_query_and_search(
@@ -105,7 +110,7 @@ def encode_query_and_search(
   qid2rank: Dict[str, List[Tuple[str, float]]] = {}
   with torch.no_grad():
     for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
-      results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': []}
+      results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': [], 'splits': []}
       input_ids = input_ids.cuda()
       attention_mask = attention_mask.cuda()
       if opt.model_type == 'fid':
@@ -129,9 +134,10 @@ def encode_query_and_search(
         flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=0)
       else:
         raise NotImplementedError
-      results['embeddings']: np.ndarray = torch.cat(results['embeddings'], dim=0).numpy()
-      results['words']: np.ndarray = torch.cat(results['words'], dim=0).numpy()
-      results['ids']: np.ndarray = np.array(results['ids'], dtype=str)
+      results['embeddings'] = torch.cat(results['embeddings'], dim=0).numpy()
+      results['words'] = torch.cat(results['words'], dim=0).numpy()
+      results['ids'] = np.array(results['ids'], dtype=str)
+      results['splits'] = np.array(results['splits'], dtype=int)
 
       qid2did2score: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(lambda: 0))
       if opt.model_type in {'fid', 'colbert'}:
@@ -160,8 +166,29 @@ def encode_query_and_search(
       else:
         raise NotImplementedError
       
-      for qid, did2score in qid2did2score.items():  # rank and only keep top docs
-        qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))[:opt.doc_topk]
+      for i, (qid, did2score) in enumerate(qid2did2score.items()):  # rank and only keep top docs
+        qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))
+        if opt.candidate_doc_topk <= 0:
+          qid2rank[qid] = qid2rank[qid][:opt.doc_topk]
+          continue
+        dids = [did for did, _ in qid2rank[qid]][:opt.candidate_doc_topk]
+        flat_embs, flat_dids = index.get_by_ids(dids)  # (num_doc_tok_in_total, emb_size), (num_doc_tok_in_total)
+        qry_embs = results['embeddings'][results['splits'][i - 1] if i else 0:results['splits'][i]]
+        qry_embs = torch.tensor(qry_embs).cuda()
+        flat_embs = torch.tensor(flat_embs).cuda()
+        sim_mat = (qry_embs @ flat_embs.T)  # (num_qry_tok, num_doc_tok_in_total)
+        did2newdid: Dict[str, int] = {}
+        newdid2did: Dict[int, str] = {}
+        assert len(dids) == len(set(dids))
+        for did in dids:
+          if did not in did2newdid:
+            did2newdid[did] = len(did2newdid)
+            newdid2did[did2newdid[did]] = did
+        flat_dids = torch.tensor([did2newdid[did] for did in flat_dids]).cuda()
+        agg_sim_mat = torch.zeros(sim_mat.size(0), len(did2newdid)).to(sim_mat)
+        agg_sim_mat = torch_scatter.scatter_max(sim_mat, flat_dids, out=agg_sim_mat, dim=-1)[0]  # (num_qry_tok, num_doc)
+        agg_sim_mat = agg_sim_mat.sum(0)  # (num_doc)
+        qid2rank[qid] = sorted([(newdid2did[nd], score.item()) for nd, score in enumerate(agg_sim_mat)], key=lambda x: -x[1])[:opt.doc_topk]
 
   return qid2rank
 
@@ -206,12 +233,13 @@ def main(opt):
       n_subquantizers=opt.n_subquantizers,
       n_bits=opt.n_bits,
       hnsw_m=opt.hnsw_m,
+      keep_raw_vector=True,
       cuda_device=0 if opt.use_faiss_gpu else -1)
     index.load_from_npz(args.passages, args.save_or_load_index)
     # query
     qid2rank = encode_query_and_search(opt, queries, model, tokenizer, index)
     if opt.model_type in {'fid', 'colbert'}:
-      rank_file = output_path / f'qid2rank_{opt.token_topk}.pkl'
+      rank_file = output_path / (f'qid2rank_{opt.token_topk}' + (f'_{opt.candidate_doc_topk}' if opt.candidate_doc_topk else '') + '.pkl')
     elif opt.model_type == 'dpr':
       rank_file = output_path / f'qid2rank_{opt.doc_topk}.pkl'
     else:
@@ -258,6 +286,7 @@ if __name__ == '__main__':
   parser.add_argument('--save_or_load_index', action='store_true', help='if enabled, save index and load index if it exists')
   parser.add_argument('--token_topk', type=int, help='return top-k retrieved tokens')
   parser.add_argument('--doc_topk', type=int, help='return top-k retrieved documents')
+  parser.add_argument('--candidate_doc_topk', type=int, default=0, help='top-k retrieved documents for reranking')
   parser.add_argument('--head_idx', type=int, default=0, help='head idx used in retrieval')
   parser.add_argument('--use_faiss_gpu', action='store_true', help='use faiss gpu')
   parser.add_argument('--use_position_bias', action='store_true', help='use position bias')

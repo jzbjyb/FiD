@@ -34,7 +34,7 @@ elif [[ ${model_type} == 'dpr' ]]; then
   index_name=$2
 
   output_path=pretrained_models/dpr.index/${index_name}
-  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 1024
+  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 512
 
 elif [[ ${model_type} == 'colbert' ]]; then
   model_name=$2
@@ -46,7 +46,7 @@ elif [[ ${model_type} == 'colbert' ]]; then
   index_name=$3
   
   output_path=${model_path}.index/${index_name}
-  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 1024
+  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 512
 
 else
   exit 1

@@ -14,7 +14,9 @@ head_idx=""
 extra=""
 token_topk=0
 doc_topk=10
+candidate_doc_topk=0
 use_faiss_gpu="--use_faiss_gpu"
+rerank=""
 
 # model specific arguments
 if [[ ${model_type} == 'fid' ]]; then
@@ -23,6 +25,7 @@ if [[ ${model_type} == 'fid' ]]; then
   head_idx="--head_idx $4"
   use_position_bias=$5
   token_topk=$6
+  candidate_doc_topk=$7
   index_dim=64
 
   get_dataset_settings ${index_name} 1024 ${gpu}  # t5's limit is 1024
@@ -36,13 +39,16 @@ if [[ ${model_type} == 'fid' ]]; then
   if (( ${token_topk} > 2048 )); then
     use_faiss_gpu=""
   fi
+  if (( ${candidate_doc_topk} > 0 )); then
+    rerank="--candidate_doc_topk ${candidate_doc_topk}"
+  fi
 
 elif [[ ${model_type} == 'dpr' ]]; then
   model_path=facebook/dpr-question_encoder-multiset-base
   index_name=$2
   index_dim=768
   
-  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 1024
+  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 512
   output_path=pretrained_models/dpr.index/${index_name}
   passages=${output_path}/embedding_*.npz
   if (( ${doc_topk} > 2048 )); then
@@ -55,16 +61,22 @@ elif [[ ${model_type} == 'colbert' ]]; then
     model_path=../ColBERT/downloads/colbertv2.0
   elif [[ ${model_name} == 'nq' ]]; then
     model_path=../ColBERT/downloads/colbert-60000.dnn
+  else
+    exit 1
   fi
   index_name=$3
   token_topk=$4
+  candidate_doc_topk=$5
   index_dim=128
 
-  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 1024
+  get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 512
   output_path=${model_path}.index/${index_name}
   passages=${output_path}/embedding_*.npz
   if (( ${token_topk} > 2048 )); then
     use_faiss_gpu=""
+  fi
+  if (( ${candidate_doc_topk} > 0 )); then
+    rerank="--candidate_doc_topk ${candidate_doc_topk}"
   fi
   
 else
@@ -98,4 +110,4 @@ python ${prefix} retrieval.py \
   --token_topk ${token_topk} \
   --doc_topk ${doc_topk} \
   --save_or_load_index \
-   ${head_idx} ${use_faiss_gpu} ${extra}
+  ${rerank} ${head_idx} ${use_faiss_gpu} ${extra}
