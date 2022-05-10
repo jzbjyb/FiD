@@ -104,7 +104,7 @@ def encode_query_and_search(
      index: src.index.Indexer,
      debug: bool = False) -> Dict[str, List[Tuple[str, float]]]:
   batch_size = opt.per_gpu_batch_size
-  collator = src.data.TextCollator(tokenizer, opt.query_maxlength)
+  collator = src.data.TextCollator(tokenizer, opt.query_maxlength, augmentation=opt.augmentation)
   dataset = src.data.QuestionDataset(queries)
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=8, collate_fn=collator)
   qid2rank: Dict[str, List[Tuple[str, float]]] = {}
@@ -239,7 +239,7 @@ def main(opt):
     # query
     qid2rank = encode_query_and_search(opt, queries, model, tokenizer, index)
     if opt.model_type in {'fid', 'colbert'}:
-      rank_file = output_path / (f'qid2rank_{opt.token_topk}' + (f'_{opt.candidate_doc_topk}' if opt.candidate_doc_topk else '') + '.pkl')
+      rank_file = output_path / (f'qid2rank_{opt.token_topk}' + (f'_{opt.candidate_doc_topk}' if opt.candidate_doc_topk else '') + (f'_{opt.augmentation}' if opt.augmentation else '') + '.pkl')
     elif opt.model_type == 'dpr':
       rank_file = output_path / f'qid2rank_{opt.doc_topk}.pkl'
     else:
@@ -290,6 +290,7 @@ if __name__ == '__main__':
   parser.add_argument('--head_idx', type=int, default=0, help='head idx used in retrieval')
   parser.add_argument('--use_faiss_gpu', action='store_true', help='use faiss gpu')
   parser.add_argument('--use_position_bias', action='store_true', help='use position bias')
+  parser.add_argument('--augmentation', type=str, help='query augmentation', default=None, choices=[None, 'duplicate', 'mask'])
   args = parser.parse_args()
 
   src.slurm.init_distributed_mode(args)

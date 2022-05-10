@@ -315,13 +315,24 @@ class QuestionDataset(torch.utils.data.Dataset):
     return id, text
 
 class TextCollator(object):
-    def __init__(self, tokenizer, maxlength: int = 200):
+    def __init__(self, tokenizer, maxlength: int = 200, augmentation: str = None):
+        assert augmentation in {'duplicate', 'mask'}
         self.tokenizer = tokenizer
         self.maxlength = maxlength
+        self.augmentation = augmentation
+    
+    def augment(self, text: str):
+        if self.augmentation is None:
+            return text
+        if self.augmentation == 'duplicate':
+            return text + ' ' + text
+        if self.augmentation == 'mask':
+            return text + ' ' + ' '.join([f'<extra_id_{i}>' for i in range(10)])  # TODO: hyperparam
+        raise NotImplementedError
 
     def __call__(self, batch):
         index = [x[0] for x in batch]
-        texts: List[str] = [x[1] for x in batch]
+        texts: List[str] = [self.augment(x[1]) for x in batch]
         encoded_batch = self.tokenizer.batch_encode_plus(
             texts,
             padding='max_length',
