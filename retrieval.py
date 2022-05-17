@@ -5,15 +5,17 @@
 # LICENSE file in the root directory of this source tree.
 
 import faiss
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Union
 import argparse
 from collections import defaultdict
+import glob
 from tqdm import tqdm
 import sys
 from pathlib import Path
 import logging
 from pathlib import Path
 import pickle
+from multiprocessing import Queue, Process
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -53,48 +55,71 @@ def flatten_embedding(
 
 def encode_context(
      opt,
-     passages: List[Tuple[str, str, str]],
+     passages: Union[List[Tuple[str, str, str]], np.ndarray],
      model,
-     tokenizer) -> Dict[str, np.ndarray]:
+     tokenizer):
+  device = model.device
   batch_size = opt.per_gpu_batch_size
   collator = src.data.TextCollator(tokenizer, opt.passage_maxlength)
   dataset = src.data.ContextDataset(passages)
-  dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=8, collate_fn=collator)
+  dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=opt.num_workers, collate_fn=collator)
+  
   results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': [], 'splits': []}
+  num_encoded_doc = 0
+  save_count = 0
+  def _save():
+    results['embeddings'] = torch.cat(results['embeddings'], dim=0).numpy()
+    results['words'] = torch.cat(results['words'], dim=0).numpy()
+    results['ids'] = np.array(results['ids'], dtype=str)
+    results['splits'] = np.array(results['splits'], dtype=int)
+    emb_file = opt.output_path / f'embedding_{opt.shard_id:02d}_{save_count}.npz'
+    logger.info(f'saving {len(results["ids"])} embeddings to {emb_file}')
+    with open(emb_file, mode='wb') as f:
+      np.savez_compressed(f, **results)
+    for k in results:
+      results[k] = []
+
   with torch.no_grad():
     for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
-      input_ids = input_ids.cuda()
-      attention_mask = attention_mask.cuda()
-      if opt.model_type == 'fid':
-        # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head)
-        embeddings = model.encode_context(
-          input_ids=input_ids,
-          attention_mask=attention_mask,
-          max_query_len=opt.query_maxlength if opt.use_position_bias else None)
-        flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
-      elif opt.model_type == 'colbert':
-        # (num_docs, seq_len, emb_size)
-        embeddings, input_ids, attention_mask = model.docFromText(
-          texts,
-          keep_dims=True,
-          return_more=True)
-        embeddings = embeddings.unsqueeze(1).unsqueeze(1)
-        attention_mask = attention_mask.bool()
-        flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=0)
-      elif opt.model_type == 'dpr':
-        # (num_docs, emb_size)
-        embeddings = model(input_ids=input_ids, attention_mask=attention_mask).pooler_output
-        results['embeddings'].append(embeddings.cpu())
-        results['words'].append(input_ids[:, 0].cpu())  # TODO: store text
-        results['ids'].extend(ids)
-        # TODO: add splits?
-      else:
-        raise NotImplementedError
-  results['embeddings'] = torch.cat(results['embeddings'], dim=0).numpy()
-  results['words'] = torch.cat(results['words'], dim=0).numpy()
-  results['ids'] = np.array(results['ids'], dtype=str)
-  results['splits'] = np.array(results['splits'], dtype=int)
-  return results
+      num_encoded_doc += input_ids.size(0)
+      need_compute = save_count >= opt.start_from
+      if need_compute:  # compute embedding
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        if opt.model_type == 'fid':
+          # (num_docs, n_layer, n_heads, seq_len, emb_size_per_head)
+          embeddings = model.encode_context(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_query_len=opt.query_maxlength if opt.use_position_bias else None)
+          flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
+        elif opt.model_type == 'colbert':
+          # (num_docs, seq_len, emb_size)
+          embeddings, input_ids, attention_mask = model.docFromText(
+            texts,
+            keep_dims=True,
+            return_more=True)
+          embeddings = embeddings.unsqueeze(1).unsqueeze(1)
+          attention_mask = attention_mask.bool()
+          flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=0)
+        elif opt.model_type == 'dpr':
+          # (num_docs, emb_size)
+          embeddings = model(input_ids=input_ids, attention_mask=attention_mask).pooler_output
+          results['embeddings'].append(embeddings.cpu())
+          results['words'].append(input_ids[:, 0].cpu())  # TODO: store text
+          results['ids'].extend(ids)
+          # TODO: add splits?
+        else:
+          raise NotImplementedError
+      if opt.save_every_n_doc and num_encoded_doc >= opt.save_every_n_doc:  # output
+        if need_compute:
+          _save()
+        save_count += 1
+        num_encoded_doc = 0
+    if len(results['ids']) > 0:
+      _save()
+      save_count += 1
+      num_encoded_doc = 0
 
 def encode_query_and_search(
      opt,
@@ -103,16 +128,17 @@ def encode_query_and_search(
      tokenizer,
      index: src.index.Indexer,
      debug: bool = False) -> Dict[str, List[Tuple[str, float]]]:
+  device = model.device
   batch_size = opt.per_gpu_batch_size
   collator = src.data.TextCollator(tokenizer, opt.query_maxlength, augmentation=opt.augmentation)
   dataset = src.data.QuestionDataset(queries)
-  dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=8, collate_fn=collator)
+  dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=opt.num_workers, collate_fn=collator)
   qid2rank: Dict[str, List[Tuple[str, float]]] = {}
   with torch.no_grad():
     for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
       results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': [], 'splits': []}
-      input_ids = input_ids.cuda()
-      attention_mask = attention_mask.cuda()
+      input_ids = input_ids.to(device)
+      attention_mask = attention_mask.to(device)
       if opt.model_type == 'fid':
         # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head)
         embeddings = model.encode_query(
@@ -174,8 +200,8 @@ def encode_query_and_search(
         dids = [did for did, _ in qid2rank[qid]][:opt.candidate_doc_topk]
         flat_embs, flat_dids = index.get_by_ids(dids)  # (num_doc_tok_in_total, emb_size), (num_doc_tok_in_total)
         qry_embs = results['embeddings'][results['splits'][i - 1] if i else 0:results['splits'][i]]
-        qry_embs = torch.tensor(qry_embs).cuda()
-        flat_embs = torch.tensor(flat_embs).cuda()
+        qry_embs = torch.tensor(qry_embs).to(device)
+        flat_embs = torch.tensor(flat_embs).to(device)
         sim_mat = (qry_embs @ flat_embs.T)  # (num_qry_tok, num_doc_tok_in_total)
         did2newdid: Dict[str, int] = {}
         newdid2did: Dict[int, str] = {}
@@ -184,7 +210,7 @@ def encode_query_and_search(
           if did not in did2newdid:
             did2newdid[did] = len(did2newdid)
             newdid2did[did2newdid[did]] = did
-        flat_dids = torch.tensor([did2newdid[did] for did in flat_dids]).cuda()
+        flat_dids = torch.tensor([did2newdid[did] for did in flat_dids]).to(device)
         agg_sim_mat = torch.zeros(sim_mat.size(0), len(did2newdid)).to(sim_mat)
         agg_sim_mat = torch_scatter.scatter_max(sim_mat, flat_dids, out=agg_sim_mat, dim=-1)[0]  # (num_qry_tok, num_doc)
         agg_sim_mat = agg_sim_mat.sum(0)  # (num_doc)
@@ -192,11 +218,7 @@ def encode_query_and_search(
 
   return qid2rank
 
-def main(opt):
-  output_path = Path(args.output_path)
-  output_path.mkdir(parents=True, exist_ok=True)
-  is_querying = args.queries is not None
-
+def get_model_tokenizer(opt, is_querying: bool):
   if opt.model_type == 'fid':
     tokenizer = T5Tokenizer.from_pretrained('t5-base', return_dict=False)
     model = src.model.FiDT5.from_pretrained(opt.model_path)
@@ -217,16 +239,24 @@ def main(opt):
   else:
     raise NotImplementedError
   model.eval()
-  model = model.to(opt.device)
   if opt.fp16:  # this could be dangerous for certain models
     model = model.half()
+  return model, tokenizer
 
-  if is_querying:  # querying
-    logger = src.util.init_logger(opt.is_main, opt.is_distributed, output_path / 'query.log')
-    # load data
-    queries = src.data.load_data(args.queries)
-    queries: List[Tuple[str, str]] = [(q['id'], q['question']) for q in queries]
-    logger.info(f'embedding generation for {len(queries)} queries')
+def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]], logger):
+  # load model
+  main_device = torch.device(f'cuda:{cuda_device[0]}') if type(cuda_device) is list else torch.device(f'cuda:{cuda_device}')
+  model, tokenizer = get_model_tokenizer(opt, is_querying=True)
+  model = model.to(main_device)
+  # load query data
+  queries = src.data.load_data(opt.queries)
+  queries: List[Tuple[str, str]] = [(q['id'], q['question']) for q in queries]
+  logger.info(f'#queries: {len(queries)}')
+  while True:
+    batch = input_queue.get()
+    if type(batch) is str and batch == 'done':
+      break
+    batch_index, batch_files = batch
     # load index
     index = src.index.Indexer(
       opt.indexing_dimension,
@@ -234,37 +264,79 @@ def main(opt):
       n_bits=opt.n_bits,
       hnsw_m=opt.hnsw_m,
       keep_raw_vector=True,
-      cuda_device=0 if opt.use_faiss_gpu else -1)
-    index.load_from_npz(args.passages, args.save_or_load_index)
+      cuda_device=cuda_device)
+    index.load_from_npz(batch_files, opt.save_or_load_index)
     # query
     qid2rank = encode_query_and_search(opt, queries, model, tokenizer, index)
     if opt.model_type in {'fid', 'colbert'}:
-      rank_file = output_path / (f'qid2rank_{opt.token_topk}' + (f'_{opt.candidate_doc_topk}' if opt.candidate_doc_topk else '') + (f'_{opt.augmentation}' if opt.augmentation else '') + '.pkl')
+      rank_file = opt.output_path / (f'qid2rank_{opt.token_topk}' + \
+        (f'_{opt.candidate_doc_topk}' if opt.candidate_doc_topk else '') + \
+        (f'_{opt.augmentation}' if opt.augmentation else '') + \
+        (f'.{batch_index}' if batch_index >= 0 else '') + '.pkl')
     elif opt.model_type == 'dpr':
-      rank_file = output_path / f'qid2rank_{opt.doc_topk}.pkl'
+      rank_file = opt.output_path / f'qid2rank_{opt.doc_topk}.pkl'
     else:
       raise NotImplementedError
     with open(rank_file, mode='wb') as f:
       pickle.dump(qid2rank, f)
 
+def main(opt):
+  opt.output_path = Path(opt.output_path)
+  opt.output_path.mkdir(parents=True, exist_ok=True)
+  is_querying = opt.queries is not None
+
+  if is_querying:  # querying
+    logger = src.util.init_logger(opt.is_main, opt.is_distributed)
+
+    # launch process
+    processes: List[Process] = []
+    input_queue: Queue = Queue()
+    if opt.faiss_gpus == 'all':  # use a single process and all gpu
+      p = Process(target=run_query, args=(input_queue, opt, [gpu for gpu in range(torch.cuda.device_count())], logger))
+      processes.append(p)
+    elif opt.faiss_gpus == 'separate':  # ues multiple processes with a single gpu assigned to each of them
+      for gpu in range(torch.cuda.device_count()):
+        p = Process(target=run_query, args=(input_queue, opt, gpu, logger))
+        processes.append(p)
+    else:  # single process with a single gpu
+      p = Process(target=run_query, args=(input_queue, opt, int(opt.faiss_gpus), logger))
+      processes.append(p)
+    for p in processes:
+      p.daemon = True
+      p.start()
+    
+    emb_files = glob.glob(opt.passages)
+    emb_files = sorted(emb_files)
+    if len(emb_files) > opt.files_per_run:  # iterative over emb files
+      opt.save_or_load_index = False
+      for batch_index, file_start in enumerate(range(0, len(emb_files), opt.files_per_run)):
+        batch_files = emb_files[file_start:file_start + opt.files_per_run]
+        input_queue.put((batch_index, batch_files))
+    else:  # use all emb files at once
+      input_queue.put((-1, emb_files))
+    
+    # finish
+    for _ in range(len(processes)):
+      input_queue.put('done')
+    for p in processes:
+      p.join()  
+ 
   else:  # indexing
-    logger = src.util.init_logger(opt.is_main, opt.is_distributed, output_path / 'index.log')
+    # load model
+    model, tokenizer = get_model_tokenizer(opt, is_querying=is_querying)
+    model = model.cuda()
+    logger = src.util.init_logger(opt.is_main, opt.is_distributed, opt.output_path / f'index{opt.shard_id}.log')
     # load data
-    passages = src.util.load_passages(args.passages)
-    shard_size = len(passages) // args.num_shards
-    start_idx = args.shard_id * shard_size
+    passages = src.util.load_passages(opt.passages)
+    shard_size = len(passages) // opt.num_shards
+    start_idx = opt.shard_id * shard_size
     end_idx = start_idx + shard_size
-    if args.shard_id == args.num_shards - 1:
+    if opt.shard_id == opt.num_shards - 1:
       end_idx = len(passages)
     passages = passages[start_idx:end_idx]
     logger.info(f'embedding generation for {len(passages)} passages from idx {start_idx} to {end_idx}')
-    # encode
-    results: Dict[str, np.ndarray] = encode_context(opt, passages, model, tokenizer)
-    # output
-    emb_file = output_path / f'embedding_{args.shard_id:02d}.npz'
-    logger.info(f'saving {len(results["ids"])} passage embeddings to {emb_file}')
-    with open(emb_file, mode='wb') as f:
-      np.savez(f, **results)
+    # encode and output
+    encode_context(opt, passages, model, tokenizer)
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
@@ -275,6 +347,7 @@ if __name__ == '__main__':
   parser.add_argument('--shard_id', type=int, default=0, help='id of the current shard')
   parser.add_argument('--num_shards', type=int, default=1, help='total number of shards')
   parser.add_argument('--per_gpu_batch_size', type=int, default=32)
+  parser.add_argument('--files_per_run', type=int, default=1, help='embedding files to load for each run')
   parser.add_argument('--passage_maxlength', type=int, default=200, help='maximum number of tokens in a passage')
   parser.add_argument('--query_maxlength', type=int, default=50, help='maximum number of tokens in a query')
   parser.add_argument('--model_path', type=str, help='path to directory containing model weights and config file')
@@ -288,9 +361,12 @@ if __name__ == '__main__':
   parser.add_argument('--doc_topk', type=int, help='return top-k retrieved documents')
   parser.add_argument('--candidate_doc_topk', type=int, default=0, help='top-k retrieved documents for reranking')
   parser.add_argument('--head_idx', type=int, default=0, help='head idx used in retrieval')
-  parser.add_argument('--use_faiss_gpu', action='store_true', help='use faiss gpu')
+  parser.add_argument('--faiss_gpus', type=str, default='-1', help='gpu indices for faiss or all')
   parser.add_argument('--use_position_bias', action='store_true', help='use position bias')
   parser.add_argument('--augmentation', type=str, help='query augmentation', default=None, choices=[None, 'duplicate', 'mask'])
+  parser.add_argument('--save_every_n_doc', type=int, help='#doc to accumulate before saving. 0 means only saving after encoding all docs', default=0)
+  parser.add_argument('--start_from', type=int, help='start from index which is used together with save_every_n_doc', default=0)
+  parser.add_argument('--num_workers', type=int, help='#workers for dataloader', default=0)
   args = parser.parse_args()
 
   src.slurm.init_distributed_mode(args)

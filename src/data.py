@@ -4,11 +4,12 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import List, Tuple
+from typing import List, Tuple, Union
 import torch
 import random
 import json
 import numpy as np
+from multiprocessing import Manager
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self,
@@ -278,11 +279,15 @@ class RetrieverCollator(object):
 
 class ContextDataset(torch.utils.data.Dataset):
     def __init__(self,
-                 data: List[Tuple[str, str, str]],
+                 data: Union[List[Tuple[str, str, str]], np.ndarray],
                  title_prefix: str = 'title:',
                  passage_prefix: str = 'context:',
                  add_eos: bool = False):
-        self.data = data
+        if type(data) is list and False:  # TODO: avoid copy-on-access
+            manager = Manager()
+            self.data = manager.list([x for x in data])
+        else:
+            self.data = data
         self.title_prefix = title_prefix
         self.passage_prefix = passage_prefix
         self.eos = ' </s>' if add_eos else ''  # TODO: add tokenizer-specific eos
@@ -292,6 +297,9 @@ class ContextDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index) -> Tuple[str, str]:
         example = self.data[index]
+        is_byte = type(example[0]) is np.bytes_
+        if is_byte:
+            example = [x.decode('utf-8') for x in example]
         id = example[0]
         text = f'{self.title_prefix} {example[2]} {self.passage_prefix} {example[1]}{self.eos}'
         return id, text
@@ -316,7 +324,7 @@ class QuestionDataset(torch.utils.data.Dataset):
 
 class TextCollator(object):
     def __init__(self, tokenizer, maxlength: int = 200, augmentation: str = None):
-        assert augmentation in {'duplicate', 'mask'}
+        assert augmentation in {'duplicate', 'mask', None}
         self.tokenizer = tokenizer
         self.maxlength = maxlength
         self.augmentation = augmentation

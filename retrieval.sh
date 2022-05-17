@@ -3,11 +3,7 @@ source utils.sh
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
-MAX_NUM_GPU_PER_NODE=8
 gpu=a100
-num_gpu=1
-shard_id=0
-num_shards=1
 
 model_type=$1  # fid dpr colbert
 
@@ -52,28 +48,19 @@ else
   exit 1
 fi
 
-if (( ${num_gpu} == 1 )); then
-  echo 'single-GPU'
-  prefix=""
-elif (( ${num_gpu} <= ${MAX_NUM_GPU_PER_NODE} )); then
-  echo 'single-node'
-  export NGPU=${num_gpu}
-  random_port=$(shuf -i 10000-65000 -n 1)
-  prefix="-m torch.distributed.launch --nproc_per_node=${num_gpu} --master_port=${random_port}"
-else
-  echo 'multi-node'
-  prefix=""
-  exit  # TODO: not implemented
-fi
-
-python ${prefix} retrieval.py \
-  --model_type ${model_type} \
-  --model_path ${model_path} \
-  --passages ${passages} \
-  --output_path ${output_path} \
-  --shard_id ${shard_id} \
-  --num_shards ${num_shards} \
-  --per_gpu_batch_size ${passage_per_gpu_batch_size} \
-  --passage_maxlength ${passage_maxlength} \
-  --query_maxlength ${query_maxlength} \
-  ${head_idx} ${extra}
+for shard_id in $(seq 0 $((${num_shards} - 1))); do
+  CUDA_VISIBLE_DEVICES=${shard_id} python retrieval.py \
+    --model_type ${model_type} \
+    --model_path ${model_path} \
+    --passages ${passages} \
+    --output_path ${output_path} \
+    --shard_id ${shard_id} \
+    --num_shards ${num_shards} \
+    --save_every_n_doc ${save_every_n_doc} \
+    --num_workers ${num_workers} \
+    --per_gpu_batch_size ${passage_per_gpu_batch_size} \
+    --passage_maxlength ${passage_maxlength} \
+    --query_maxlength ${query_maxlength} \
+    ${head_idx} ${extra} &> ${output_path}/index${shard_id}.out &
+done
+wait

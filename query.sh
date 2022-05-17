@@ -3,7 +3,7 @@ source utils.sh
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
-MAX_NUM_GPU_PER_NODE=8
+MAX_NUM_GPU_PER_NODE=4
 gpu=a100
 num_gpu=1
 
@@ -15,8 +15,9 @@ extra=""
 token_topk=0
 doc_topk=10
 candidate_doc_topk=0
-use_faiss_gpu="--use_faiss_gpu"
+faiss_gpus="--faiss_gpus all"
 rerank=""
+files_per_run=16  # about 70G embs
 
 # model specific arguments
 if [[ ${model_type} == 'fid' ]]; then
@@ -37,7 +38,7 @@ if [[ ${model_type} == 'fid' ]]; then
   fi
   passages=${output_path}/embedding_*.npz
   if (( ${token_topk} > 2048 )); then
-    use_faiss_gpu=""
+    faiss_gpus="--faiss_gpus -1"
   fi
   if (( ${candidate_doc_topk} > 0 )); then
     rerank="--candidate_doc_topk ${candidate_doc_topk}"
@@ -52,7 +53,7 @@ elif [[ ${model_type} == 'dpr' ]]; then
   output_path=pretrained_models/dpr.index/${index_name}
   passages=${output_path}/embedding_*.npz
   if (( ${doc_topk} > 2048 )); then
-    use_faiss_gpu=""
+    faiss_gpus="--faiss_gpus -1"
   fi
   
 elif [[ ${model_type} == 'colbert' ]]; then
@@ -73,7 +74,7 @@ elif [[ ${model_type} == 'colbert' ]]; then
   output_path=${model_path}.index/${index_name}
   passages=${output_path}/embedding_*.npz
   if (( ${token_topk} > 2048 )); then
-    use_faiss_gpu=""
+    faiss_gpus="--faiss_gpus -1"
   fi
   if (( ${candidate_doc_topk} > 0 )); then
     rerank="--candidate_doc_topk ${candidate_doc_topk}"
@@ -100,7 +101,7 @@ fi
 python ${prefix} retrieval.py \
   --model_type ${model_type} \
   --queries ${queries} \
-  --passages ${passages} \
+  --passages "${passages}" \
   --model_path ${model_path} \
   --output_path ${output_path} \
   --per_gpu_batch_size ${query_per_gpu_batch_size} \
@@ -110,4 +111,5 @@ python ${prefix} retrieval.py \
   --token_topk ${token_topk} \
   --doc_topk ${doc_topk} \
   --save_or_load_index \
-  ${rerank} ${head_idx} ${use_faiss_gpu} ${extra}
+  --files_per_run ${files_per_run} \
+  ${rerank} ${head_idx} ${faiss_gpus} ${extra}

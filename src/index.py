@@ -30,31 +30,40 @@ class Indexer(object):
     self.n_bits = n_bits
     self.hnsw_m = hnsw_m
     self.keep_raw_vector = keep_raw_vector
+    self.shard = False  # shard index across multiple gpus
     self.create_index()
     self.ids = np.empty((0), dtype=str)
     self.texts = np.empty((0), dtype=str)
     self.embs = np.empty((0, vector_sz), dtype=np.float32)
 
-  def load_from_npz(self, filepath_pattern: str, save_or_load_index: bool = True):
-    input_paths = glob.glob(filepath_pattern)
-    input_paths = sorted(input_paths)
-    embeddings_dir = Path(input_paths[0]).parent
+  def load_from_npz(self, emb_files: List[str], save_or_load_index: bool = True):
+    embeddings_dir = Path(emb_files[0]).parent
     index_path = embeddings_dir / 'index.faiss'
     if save_or_load_index and index_path.exists():
       self.deserialize_from(embeddings_dir)
     else:
-      logger.info(f'indexing passages from files {input_paths}')
+      logger.info(f'indexing passages from files {emb_files}')
       start_time_indexing = time.time()
-      for i, input_path in enumerate(input_paths):
-        logger.info(f'loading file {input_path}')
-        with open(input_path, 'rb') as fin:
+      ids, embeddings, texts = [], [], []
+      for i, emb_file in enumerate(emb_files):
+        logger.info(f'loading file {emb_file}')
+        with open(emb_file, 'rb') as fin:
           npzfile = np.load(fin)
-          ids, embeddings, texts = npzfile['ids'], npzfile['embeddings'], npzfile['words']
-          self.index_data(ids, embeddings, texts)
+          _ids, _embeddings, _texts = npzfile['ids'], npzfile['embeddings'], npzfile['words']
+          ids.append(_ids)
+          embeddings.append(_embeddings)
+          texts.append(_texts)
+      ids = np.concatenate(ids, axis=0)
+      embeddings = np.concatenate(embeddings, axis=0)
+      texts = np.concatenate(texts, axis=0)
+      self.index_data(ids, embeddings, texts)
       logger.info(f'data indexing completed with time {time.time() - start_time_indexing:.1f} s.')
       if save_or_load_index:
         self.serialize(embeddings_dir)
     self.build_length_offset()
+  
+  def __len__(self):
+    return len(self.ids)
   
   @property
   def use_gpu(self):
@@ -70,6 +79,9 @@ class Indexer(object):
       self.index = faiss.IndexHNSWFlat(self.vector_sz, self.hnsw_m, metric)
     else:
       self.index = faiss.IndexFlatIP(self.vector_sz)
+      #quantizer = faiss.IndexFlatIP(self.vector_sz)
+      #self.index = faiss.IndexIVFPQ(quantizer, self.vector_sz, 16384, 32, 8)
+      #self.index.nprobe = 8
     self.move_to_gpu()
 
   def move_to_gpu(self):
@@ -78,7 +90,13 @@ class Indexer(object):
     if type(self.cuda_device) is list:  # multiple gpu
       logger.info(f'Move FAISS index to gpu {self.cuda_device}')
       print(f'Move FAISS index to gpu {self.cuda_device}', flush=True)
-      self.index = faiss.index_cpu_to_gpus_list(self.index, gpus=self.cuda_device)
+      if self.shard:
+        co = faiss.GpuMultipleClonerOptions()
+        co.useFloat16 = True
+        co.shard = True
+      else:
+        co = None
+      self.index = faiss.index_cpu_to_gpus_list(self.index, co=co, gpus=self.cuda_device)
     else:  # single gpu
       logger.info(f'Move FAISS index to gpu {self.cuda_device}')
       print(f'Move FAISS index to gpu {self.cuda_device}', flush=True)
@@ -89,21 +107,27 @@ class Indexer(object):
                  ids: np.ndarray,
                  embeddings: np.ndarray,
                  texts: np.ndarray = None,
-                 indexing_batch_size: int = 50000,
+                 indexing_batch_size: int = None,
                  disable_log: bool = False):
       assert len(ids) == len(embeddings)
       if texts is not None:
         assert len(ids) == len(texts)
       embeddings = embeddings.astype('float32')
+      if not self.index.is_trained:
+        self.index.train(embeddings)
+      if indexing_batch_size is None:
+        self.index.add(embeddings)
+      else:
+        for b in tqdm(range(0, len(embeddings), indexing_batch_size), desc='indexing', disable=disable_log):
+          batch = embeddings[b:b + indexing_batch_size]
+          #implicit_ids = np.arange(len(self) + b, len(self) + b + len(batch))
+          #self.index.add_with_ids(batch, implicit_ids)
+          self.index.add(batch)
       self._update_id_mapping(ids)
       self._update_texts(texts)
       self._update_emb(embeddings)
-      if not self.index.is_trained:
-        self.index.train(embeddings)
-      for b in tqdm(range(0, len(embeddings), indexing_batch_size), desc='indexing', disable=disable_log):
-        self.index.add(embeddings[b:b + indexing_batch_size])
       if not disable_log:
-        logger.info(f'total data indexed {len(self.ids)}')
+        logger.info(f'total data indexed {len(self)}')
   
   def build_length_offset(self):
     self.id2offset: Dict[str, int] = {}
@@ -135,7 +159,7 @@ class Indexer(object):
         break
       unique_ids.add(id)
     if not stop:  # remove all
-      i = len(self.ids)
+      i = len(self)
     try:
       self.index.remove_ids(np.arange(i))
     except:  # remove is not supported for some index
@@ -147,7 +171,7 @@ class Indexer(object):
     self.ids = self.ids[i:]
     self.texts = self.texts[i:]
     self.embs = self.embs[i:]
-    assert len(self.ids) == self.index.ntotal
+    assert len(self) == self.index.ntotal
 
   def search_knn(self,
                  query_vectors: np.array,
@@ -202,7 +226,7 @@ class Indexer(object):
       self.ids, self.texts = npzfile['ids'], npzfile['texts']
       if 'embs' in npzfile:
         self.embs = npzfile['embs']
-    assert len(self.ids) == self.index.ntotal, 'Deserialized ids should match faiss index size'
+    assert len(self) == self.index.ntotal, 'Deserialized ids should match faiss index size'
 
   def _update_id_mapping(self, ids):
     ids = np.array(ids, dtype=str)

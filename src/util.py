@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Set
 import os
 import errno
 import torch
@@ -18,6 +18,7 @@ import torch.distributed as dist
 #from fairscale.optim.oss import OSS
 import csv
 import wandb
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -283,25 +284,37 @@ def save_distributed_dataset(data, opt):
             json.dump(alldata, fout, indent=4)
         write_path.rmdir()
 
-def load_passages(path) -> List[Tuple[str, str, str]]:  # id, text, title
+def load_passages(path, restricted_ids: Set[str] = None, use_csv_reader: bool = True, as_numpy: bool = False) -> List[Tuple[str, str, str]]:  # id, text, title
     if not os.path.exists(path):
         logger.info(f'{path} does not exist')
         return
     logger.info(f'Loading passages from: {path}')
     passages = []
     with open(path) as fin:
-        reader = csv.reader(fin, delimiter='\t')
-        header = next(reader)
+        if use_csv_reader:
+          reader = csv.reader(fin, delimiter='\t')
+          header = next(reader)
+        else:
+          header = fin.readline().strip().split('\t')
         assert len(header) == 3 and header[0] == 'id', 'header format error'
         textfirst = header[1] == 'text'
-        for k, row in enumerate(reader):
+        for k, row in enumerate(reader if use_csv_reader else fin):
+            if (k + 1) % 1000000 == 0:
+                print(f'{(k + 1) // 1000000}M', end=' ', flush=True)
             try:
+                if not use_csv_reader:
+                    row = row.rstrip('\n').split('\t')
+                if restricted_ids and row[0] not in restricted_ids:
+                    continue
                 if textfirst:
                     passages.append((row[0], row[1], row[2]))
                 else:
                     passages.append((row[0], row[2], row[1]))
             except:
                 logger.warning(f'The following input line has not been correctly loaded: {row}')
+        print()
+    if as_numpy:
+      return np.array(passages, dtype=np.string_)
     return passages
 
 def extract_query_answer(output: List[int], tokenizer, query_in_decoder: bool = False) -> Tuple[str, str, int]:

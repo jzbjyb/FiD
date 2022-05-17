@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import glob
 import numpy as np
 import time
 import random
@@ -740,6 +741,7 @@ def rank2json(rank_file: str, query_json_file: str, psge_tsv_file: str, out_json
         'id': did,
         'text': did2doc[did][1],
         'title': did2doc[did][2],
+        'score': score,
       } for did, score in rank]
       queries_with_newctx.append(query)
     json.dump(queries_with_newctx, fout, indent=2)
@@ -851,6 +853,36 @@ def create_pseudo_queries_from_corpus(
   print(f'#queries {len(qid2dict)}, avg #entities {np.mean(num_ents)}')
 
 
+def add_doc_to_onlyid(query_file: str, psgs_tsv_file: str, out_json_file: str):
+  dids: Set[str] = set()
+  with open(query_file, 'r') as fin:
+    data = json.load(fin)
+    for query in data:
+      for ctx in query['ctxs']:
+        dids.add(ctx['id'])
+  docs = src.util.load_passages(psgs_tsv_file, restricted_ids=dids)
+  did2doc: Dict[str, Tuple] = {doc[0]: doc for doc in docs}
+  with open(query_file, 'r') as fin, open(out_json_file, 'w') as fout:
+    data = json.load(fin)
+    for query in data:
+      query['ctxs'] = [{**ctx, **{'text': did2doc[ctx['id']][1], 'title': did2doc[ctx['id']][2]}} for ctx in query['ctxs']]
+    json.dump(data, fout, indent=2)
+
+
+def merge_queries(pkl_file_pattern: str, out_pkl_file: str):
+  pkl_files = glob.glob(pkl_file_pattern)
+  print(f'#files {len(pkl_files)}')
+  datas = [pickle.load(open(pf, 'rb')) for pf in pkl_files]
+  qid2rank: Dict[str, List[Tuple[str, float]]] = {}
+  for qid in datas[0]:
+    all_ctxs = [ctx for data in datas for ctx in data[qid]]
+    assert len(all_ctxs) == len(set(ctx[0] for ctx in all_ctxs)), 'duplicated'
+    merged_ctxs = sorted(all_ctxs, key=lambda x: -x[1])[:len(datas[0][qid])]
+    qid2rank[qid] = merged_ctxs
+  with open(out_pkl_file, 'wb') as fout:
+     pickle.dump(qid2rank, fout)
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
@@ -858,7 +890,8 @@ if __name__ == '__main__':
     'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx', 'rank2json',
     'add_negative', 'add_negative_mimic_inbatch', 'create_pseudo_queries_from_beir',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format', 'split_fid_file',
-    'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 'create_whole_test'])
+    'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 
+    'create_whole_test', 'add_doc_to_onlyid', 'merge_queries'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   parser.add_argument('--other', type=str, nargs='+', help='additional arguments')
@@ -1033,3 +1066,13 @@ if __name__ == '__main__':
       data2 = [data[i] for i in perm[-count2:]]
       json.dump(data1, fout1, indent=2)
       json.dump(data2, fout2, indent=2)
+  
+  elif args.task == 'add_doc_to_onlyid':
+    query_file, psgs_tsv_file = args.inp
+    out_json_file = args.out[0]
+    add_doc_to_onlyid(query_file, psgs_tsv_file, out_json_file)
+  
+  elif args.task == 'merge_queries':
+    pkl_file_pattern = args.inp[0]
+    out_pkl_file = args.out[0]
+    merge_queries(pkl_file_pattern, out_pkl_file)
