@@ -975,9 +975,9 @@ def init_to_file(fout):
   )
 
 
-def compare_two_rank_files(f1: str, f2: str, out_file: str, topk: int = 5):
+def compare_two_rank_files(f1: str, f2: str, out_file: str, topk: int = 5, format: str = 'html'):
   tokenizer = SimpleTokenizer()
-  with open(f1, 'r') as fin1, open(f2, 'r') as fin2, open(out_file + '1.html', 'w') as fout1, open(out_file + '2.html', 'w') as fout2:
+  with open(f1, 'r') as fin1, open(f2, 'r') as fin2, open(out_file + f'1.{format}', 'w') as fout1, open(out_file + f'2.{format}', 'w') as fout2:
     init_to_file(fout1)
     init_to_file(fout2)
     data1, data2 = json.load(fin1), json.load(fin2)
@@ -1002,6 +1002,17 @@ def compare_two_rank_files(f1: str, f2: str, out_file: str, topk: int = 5):
     print(f'1 wins {wins1}, 2 wins {wins2}')
 
 
+def annotate_rank_file(rank_file: str, out_file: str):
+  tokenizer = SimpleTokenizer()
+  with open(rank_file, 'r') as fin, open(out_file, 'w') as fout:
+    data = json.load(fin)
+    for query in data:
+      for ctx in query['ctxs']:
+        correct = has_answer(query['answers'], ctx['text'], tokenizer)
+        ctx['is_relevant'] = correct
+    json.dump(data, fout, indent=2)
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
@@ -1010,7 +1021,7 @@ if __name__ == '__main__':
     'add_negative', 'add_negative_mimic_inbatch', 'create_pseudo_queries_from_beir',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format', 'split_fid_file',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 
-    'create_whole_test', 'add_doc_to_onlyid', 'merge_queries', 'compare_two_rank_files'])
+    'create_whole_test', 'add_doc_to_onlyid', 'merge_queries', 'compare_two_rank_files', 'annotate_rank_file'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   parser.add_argument('--other', type=str, nargs='+', help='additional arguments')
@@ -1205,3 +1216,8 @@ if __name__ == '__main__':
     f1, f2 = args.inp
     out_file = args.out[0]
     compare_two_rank_files(f1, f2, out_file)
+
+  elif args.task == 'annotate_rank_file':
+    rank_file = args.inp[0]
+    out_file = args.out[0]
+    annotate_rank_file(rank_file, out_file)
