@@ -88,8 +88,6 @@ def init_logger(is_main=True, is_distributed=False, filename=None):
         format="[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s",
         handlers=handlers,
     )
-    for h in handlers:
-      logger.addHandler(h)
     logger.setLevel(logging.INFO if is_main else logging.WARN)
     logging.getLogger('transformers.tokenization_utils').setLevel(logging.ERROR)
     logging.getLogger('transformers.tokenization_utils_base').setLevel(logging.ERROR)
@@ -284,7 +282,12 @@ def save_distributed_dataset(data, opt):
             json.dump(alldata, fout, indent=4)
         write_path.rmdir()
 
-def load_passages(path, restricted_ids: Set[str] = None, use_csv_reader: bool = True, as_numpy: bool = False) -> List[Tuple[str, str, str]]:  # id, text, title
+def load_passages(
+  path: str, 
+  restricted_ids: Set[str] = None, 
+  use_csv_reader: bool = True, 
+  as_numpy: bool = False, 
+  iterative: bool = False) -> List[Tuple[str, str, str]]:  # id, text, title
     if not os.path.exists(path):
         logger.info(f'{path} does not exist')
         return
@@ -307,15 +310,20 @@ def load_passages(path, restricted_ids: Set[str] = None, use_csv_reader: bool = 
                 if restricted_ids and row[0] not in restricted_ids:
                     continue
                 if textfirst:
-                    passages.append((row[0], row[1], row[2]))
+                    did, text, title = row[0], row[1], row[2]
                 else:
-                    passages.append((row[0], row[2], row[1]))
+                    did, text, title = row[0], row[2], row[1]
+                if iterative:
+                    yield did, text, title
+                else:
+                    passages.append((did, text, title))
             except:
                 logger.warning(f'The following input line has not been correctly loaded: {row}')
         print()
-    if as_numpy:
-      return np.array(passages, dtype=np.string_)
-    return passages
+    if not iterative:
+        if as_numpy:
+          yield np.array(passages, dtype=np.string_)
+        yield passages
 
 def extract_query_answer(output: List[int], tokenizer, query_in_decoder: bool = False) -> Tuple[str, str, int]:
   pad_id = tokenizer.pad_token_id

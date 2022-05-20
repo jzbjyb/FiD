@@ -4,8 +4,10 @@ source utils.sh
 index_name=$1
 model_path=$2
 topk=$3
-pkl=${model_path}.index/${index_name}/qid2rank_${topk}.pkl
-json=${model_path}.index/${index_name}/qid2rank_${topk}.json
+index_name_suffix=$4
+
+pkl=${model_path}.index/${index_name}${index_name_suffix}/qid2rank_${topk}.pkl
+json=${model_path}.index/${index_name}${index_name_suffix}/qid2rank_${topk}.json
 
 get_dataset_settings ${index_name} 1024 ${gpu}  # 1024 doesn't matter
 

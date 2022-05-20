@@ -100,6 +100,7 @@ class Options():
         self.parser.add_argument('--memory_bank_additional_encode', action='store_true',
                                  help='compute decoder-attention for docs from memory bank')
         self.parser.add_argument('--memory_bank_gpu', type=str, default=None, help='gpu index connected by , used for memory bank')
+        self.parser.add_argument('--max_over_head', action='store_true', help='max over all attention heads in aggregation')
 
     def add_retriever_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')
@@ -139,6 +140,7 @@ class Options():
                         help="Main port (for multi-node SLURM jobs)")
         self.parser.add_argument('--seed', type=int, default=0, help="random seed for initialization")
         self.parser.add_argument('--num_workers', type=int, default=0, help='number of workers for dataloader')
+        self.parser.add_argument('--augmentation', type=str, default=None, help='query augmentation')
         # training parameters
         self.parser.add_argument('--eval_freq', type=int, default=500,
                         help='evaluate model every <eval_freq> steps during training')

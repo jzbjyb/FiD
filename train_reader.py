@@ -194,7 +194,7 @@ if __name__ == "__main__":
         world_size=opt.world_size,
         n_context=opt.n_context,
     )
-    train_dataset = src.data.Dataset(train_examples, opt.n_context)
+    train_dataset = src.data.Dataset(train_examples, opt.n_context, augmentation=opt.augmentation)
     # use golbal rank and world size to split the eval set on multiple gpus
     eval_examples = src.data.load_data(
         opt.eval_data,
@@ -204,7 +204,7 @@ if __name__ == "__main__":
     )
     if opt.eval_num_examples:
         eval_examples = eval_examples[:opt.eval_num_examples]
-    eval_dataset = src.data.Dataset(eval_examples, opt.n_context)
+    eval_dataset = src.data.Dataset(eval_examples, opt.n_context, augmentation=opt.augmentation)
 
     if opt.is_distributed and opt.global_rank != 0:  # load model
         torch.distributed.barrier()
@@ -236,7 +236,8 @@ if __name__ == "__main__":
           encoder_encoder_kl_sparsity=opt.encoder_encoder_kl_sparsity,
           encoder_encoder_kl=opt.encoder_encoder_kl,
           decoder_attn_ctx_normalize=opt.decoder_attn_ctx_normalize,
-          encoder_attention_pre_softmax=opt.encoder_attention_pre_softmax)
+          encoder_attention_pre_softmax=opt.encoder_attention_pre_softmax,
+          max_over_head=opt.max_over_head)
         if opt.init_from:
           logger.info(f'Init from {opt.init_from}')
           _model = model_class.from_pretrained(opt.init_from)

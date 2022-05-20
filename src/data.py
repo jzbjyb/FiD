@@ -19,7 +19,8 @@ class Dataset(torch.utils.data.Dataset):
                  title_prefix='title:',
                  passage_prefix='context:',
                  add_eos: bool = False,
-                 in_batch_negative_mimic: int = 0):
+                 in_batch_negative_mimic: int = 0,
+                 augmentation: str = None):
         self.data = data
         self.n_context = n_context
         self.question_prefix = question_prefix
@@ -27,6 +28,8 @@ class Dataset(torch.utils.data.Dataset):
         self.passage_prefix = passage_prefix
         self.eos = (' </s>' if add_eos else '')
         self.in_batch_negative_mimic = in_batch_negative_mimic
+        assert augmentation in {'duplicate', 'mask', None}
+        self.augmentation = augmentation
         self.sort_data()
 
     def __len__(self):
@@ -48,10 +51,19 @@ class Dataset(torch.utils.data.Dataset):
             return random.choice(ans_li) + (' </s>' if add_eos else '')
         else:
             return None
+    
+    def augment(self, text: str):
+        if self.augmentation is None:
+            return text
+        if self.augmentation == 'duplicate':
+            return text + ' ' + text
+        if self.augmentation == 'mask':
+            return text + ' ' + ' '.join([f'<extra_id_{i}>' for i in range(5)])  # TODO: hyperparam
+        raise NotImplementedError
 
     def __getitem__(self, index):
         example = self.data[index]
-        question = self.question_prefix + " " + example['question'] + self.eos
+        question = self.augment(self.question_prefix + " " + example['question']) + self.eos
         target = self.get_target(example)
 
         if 'ctxs' in example and self.n_context is not None:
@@ -335,7 +347,7 @@ class TextCollator(object):
         if self.augmentation == 'duplicate':
             return text + ' ' + text
         if self.augmentation == 'mask':
-            return text + ' ' + ' '.join([f'<extra_id_{i}>' for i in range(10)])  # TODO: hyperparam
+            return text + ' ' + ' '.join([f'<extra_id_{i}>' for i in range(5)])  # TODO: hyperparam
         raise NotImplementedError
 
     def __call__(self, batch):

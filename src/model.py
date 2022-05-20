@@ -602,6 +602,7 @@ class FiDT5Config(transformers.T5Config):
                encoder_encoder_kl: str = None,
                encoder_encoder_kl_sparsity: int = 0,
                decoder_attn_ctx_normalize: bool = False,
+               max_over_head: bool = False,
                **kwargs):
     super().__init__(*args, **kwargs)
     self.n_layer_two_tower = n_layer_two_tower
@@ -630,6 +631,7 @@ class FiDT5Config(transformers.T5Config):
     self.encoder_encoder_kl = encoder_encoder_kl
     self.encoder_encoder_kl_sparsity = encoder_encoder_kl_sparsity
     self.decoder_attn_ctx_normalize = decoder_attn_ctx_normalize
+    self.max_over_head = max_over_head
 
 class FiDT5(transformers.T5ForConditionalGeneration):
     config_class = FiDT5Config
@@ -672,7 +674,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 encoder_encoder_kl_ratio: float = 0,
                 encoder_encoder_kl: str = None,
                 encoder_encoder_kl_sparsity: int = 0,
-                decoder_attn_ctx_normalize: bool = False):
+                decoder_attn_ctx_normalize: bool = False,
+                max_over_head: bool = False):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
@@ -701,6 +704,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           encoder_encoder_kl=encoder_encoder_kl,
           encoder_encoder_kl_sparsity=encoder_encoder_kl_sparsity,
           decoder_attn_ctx_normalize=decoder_attn_ctx_normalize,
+          max_over_head=max_over_head,
           **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
@@ -987,6 +991,7 @@ class DecoderWrapper(torch.nn.Module):
     self.pairwise_loss = config.pairwise_loss
     self.memory_bank_topk = config.memory_bank_topk
     self.memory_bank_additional_encode = config.memory_bank_additional_encode
+    self.max_over_head = config.max_over_head
     if self.encoder_attention_pre_softmax and self.num_keep_ctx_in_decoder:
       raise NotImplementedError
     if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
@@ -994,8 +999,8 @@ class DecoderWrapper(torch.nn.Module):
     if self.decoder_attn_ctx_normalize:
       assert self.num_keep_ctx_in_decoder and not self.encoder_decoder_kl_ratio, \
         'normalized decoder is not used in a proper setting'
-    if FiDT5.need_wrap_decoder(config):
-      # head weight always needed
+    
+    if FiDT5.need_wrap_decoder(config) and not self.max_over_head:
       if config.keep_ctx_in_decoder_with_head is None:
         if self.layer_for_retrieval in {'first', 'emb'}:
           nw = config.num_heads
@@ -1016,6 +1021,8 @@ class DecoderWrapper(torch.nn.Module):
         weights = [-1e5] * config.num_heads
         weights[config.keep_ctx_in_decoder_with_head] = 1.0
         self.head_weights = torch.nn.Parameter(torch.tensor(weights), requires_grad=False)
+    
+    if FiDT5.need_wrap_decoder(config):
       if config.head_weights_norm_func == 'softmax':
         self.head_weights_norm_func = lambda x: torch.softmax(x / self.keep_ctx_in_decoder_head_tau, 0)
       elif config.head_weights_norm_func == 'sparsemax':
@@ -1059,9 +1066,7 @@ class DecoderWrapper(torch.nn.Module):
       assert not has_token, 'pre softmax might not be good for token-level loss'
       encoder_imp = torch.log_softmax(encoder_imp, dim=1)
 
-    # combine multiple heads
-    hwn = self.head_weights_norm_func(self.head_weights)
-    WandbLogger.log_w_step({'head-weight': hwn})
+    # reshape
     if self.layer_for_retrieval in {'first', 'emb'}:  # use the first layer
       encoder_imp = encoder_imp[:, :, 0]  # (num_q, num_d, num_head, [num_toks])
     elif self.layer_for_retrieval in {'emb-first', 'last-first'}:  # use the emb/last layer and first layer after bi-encoder
@@ -1073,17 +1078,26 @@ class DecoderWrapper(torch.nn.Module):
       encoder_imp = encoder_imp.view(*v)  # (num_q, num_d, ? * num_head, [num_toks])
     else:
       raise NotImplementedError
-    if self.encoder_attention_pre_softmax:
-      assert not has_token, 'pre softmax might not be good for token-level loss'
-      encoder_imp = torch.logsumexp(encoder_imp + torch.log(torch.clamp(hwn, min=1e-10))[None, None, :], dim=-1)
+    
+    if num_head == 1:
+      if has_token:
+        raise NotImplementedError
+      encoder_imp = encoder_imp[:, :, 0]  # (num_q, num_d)
     else:
-      if not has_token:
-        encoder_imp = (encoder_imp * hwn[None, None, :]).sum(-1)  # (num_q, num_d)
+      # combine multiple heads
+      hwn = self.head_weights_norm_func(self.head_weights)
+      WandbLogger.log_w_step({'head-weight': hwn})
+      if self.encoder_attention_pre_softmax:
+        assert not has_token, 'pre softmax might not be good for token-level loss'
+        encoder_imp = torch.logsumexp(encoder_imp + torch.log(torch.clamp(hwn, min=1e-10))[None, None, :], dim=-1)
       else:
-        encoder_imp = (encoder_imp * hwn[None, None, :, None]).sum(-2)  # (num_q, num_d, num_toks)
-        # softmax over all toks in all context
-        encoder_imp = encoder_imp * encoder_imp_tok_mask - ~encoder_imp_tok_mask * 1e5
-        encoder_imp = torch.log_softmax(encoder_imp.view(num_q, -1), dim=-1).view(num_q, num_d, num_toks)
+        if not has_token:
+          encoder_imp = (encoder_imp * hwn[None, None, :]).sum(-1)  # (num_q, num_d)
+        else:
+          encoder_imp = (encoder_imp * hwn[None, None, :, None]).sum(-2)  # (num_q, num_d, num_toks)
+          # softmax over all toks in all context
+          encoder_imp = encoder_imp * encoder_imp_tok_mask - ~encoder_imp_tok_mask * 1e5
+          encoder_imp = torch.log_softmax(encoder_imp.view(num_q, -1), dim=-1).view(num_q, num_d, num_toks)
 
     # used for output
     if not has_token:
@@ -1152,7 +1166,8 @@ class EncoderWrapper(torch.nn.Module):
         self.memory_bank_topk = config.memory_bank_topk
         self.memory_use_random = config.memory_use_random
         self.memory_bank_additional_encode = config.memory_bank_additional_encode
-        self.use_head_idx = get_single_head_idx(self.num_heads, self.n_layer_two_tower)
+        self.max_over_head = config.max_over_head
+        self.use_head_idx = get_single_head_idx(self.num_heads, self.n_layer_two_tower, self.max_over_head)
         self.pad_token_id = config.pad_token_id
         self.memory_bank_inference = True  # use inference mode to run memory bank
         self.separate_process = True  # use another process to handle memory bank
@@ -1391,6 +1406,7 @@ class T5blockWrapper(torch.nn.Module):
         self.use_for_retrieval = use_for_retrieval
         self.bi_encoder_forward = bi_encoder_forward
         self.retrieval_aggregation_method = config.retrieval_aggregation_method
+        self.max_over_head = config.max_over_head
         self.in_batch_negative = config.in_batch_negative
         self.in_batch_negative_size = config.in_batch_negative_size
         self.in_batch_negative_max_num_query = config.in_batch_negative_max_num_query
@@ -1414,10 +1430,11 @@ class T5blockWrapper(torch.nn.Module):
                     attention_mask=attention_mask[:, 0].eq(0),
                     input_ids=self.input_ids if hasattr(self, 'input_ids') else None,  # passed from the forward function of the encoder
                     aggregation_method=self.retrieval_aggregation_method,
+                    max_over_head=self.max_over_head,
                     field='query',
                     use_hidden_states=False,
                     n_context=self.n_passages if hasattr(self, 'n_passages') else None,
-                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower)), reg_point.SelfAttention)
+                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower, self.max_over_head)), reg_point.SelfAttention)
             if self.in_batch_negative and self.training:
               reg_point.SelfAttention.in_batch_negative = types.MethodType(functools.partial(
                 in_batch_negative, n_context=self.n_passages, in_batch_negative_size=self.in_batch_negative_size,
@@ -1626,6 +1643,7 @@ def aggregate_attention(
      attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
      field: str,
      aggregation_method: str,
+     max_over_head: bool = False,
      use_head_idx: int = None,
      n_heads: int = None):
   pad_mask = attention_mask.max(1)[0]  # (bs, seq_len)
@@ -1641,6 +1659,9 @@ def aggregate_attention(
     raise NotImplementedError
   cross_mask = (~attention_mask & pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)).unsqueeze(
     1)  # (bs, 1, seq_len, seq_len)
+
+  if max_over_head:
+    scores = scores.max(1, keepdim=True)[0]
 
   if aggregation_method == 'all-max-all':
     # max over tokens paying attention
@@ -1691,7 +1712,9 @@ def aggregate_attention(
                         torch.zeros_like(scores).repeat(1, n_heads - use_head_idx - 1)], dim=1)
   self.retrieval['two_tower_attn_score'] = scores
 
-def get_single_head_idx(num_heads: int, n_layer_two_tower: int):
+def get_single_head_idx(num_heads: int, n_layer_two_tower: int, max_over_head: bool = False):
+  if max_over_head:
+    return None
   if num_heads == 12:  # 'google/t5-base-lm-adapt':
     assert n_layer_two_tower == 6
     return 3
@@ -1712,6 +1735,7 @@ def collect_for_retrieval(
      attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
      input_ids: torch.LongTensor,  # (bs * n_context, seq_len)
      aggregation_method: str,  # 'head-query-key'
+     max_over_head: bool,
      field: str,
      use_hidden_states: bool,
      n_context: int,
@@ -1754,6 +1778,9 @@ def collect_for_retrieval(
           scores = scores + position_bias[:, use_head_idx:use_head_idx + 1, :max_qry_len, min_qry_len:]
         else:
           scores = scores + position_bias[:, :, :max_qry_len, min_qry_len:]
+        if max_over_head:
+          assert use_head_idx is None
+          scores = scores.max(1, keepdim=True)[0]
         assert aggregation_method == 'all-avg-max'
         # (<=(n_gpu * bs)^2 * n_context, 1 (n_heads), max_qry_len, seq_len - min_qry_len)
         cross_mask = (query_mask.unsqueeze(-1) & doc_mask.unsqueeze(1)).unsqueeze(1)
@@ -1772,7 +1799,7 @@ def collect_for_retrieval(
           scores = scores + position_bias
         aggregate_attention(
           self, scores, _attention_mask,
-          field=field, aggregation_method=aggregation_method, use_head_idx=use_head_idx, n_heads=n_heads)
+          field=field, aggregation_method=aggregation_method, max_over_head=max_over_head, use_head_idx=use_head_idx, n_heads=n_heads)
         scores_li.append(self.retrieval['two_tower_attn_score'])
     self.retrieval['two_tower_attn_score'] = torch.cat(scores_li, dim=0)
     return
@@ -1837,7 +1864,7 @@ def collect_for_retrieval(
         attention_mask = cat_by_doc(attention_mask, __attention_mask.view(-1, seq_len, seq_len))
         aggregate_attention(
           self, scores, attention_mask,
-          field=field, aggregation_method=aggregation_method)
+          field=field, aggregation_method=aggregation_method, max_over_head=max_over_head)
       else:
         # use original query-related vectors to enable dropout
         assert memory_bank_topk % n_context == 0
@@ -1856,7 +1883,7 @@ def collect_for_retrieval(
         scores = scores + position_bias[:, use_head_idx:use_head_idx + 1]
         aggregate_attention(
           self, scores, attention_mask,
-          field=field, aggregation_method=aggregation_method, use_head_idx=use_head_idx, n_heads=n_heads)
+          field=field, aggregation_method=aggregation_method, max_over_head=max_over_head, use_head_idx=use_head_idx, n_heads=n_heads)
 
     # add to memory bank and avoid duplicated add when checkpointing is activated
     if _key_states.requires_grad:
@@ -1891,7 +1918,7 @@ def collect_for_retrieval(
 
   aggregate_attention(
     self, scores, attention_mask,
-    field=field, aggregation_method=aggregation_method)
+    field=field, aggregation_method=aggregation_method, max_over_head=max_over_head)
 
 def cross_combine(values,  # (query_dim, doc_dim, seq_len, ...)
                   sep_lens,  # (query_dim)

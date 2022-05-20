@@ -62,6 +62,10 @@ class BEIRDataset:
   @classmethod
   def get_answer_msmarcoqa(cls, metadata: Dict) -> List[str]:
     return metadata['answer']
+  
+  @classmethod
+  def get_answer_nq(cls, metadata: Dict) -> List[str]:
+    return metadata['answer']
 
   @classmethod
   def get_answer_fiqa(cls, metadata: Dict) -> List[str]:
@@ -121,9 +125,10 @@ def convert_beir_to_fid_format(
   hostname = 'localhost'
   number_of_shards = 1  # TODO
   corpus, _, _ = GenericDataLoader(data_folder=beir_dir).load(split=splits[0])
-  model = BM25(index_name=dataset_name, hostname=hostname, initialize=True, number_of_shards=number_of_shards)
-  model.index(corpus)
-  time.sleep(5)
+  # TODO: debug
+  #model = BM25(index_name=dataset_name, hostname=hostname, initialize=True, number_of_shards=number_of_shards)
+  #model.index(corpus)
+  #time.sleep(5)
 
   for split_ind, split in enumerate(splits):
     corpus, queries, qrels = GenericDataLoader(data_folder=beir_dir).load(split=split)
@@ -212,6 +217,24 @@ def convert_sciq_to_beir_format(sciq_dir: str, beir_dir: str):
         did2dict[did] = {'_id': did, 'title': '', 'text': ex['support']}
         unique_text_set.add(ex['support'])
         split2qiddid[nsplit].append((qid, did))
+  save_beir_format(beir_dir, qid2dict, did2dict, split2qiddid)
+
+
+def convert_nq_to_beir_format(nq_dir: str, beir_dir: str):
+  qid2dict: Dict[str, Dict] = {}
+  did2dict: Dict[str, Dict] = {}
+  split2qiddid: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+  max_did = 0
+  for did, text, title in src.util.load_passages(os.path.join(nq_dir, 'psgs_w100.tsv'), iterative=True):
+    did2dict[did] = {'_id': did, 'title': title, 'text': text}
+    max_did = max(max_did, int(did))
+  for split, nsplit in [('train', 'train'), ('dev', 'dev'), ('test', 'test')]:
+    with open(os.path.join(nq_dir, f'{split}.json'), 'r') as fin:
+      data = json.load(fin)
+      for ex in data:
+        qid = f'{str(len(qid2dict) + max_did + 1)}'
+        qid2dict[qid] = {'_id': qid, 'text': ex['question'], 'metadata': {'answer': ex['answers']}}
+        split2qiddid[nsplit].append((qid, ex['ctxs'][0]['id']))
   save_beir_format(beir_dir, qid2dict, did2dict, split2qiddid)
 
 
@@ -729,7 +752,7 @@ def aggregate_ctx(query_files: List[str], tsv_file: str, topk: int = None):
 def rank2json(rank_file: str, query_json_file: str, psge_tsv_file: str, out_json_file: str):
   with open(rank_file, 'rb') as fin:
     qid2rank = pickle.load(fin)
-  docs = src.util.load_passages(psge_tsv_file)
+  docs = next(src.util.load_passages(psge_tsv_file))
   did2doc: Dict[str, Tuple] = {doc[0]: doc for doc in docs}
   with open(query_json_file, 'r') as fin, open(out_json_file, 'w') as fout:
     queries = json.load(fin)
@@ -860,7 +883,7 @@ def add_doc_to_onlyid(query_file: str, psgs_tsv_file: str, out_json_file: str):
     for query in data:
       for ctx in query['ctxs']:
         dids.add(ctx['id'])
-  docs = src.util.load_passages(psgs_tsv_file, restricted_ids=dids)
+  docs = next(src.util.load_passages(psgs_tsv_file, restricted_ids=dids))
   did2doc: Dict[str, Tuple] = {doc[0]: doc for doc in docs}
   with open(query_file, 'r') as fin, open(out_json_file, 'w') as fout:
     data = json.load(fin)
@@ -886,7 +909,7 @@ def merge_queries(pkl_file_pattern: str, out_pkl_file: str):
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
-    'convert_sciq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
+    'convert_sciq_to_beir_format', 'convert_nq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
     'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx', 'rank2json',
     'add_negative', 'add_negative_mimic_inbatch', 'create_pseudo_queries_from_beir',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format', 'split_fid_file',
@@ -909,12 +932,17 @@ if __name__ == '__main__':
   elif args.task == 'convert_beir_to_fid_format':
     beir_dir = args.inp[0]
     out_dir = args.out[0]
-    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='pseudo', splits=['test'], add_self=True)
+    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='nq', splits=['train'], add_self=False)
 
   elif args.task == 'convert_sciq_to_beir_format':
     sciq_dir = args.inp[0]
     beir_dir = args.out[0]
     convert_sciq_to_beir_format(sciq_dir, beir_dir)
+  
+  elif args.task == 'convert_nq_to_beir_format':
+    nq_dir = args.inp[0]
+    beir_dir = args.out[0]
+    convert_nq_to_beir_format(nq_dir, beir_dir)
 
   elif args.task == 'convert_techqa_to_beir_format':
     techqa_dir = args.inp[0]

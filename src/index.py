@@ -4,12 +4,14 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import enum
 import logging
 from re import I
 from typing import List, Tuple, Set, Union, Dict
 import time
 import glob
 from pathlib import Path
+from collections import defaultdict
 from tqdm import tqdm
 import faiss
 import numpy as np
@@ -36,11 +38,13 @@ class Indexer(object):
     self.texts = np.empty((0), dtype=str)
     self.embs = np.empty((0, vector_sz), dtype=np.float32)
 
-  def load_from_npz(self, emb_files: List[str], save_or_load_index: bool = True):
-    embeddings_dir = Path(emb_files[0]).parent
-    index_path = embeddings_dir / 'index.faiss'
-    if save_or_load_index and index_path.exists():
-      self.deserialize_from(embeddings_dir)
+  def load_from_npz(
+      self, 
+      emb_files: List[str], 
+      index_name: str = None):
+    root_dir = Path(emb_files[0]).parent
+    if index_name is not None and (root_dir / '{index_name}.faiss').exists():
+      self.deserialize_from(root_dir, index_name=index_name)
     else:
       logger.info(f'indexing passages from files {emb_files}')
       start_time_indexing = time.time()
@@ -58,9 +62,37 @@ class Indexer(object):
       texts = np.concatenate(texts, axis=0)
       self.index_data(ids, embeddings, texts)
       logger.info(f'data indexing completed with time {time.time() - start_time_indexing:.1f} s.')
-      if save_or_load_index:
-        self.serialize(embeddings_dir)
+      if index_name is not None:
+        self.serialize(root_dir, index_name=index_name)
     self.build_length_offset()
+
+  def serialize(
+      self, 
+      dir_path: Path, 
+      index_name: str = 'index'):
+    index_file = dir_path / f'{index_name}.faiss'
+    meta_file = dir_path / f'{index_name}.meta'
+    logger.info(f'Serializing index to {index_file}, meta data to {meta_file}')
+    faiss.write_index(faiss.index_gpu_to_cpu(self.index) if self.use_gpu else self.index, str(index_file))
+    with open(meta_file, mode='wb') as f:
+      np.savez(f, ids=self.ids, texts=self.texts, embs=self.embs)
+
+  def deserialize_from(
+      self, 
+      dir_path: Path,
+      index_name: str = 'index'):
+    index_file = dir_path / f'{index_name}.faiss'
+    meta_file = dir_path / f'{index_name}.meta'
+    logger.info(f'Loading index from {index_file}, meta data from {meta_file}')
+    self.index = faiss.read_index(str(index_file))
+    self.move_to_gpu()
+    logger.info('Loaded index of type %s and size %d', type(self.index), self.index.ntotal)
+    with open(meta_file, 'rb') as reader:
+      npzfile = np.load(reader)
+      self.ids, self.texts = npzfile['ids'], npzfile['texts']
+      if 'embs' in npzfile:
+        self.embs = npzfile['embs']
+    assert len(self) == self.index.ntotal, 'Deserialized ids should match faiss index size'
   
   def __len__(self):
     return len(self.ids)
@@ -89,7 +121,6 @@ class Indexer(object):
       return
     if type(self.cuda_device) is list:  # multiple gpu
       logger.info(f'Move FAISS index to gpu {self.cuda_device}')
-      print(f'Move FAISS index to gpu {self.cuda_device}', flush=True)
       if self.shard:
         co = faiss.GpuMultipleClonerOptions()
         co.useFloat16 = True
@@ -99,7 +130,6 @@ class Indexer(object):
       self.index = faiss.index_cpu_to_gpus_list(self.index, co=co, gpus=self.cuda_device)
     else:  # single gpu
       logger.info(f'Move FAISS index to gpu {self.cuda_device}')
-      print(f'Move FAISS index to gpu {self.cuda_device}', flush=True)
       res = faiss.StandardGpuResources()
       self.index = faiss.index_cpu_to_gpu(res, self.cuda_device, self.index)
 
@@ -176,20 +206,24 @@ class Indexer(object):
   def search_knn(self,
                  query_vectors: np.array,
                  top_docs: int,
-                 index_batch_size: int = 1024) -> List[Tuple[List[object], List[float], List[str]]]:
+                 batch_size: int = 1024,
+                 return_external_id: bool = True) -> List[Tuple[List[Union[str, int]], List[float], List[str]]]:
     query_vectors = query_vectors.astype('float32')
     result = []
-    nbatch = (len(query_vectors) - 1) // index_batch_size + 1
+    nbatch = (len(query_vectors) - 1) // batch_size + 1
     for k in range(nbatch):
-      start_idx = k * index_batch_size
-      end_idx = min((k + 1) * index_batch_size, len(query_vectors))
+      start_idx = k * batch_size
+      end_idx = min((k + 1) * batch_size, len(query_vectors))
       q = query_vectors[start_idx:end_idx]
-      scores, indexes = self.index.search(q, top_docs)
+      scores, indices = self.index.search(q, top_docs)
       # convert to external ids
-      ids = [self.ids[query_top_idxs] for query_top_idxs in indexes]
+      ext_ids = [self.ids[_indices] for _indices in indices]
       # get text
-      texts = [(self.texts[query_top_idxs] if len(self.texts) else None) for query_top_idxs in indexes]
-      result.extend([(ids[i], scores[i], texts[i]) for i in range(len(ids))])
+      texts = [(self.texts[_indices] if len(self.texts) else None) for _indices in indices]
+      if return_external_id:
+        result.extend([(ext_ids[i], scores[i], texts[i]) for i in range(len(indices))])
+      else:
+        result.extend([(indices[i], scores[i], texts[i]) for i in range(len(indices))])
     return result
   
   def get_by_ids_by_mask(self, ids: List[str]):
@@ -206,28 +240,6 @@ class Indexer(object):
     _embs = self.embs[indices]
     return _embs, _ids
 
-  def serialize(self, dir_path):
-    index_file = dir_path / 'index.faiss'
-    meta_file = dir_path / 'index.meta'
-    logger.info(f'Serializing index to {index_file}, meta data to {meta_file}')
-    faiss.write_index(faiss.index_gpu_to_cpu(self.index) if self.use_gpu else self.index, str(index_file))
-    with open(meta_file, mode='wb') as f:
-      np.savez(f, ids=self.ids, texts=self.texts, embs=self.embs)
-
-  def deserialize_from(self, dir_path):
-    index_file = dir_path / 'index.faiss'
-    meta_file = dir_path / 'index.meta'
-    logger.info(f'Loading index from {index_file}, meta data from {meta_file}')
-    self.index = faiss.read_index(str(index_file))
-    self.move_to_gpu()
-    logger.info('Loaded index of type %s and size %d', type(self.index), self.index.ntotal)
-    with open(meta_file, 'rb') as reader:
-      npzfile = np.load(reader)
-      self.ids, self.texts = npzfile['ids'], npzfile['texts']
-      if 'embs' in npzfile:
-        self.embs = npzfile['embs']
-    assert len(self) == self.index.ntotal, 'Deserialized ids should match faiss index size'
-
   def _update_id_mapping(self, ids):
     ids = np.array(ids, dtype=str)
     self.ids = np.concatenate((self.ids, ids), axis=0)
@@ -241,3 +253,64 @@ class Indexer(object):
     if not self.keep_raw_vector:
       return
     self.embs = np.concatenate((self.embs, emb), axis=0)
+
+
+class MultiIndexer(object):
+  def __init__(self, num_indices: int, *args, **kwargs):
+    self.indices = [Indexer(*args, **kwargs) for _ in range(num_indices)]
+    self.is_corresponding = True  # vectors in these indices correspond to each other 
+  
+  def load_from_npz(
+      self, 
+      emb_files: List[str], 
+      index_name: str = None):
+    # group files by idx
+    hi2files: Dict[int, List[str]] = defaultdict(list)
+    for f in sorted(emb_files):
+      hi2files[int(f.rsplit('.', 2)[-2])].append(f)
+    assert len(hi2files) >= len(self.indices), 'embedding files are not enought'
+    # load files for each idx
+    for hi, index in enumerate(self.indices):
+      _index_name = index_name + f'.{hi:02d}' if index_name is not None else None
+      index.load_from_npz(hi2files[hi], index_name=_index_name)
+  
+  def search_knn(self, *args, **kwargs) -> List[Tuple[List[Union[str, int]], List[float], List[str]]]:
+    result_li = []
+    return_external_id = True
+    if 'return_external_id' in kwargs:
+      return_external_id = kwargs['return_external_id']
+      del kwargs['return_external_id']
+    for _, index in enumerate(self.indices):
+      result_li.append(index.search_knn(*args, return_external_id=False, **kwargs))  # return raw id
+    # perform max aggregation
+    merged_result = []
+    for i in range(len(result_li[0])):
+      id2scoretext: Dict[int, Tuple[float, str]] = {}
+      for result in result_li:
+        for id, score, text in zip(*result[i]):
+          if id not in id2scoretext:
+            id2scoretext[id] = (score, text)
+          else:
+            assert text == id2scoretext[id][1]
+            id2scoretext[id] = (max(score, id2scoretext[id][0]), text)
+      ids, scores, texts = [], [], []
+      for id, (score, text) in id2scoretext.items():
+        ids.append(id)
+        scores.append(score)
+        texts.append(text)
+      if return_external_id:
+        ids = self.indices[0].ids[ids]
+      merged_result.append((ids, scores, texts))
+    return merged_result
+  
+  def get_by_ids(self, ids: List[str]):
+    flat_embs = []
+    flat_dids = None
+    for index in self.indices:
+      _flat_embs, _flat_dids = index.get_by_ids(ids)
+      flat_embs.append(_flat_embs)
+      if flat_dids is not None:
+        assert len(flat_dids) == len(_flat_dids)
+      flat_dids = _flat_dids
+    flat_embs = np.stack(flat_embs, axis=1)  # (num_embs, num_indices, emb_size)
+    return flat_embs, flat_dids
