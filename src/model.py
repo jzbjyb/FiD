@@ -1780,11 +1780,15 @@ def collect_for_retrieval(
           scores = scores + position_bias[:, :, :max_qry_len, min_qry_len:]
         if max_over_head:
           assert use_head_idx is None
-          scores = scores.max(1, keepdim=True)[0]
+          scores, max_head_idx = scores.max(1, keepdim=True)  
         assert aggregation_method == 'all-avg-max'
         # (<=(n_gpu * bs)^2 * n_context, 1 (n_heads), max_qry_len, seq_len - min_qry_len)
         cross_mask = (query_mask.unsqueeze(-1) & doc_mask.unsqueeze(1)).unsqueeze(1)
-        scores = (scores - (~cross_mask * 1e5)).max(-1)[0]  # (<=(n_gpu * bs)^2 * n_context, n_heads, max_qry_len)
+        scores, max_doc_tok_idx = (scores - (~cross_mask * 1e5)).max(-1)  # (<=(n_gpu * bs)^2 * n_context, n_heads, max_qry_len)
+        if max_over_head:
+          max_head_idx = torch.gather(max_head_idx, -1, max_doc_tok_idx.unsqueeze(-1))  # (<=(n_gpu * bs)^2 * n_context, 1, max_qry_len, 1)
+          max_head_idx, max_head_count = torch.unique_consecutive(max_head_idx.view(-1).sort().values, return_counts=True)  # (<=n_heads,)
+          WandbLogger.log_w_step({'max-over-head': (max_head_idx, max_head_count)})
         scores = (scores * query_mask.unsqueeze(1)).sum(-1) / query_mask.unsqueeze(1).sum(-1)  # (<=(n_gpu * bs)^2 * n_context, n_heads)
         if use_head_idx is not None:
           scores = torch.cat([torch.zeros_like(scores).repeat(1, use_head_idx), scores,

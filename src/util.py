@@ -66,6 +66,11 @@ class WandbLogger:
         return
     _data = {}
     for k in data:
+      if type(data[k]) is tuple and len(data[k]) == 2:  # key-value pair
+        assert data[k][0].dim() == data[k][1].dim() == 1
+        for _k, _v in zip(*data[k]):
+          _data[f'{k}-{_k.item()}'] = _v.item()
+        continue
       if type(data[k]) is torch.Tensor:
         data[k] = data[k].detach().cpu().numpy().tolist()
       if type(data[k]) is list:

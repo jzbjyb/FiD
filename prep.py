@@ -20,6 +20,7 @@ from beir.retrieval.evaluation import EvaluateRetrieval
 from beir.retrieval.search.lexical import BM25Search as BM25
 from passage_retrieval import validate
 from src.util import clean_text_for_tsv
+from src.evaluation import has_answer, SimpleTokenizer
 import src.evaluation
 
 logging.basicConfig(level=logging.DEBUG)
@@ -906,6 +907,99 @@ def merge_queries(pkl_file_pattern: str, out_pkl_file: str):
      pickle.dump(qid2rank, fout)
 
 
+def write_to_file(question: str, answers: List[str], title1: List[str], title2: List[str], docs1: List[str], docs2: List[str], corrects1: List[bool], corrects2: List[bool], fout):
+  fout.write(
+    f"""
+    <h2>Question: {question}</h2>
+    <h2>Answers: {answers}</h2>
+    """
+    + \
+    """
+    <div class="row">
+      <div class="column"><h2 style="text-align: center;">w/ query augmentation</h2></div>
+      <div class="column"><h2 style="text-align: center;">w/o query augmentation</h2></div>
+    </div>
+    """
+    + \
+    ''.join([
+    f"""
+    <div class="row">
+      <div class="column {'correct' if corrects1[i] else 'wrong'}">
+        <h3>Title: {title1[i]}</h3>
+        <p>Text: {docs1[i]}</p>
+      </div>
+      <div class="column {'correct' if corrects2[i] else 'wrong'}">
+        <h3>Title: {title2[i]}</h3>
+        <p>Text: {docs2[i]}</p>
+      </div>
+    </div>
+    """
+    for i in range(len(title1))])
+  )
+
+
+def init_to_file(fout):
+  fout.write(
+    """
+    <head>
+    <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    /* Create two equal columns that floats next to each other */
+    .column {
+      float: left;
+      width: 45%;
+      padding: 5px;
+      margin: 5px;
+    }
+
+    .correct {
+      background-color: #A9DFBF;
+    }
+
+    .wrong {
+      background-color: #F5CBA7;
+    }
+
+    /* Clear floats after the columns */
+    .row:after {
+      content: "";
+      display: table;
+      clear: both;
+    }
+    </style>
+    </head>
+    """
+  )
+
+
+def compare_two_rank_files(f1: str, f2: str, out_file: str, topk: int = 5):
+  tokenizer = SimpleTokenizer()
+  with open(f1, 'r') as fin1, open(f2, 'r') as fin2, open(out_file + '1.html', 'w') as fout1, open(out_file + '2.html', 'w') as fout2:
+    init_to_file(fout1)
+    init_to_file(fout2)
+    data1, data2 = json.load(fin1), json.load(fin2)
+    wins1 = wins2 = 0
+    for q_idx in range(len(data1)):
+      question = data1[q_idx]['question']
+      answers = data1[q_idx]['answers']
+      title1 = [ctx['title'] for ctx in data1[q_idx]['ctxs'][:topk]]
+      title2 = [ctx['title'] for ctx in data2[q_idx]['ctxs'][:topk]]
+      docs1 = [ctx['text'] for ctx in data1[q_idx]['ctxs'][:topk]]
+      docs2 = [ctx['text'] for ctx in data2[q_idx]['ctxs'][:topk]]
+      corrects1 = [has_answer(answers, doc, tokenizer) for doc in docs1]
+      corrects2 = [has_answer(answers, doc, tokenizer) for doc in docs2]
+      if np.any(corrects1) and not np.any(corrects2):  # 1 is better
+        wins1 += 1
+        write_to_file(question, answers, title1, title2, docs1, docs2, corrects1, corrects2, fout1)
+      elif np.any(corrects2) and not np.any(corrects1):  # 2 is better
+        wins2 += 1
+        write_to_file(question, answers, title1, title2, docs1, docs2, corrects1, corrects2, fout2)
+    print(f'1 wins {wins1}, 2 wins {wins2}')
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
@@ -914,7 +1008,7 @@ if __name__ == '__main__':
     'add_negative', 'add_negative_mimic_inbatch', 'create_pseudo_queries_from_beir',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format', 'split_fid_file',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 
-    'create_whole_test', 'add_doc_to_onlyid', 'merge_queries'])
+    'create_whole_test', 'add_doc_to_onlyid', 'merge_queries', 'compare_two_rank_files'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   parser.add_argument('--other', type=str, nargs='+', help='additional arguments')
@@ -1104,3 +1198,8 @@ if __name__ == '__main__':
     pkl_file_pattern = args.inp[0]
     out_pkl_file = args.out[0]
     merge_queries(pkl_file_pattern, out_pkl_file)
+  
+  elif args.task == 'compare_two_rank_files':
+    f1, f2 = args.inp
+    out_file = args.out[0]
+    compare_two_rank_files(f1, f2, out_file)
