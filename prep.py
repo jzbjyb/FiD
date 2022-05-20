@@ -907,7 +907,7 @@ def merge_queries(pkl_file_pattern: str, out_pkl_file: str):
      pickle.dump(qid2rank, fout)
 
 
-def write_to_file(question: str, answers: List[str], title1: List[str], title2: List[str], docs1: List[str], docs2: List[str], corrects1: List[bool], corrects2: List[bool], fout):
+def write_to_file(question: str, answers: List[str], title1: List[str], title2: List[str], docs1: List[str], docs2: List[str], scores1: List[float], scores2: List[float], corrects1: List[bool], corrects2: List[bool], fout):
   fout.write(
     f"""
     <h2>Question: {question}</h2>
@@ -925,11 +925,11 @@ def write_to_file(question: str, answers: List[str], title1: List[str], title2: 
     f"""
     <div class="row">
       <div class="column {'correct' if corrects1[i] else 'wrong'}">
-        <h3>Title: {title1[i]}</h3>
+        <h3>Title: {title1[i]} (Score: {scores1[i]})</h3>
         <p>Text: {docs1[i]}</p>
       </div>
       <div class="column {'correct' if corrects2[i] else 'wrong'}">
-        <h3>Title: {title2[i]}</h3>
+        <h3>Title: {title2[i]} (Score: {scores2[i]})</h3>
         <p>Text: {docs2[i]}</p>
       </div>
     </div>
@@ -989,14 +989,16 @@ def compare_two_rank_files(f1: str, f2: str, out_file: str, topk: int = 5):
       title2 = [ctx['title'] for ctx in data2[q_idx]['ctxs'][:topk]]
       docs1 = [ctx['text'] for ctx in data1[q_idx]['ctxs'][:topk]]
       docs2 = [ctx['text'] for ctx in data2[q_idx]['ctxs'][:topk]]
+      scores1 = [ctx['score'] for ctx in data1[q_idx]['ctxs'][:topk]]
+      scores2 = [ctx['score'] for ctx in data2[q_idx]['ctxs'][:topk]]
       corrects1 = [has_answer(answers, doc, tokenizer) for doc in docs1]
       corrects2 = [has_answer(answers, doc, tokenizer) for doc in docs2]
       if np.any(corrects1) and not np.any(corrects2):  # 1 is better
         wins1 += 1
-        write_to_file(question, answers, title1, title2, docs1, docs2, corrects1, corrects2, fout1)
+        write_to_file(question, answers, title1, title2, docs1, docs2, scores1, scores2, corrects1, corrects2, fout1)
       elif np.any(corrects2) and not np.any(corrects1):  # 2 is better
         wins2 += 1
-        write_to_file(question, answers, title1, title2, docs1, docs2, corrects1, corrects2, fout2)
+        write_to_file(question, answers, title1, title2, docs1, docs2, scores1, scores2, corrects1, corrects2, fout2)
     print(f'1 wins {wins1}, 2 wins {wins2}')
 
 
