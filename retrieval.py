@@ -60,7 +60,8 @@ def encode_context(
      opt,
      passages: Union[List[Tuple[str, str, str]], np.ndarray],
      model,
-     tokenizer):
+     tokenizer,
+     logger):
   device = model.device
   batch_size = opt.per_gpu_batch_size
   collator = src.data.TextCollator(tokenizer, opt.passage_maxlength)
@@ -308,8 +309,11 @@ def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]]):
       pickle.dump(qid2rank, f)
 
 def main(opt):
-  if args.max_over_head:
-    args.output_path = args.output_path + '.maxoverhead'
+  # append head idx to the output path
+  if opt.max_over_head:
+    opt.output_path = opt.output_path + '.maxoverhead'
+  else:
+    opt.output_path = opt.output_path + f'.{opt.head_idx}'
   opt.output_path = Path(opt.output_path)
   opt.output_path.mkdir(parents=True, exist_ok=True)
   is_querying = opt.queries is not None
@@ -368,7 +372,7 @@ def main(opt):
     passages = passages[start_idx:end_idx]
     logger.info(f'embedding generation for {len(passages)} passages from idx {start_idx} to {end_idx}')
     # encode and output
-    encode_context(opt, passages, model, tokenizer)
+    encode_context(opt, passages, model, tokenizer, logger)
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()

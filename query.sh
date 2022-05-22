@@ -17,6 +17,7 @@ doc_topk=10
 candidate_doc_topk=0
 faiss_gpus="--faiss_gpus all"
 rerank=""
+max_over_head=""
 files_per_run=16  # about 70G embs
 
 # model specific arguments
@@ -27,6 +28,7 @@ if [[ ${model_type} == 'fid' ]]; then
   use_position_bias=$5
   token_topk=$6
   candidate_doc_topk=$7
+  use_max_over_head=$8
   index_dim=64
 
   get_dataset_settings ${index_name} 1024 ${gpu}  # t5's limit is 1024
@@ -36,12 +38,14 @@ if [[ ${model_type} == 'fid' ]]; then
     output_path=${output_path}.position
     extra="--use_position_bias"
   fi
-  passages=${output_path}/embedding_*.npz
   if (( ${token_topk} > 2048 )); then
     faiss_gpus="--faiss_gpus -1"
   fi
   if (( ${candidate_doc_topk} > 0 )); then
     rerank="--candidate_doc_topk ${candidate_doc_topk}"
+  fi
+  if [[ ${use_max_over_head} == 'true' ]]; then
+    max_over_head="--max_over_head"
   fi
 
 elif [[ ${model_type} == 'dpr' ]]; then
@@ -51,7 +55,6 @@ elif [[ ${model_type} == 'dpr' ]]; then
   
   get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 512
   output_path=pretrained_models/dpr.index/${index_name}
-  passages=${output_path}/embedding_*.npz
   if (( ${doc_topk} > 2048 )); then
     faiss_gpus="--faiss_gpus -1"
   fi
@@ -72,7 +75,6 @@ elif [[ ${model_type} == 'colbert' ]]; then
 
   get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 512
   output_path=${model_path}.index/${index_name}
-  passages=${output_path}/embedding_*.npz
   if (( ${token_topk} > 2048 )); then
     faiss_gpus="--faiss_gpus -1"
   fi
@@ -101,7 +103,6 @@ fi
 python ${prefix} retrieval.py \
   --model_type ${model_type} \
   --queries ${queries} \
-  --passages "${passages}" \
   --model_path ${model_path} \
   --output_path ${output_path} \
   --per_gpu_batch_size ${query_per_gpu_batch_size} \
@@ -112,4 +113,4 @@ python ${prefix} retrieval.py \
   --doc_topk ${doc_topk} \
   --save_or_load_index \
   --files_per_run ${files_per_run} \
-  ${rerank} ${head_idx} ${faiss_gpus} ${extra}
+  ${rerank} ${head_idx} ${faiss_gpus} ${extra} ${max_over_head}

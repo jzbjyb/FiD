@@ -4,6 +4,8 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --time=0
 
+set -e
+
 in_datasets=(nq_test_top10)
 out_datasets=(bioasq_500k_test cqadupstack_programmers msmarcoqa_dev fiqa cqadupstack_mathematica cqadupstack_physics)
 all_datasets=("${in_datasets[@]}" "${out_datasets[@]}")
@@ -39,6 +41,7 @@ if [[ ${model_type} == 'fid' ]]; then
   model=$4
   head=$5
   position=false
+  use_max_over_head=false
 elif [[ ${model_type} == 'dpr' ]]; then
   echo DPR
 elif [[ ${model_type} == 'colbert' ]]; then
@@ -53,11 +56,11 @@ for group in "${two_topks[@]}"; do
   for data in "${datasets[@]}"; do
     echo ${data} ${model}
     if [[ $group == 'gpu_topks' ]]; then
-      ./retrieval.sh ${model_type} ${model} ${data} ${head} ${position}
+      ./retrieval.sh ${model_type} ${model} ${data} ${head} ${position} ${use_max_over_head}
     fi
     for topk in "${topks[@]}"; do
       for rerank in "${reranks[@]}"; do
-        ./query.sh ${model_type} ${model} ${data} ${head} ${position} ${topk} ${rerank}  # TODO: DPR does not have rerank
+        ./query.sh ${model_type} ${model} ${data} ${head} ${position} ${topk} ${rerank} ${use_max_over_head}  # TODO: DPR does not have rerank
       done
     done
   done

@@ -907,7 +907,10 @@ def merge_queries(pkl_file_pattern: str, out_pkl_file: str):
      pickle.dump(qid2rank, fout)
 
 
-def write_to_file(question: str, answers: List[str], title1: List[str], title2: List[str], docs1: List[str], docs2: List[str], scores1: List[float], scores2: List[float], corrects1: List[bool], corrects2: List[bool], fout):
+def write_to_file(question: str, answers: List[str], ctx1: List[Dict], ctx2: List[Dict], fout):
+  def _format_tokens(tokens: List[Tuple[str, str, float]]):
+    return ''.join([f'<span class="sep">{q}, {d}, {s:.3f}</span>' for q, d, s in tokens])
+
   fout.write(
     f"""
     <h2>Question: {question}</h2>
@@ -924,17 +927,19 @@ def write_to_file(question: str, answers: List[str], title1: List[str], title2: 
     ''.join([
     f"""
     <div class="row">
-      <div class="column {'correct' if corrects1[i] else 'wrong'}">
-        <h3>Title: {title1[i]} (Score: {scores1[i]})</h3>
-        <p>Text: {docs1[i]}</p>
+      <div class="column {'correct' if ctx1[i]['correct'] else 'wrong'}">
+        <h3>{ctx1[i]['id']}: {ctx1[i]['title']} ({ctx1[i]['score']})</h3>
+        <p>{_format_tokens(ctx1[i]['qd_token_pairs'])}</p>
+        <p>{ctx1[i]['text']}</p>
       </div>
-      <div class="column {'correct' if corrects2[i] else 'wrong'}">
-        <h3>Title: {title2[i]} (Score: {scores2[i]})</h3>
-        <p>Text: {docs2[i]}</p>
+      <div class="column {'correct' if ctx2[i]['correct'] else 'wrong'}">
+        <h3>{ctx2[i]['id']}: {ctx2[i]['title']} ({ctx2[i]['score']})</h3>
+        <p>{_format_tokens(ctx2[i]['qd_token_pairs'])}</p>
+        <p>{ctx2[i]['text']}</p>
       </div>
     </div>
     """
-    for i in range(len(title1))])
+    for i in range(len(ctx1))])
   )
 
 
@@ -963,6 +968,10 @@ def init_to_file(fout):
       background-color: #F5CBA7;
     }
 
+    .sep {
+      padding-right: 25px;
+    }
+
     /* Clear floats after the columns */
     .row:after {
       content: "";
@@ -975,7 +984,7 @@ def init_to_file(fout):
   )
 
 
-def compare_two_rank_files(f1: str, f2: str, out_file: str, topk: int = 5, format: str = 'html'):
+def compare_two_rank_files(f1: str, f2: str, out_file: str, topk: int = 10, format: str = 'html'):
   tokenizer = SimpleTokenizer()
   with open(f1, 'r') as fin1, open(f2, 'r') as fin2, open(out_file + f'1.{format}', 'w') as fout1, open(out_file + f'2.{format}', 'w') as fout2:
     init_to_file(fout1)
@@ -985,20 +994,21 @@ def compare_two_rank_files(f1: str, f2: str, out_file: str, topk: int = 5, forma
     for q_idx in range(len(data1)):
       question = data1[q_idx]['question']
       answers = data1[q_idx]['answers']
-      title1 = [ctx['title'] for ctx in data1[q_idx]['ctxs'][:topk]]
-      title2 = [ctx['title'] for ctx in data2[q_idx]['ctxs'][:topk]]
-      docs1 = [ctx['text'] for ctx in data1[q_idx]['ctxs'][:topk]]
-      docs2 = [ctx['text'] for ctx in data2[q_idx]['ctxs'][:topk]]
-      scores1 = [ctx['score'] for ctx in data1[q_idx]['ctxs'][:topk]]
-      scores2 = [ctx['score'] for ctx in data2[q_idx]['ctxs'][:topk]]
-      corrects1 = [has_answer(answers, doc, tokenizer) for doc in docs1]
-      corrects2 = [has_answer(answers, doc, tokenizer) for doc in docs2]
-      if np.any(corrects1) and not np.any(corrects2):  # 1 is better
+      ctxs1 = data1[q_idx]['ctxs'][:topk]
+      ctxs2 = data2[q_idx]['ctxs'][:topk]
+      has_correct1 = has_correct2 = False
+      for ctx in ctxs1:
+        ctx['correct'] = has_answer(answers, ctx['text'], tokenizer)
+        has_correct1 |= ctx['correct']
+      for ctx in ctxs2:
+        ctx['correct'] = has_answer(answers, ctx['text'], tokenizer)
+        has_correct2 |= ctx['correct']
+      if has_correct1 and not has_correct2:  # 1 is better
         wins1 += 1
-        write_to_file(question, answers, title1, title2, docs1, docs2, scores1, scores2, corrects1, corrects2, fout1)
-      elif np.any(corrects2) and not np.any(corrects1):  # 2 is better
+        write_to_file(question, answers, ctxs1, ctxs2, fout1)
+      elif has_correct2 and not has_correct1:  # 2 is better
         wins2 += 1
-        write_to_file(question, answers, title1, title2, docs1, docs2, scores1, scores2, corrects1, corrects2, fout2)
+        write_to_file(question, answers, ctxs1, ctxs2, fout2)
     print(f'1 wins {wins1}, 2 wins {wins2}')
 
 
