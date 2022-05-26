@@ -237,7 +237,9 @@ if __name__ == "__main__":
           encoder_encoder_kl=opt.encoder_encoder_kl,
           decoder_attn_ctx_normalize=opt.decoder_attn_ctx_normalize,
           encoder_attention_pre_softmax=opt.encoder_attention_pre_softmax,
-          max_over_head=opt.max_over_head)
+          max_over_head=opt.max_over_head,
+          term_weight_parameter=opt.term_weight_parameter,
+          embedding_normalize=opt.embedding_normalize)
         if opt.init_from:
           logger.info(f'Init from {opt.init_from}')
           _model = model_class.from_pretrained(opt.init_from)

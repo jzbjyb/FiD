@@ -6,6 +6,7 @@
 
 import enum
 import logging
+from operator import index
 from re import I
 from typing import List, Tuple, Set, Union, Dict
 import time
@@ -25,7 +26,8 @@ class Indexer(object):
                n_bits: int = 8,
                hnsw_m: int = 0,
                cuda_device: Union[int, List[int]] = -1,
-               keep_raw_vector: bool = False):
+               keep_raw_vector: bool = False,
+               normalize: bool = False):
     self.cuda_device = cuda_device
     self.vector_sz = vector_sz
     self.n_subquantizers = n_subquantizers
@@ -33,6 +35,7 @@ class Indexer(object):
     self.hnsw_m = hnsw_m
     self.keep_raw_vector = keep_raw_vector
     self.shard = False  # shard index across multiple gpus
+    self.normalize = normalize
     self.create_index()
     self.ids = np.empty((0), dtype=str)
     self.texts = np.empty((0), dtype=str)
@@ -43,7 +46,7 @@ class Indexer(object):
       emb_files: List[str], 
       index_name: str = None):
     root_dir = Path(emb_files[0]).parent
-    if index_name is not None and (root_dir / '{index_name}.faiss').exists():
+    if index_name is not None and (root_dir / f'{index_name}.faiss').exists():
       self.deserialize_from(root_dir, index_name=index_name)
     else:
       logger.info(f'indexing passages from files {emb_files}')
@@ -143,6 +146,8 @@ class Indexer(object):
       if texts is not None:
         assert len(ids) == len(texts)
       embeddings = embeddings.astype('float32')
+      if self.normalize:
+        embeddings = embeddings / np.linalg.norm(embeddings, axis=-1, keepdims=True)
       if not self.index.is_trained:
         self.index.train(embeddings)
       if indexing_batch_size is None:
@@ -207,7 +212,10 @@ class Indexer(object):
                  query_vectors: np.array,
                  top_docs: int,
                  batch_size: int = 1024,
-                 return_external_id: bool = True) -> List[Tuple[List[Union[str, int]], List[float], List[str]]]:
+                 return_external_id: bool = True,
+                 term_weights: np.array = None) -> List[Tuple[List[Union[str, int]], List[float], List[str]]]:
+    if term_weights is not None:
+      assert term_weights.shape[0] == query_vectors.shape[0]
     query_vectors = query_vectors.astype('float32')
     result = []
     nbatch = (len(query_vectors) - 1) // batch_size + 1
@@ -216,14 +224,13 @@ class Indexer(object):
       end_idx = min((k + 1) * batch_size, len(query_vectors))
       q = query_vectors[start_idx:end_idx]
       scores, indices = self.index.search(q, top_docs)
+      if term_weights is not None:
+        scores = scores * np.expand_dims(term_weights[start_idx:end_idx], axis=-1)
       # convert to external ids
       ext_ids = [self.ids[_indices] for _indices in indices]
       # get text
       texts = [(self.texts[_indices] if len(self.texts) else None) for _indices in indices]
-      if return_external_id:
-        result.extend([(ext_ids[i], scores[i], texts[i]) for i in range(len(indices))])
-      else:
-        result.extend([(indices[i], scores[i], texts[i]) for i in range(len(indices))])
+      result.extend([(ext_ids[i] if return_external_id else indices[i], scores[i], texts[i]) for i in range(len(indices))])
     return result
   
   def get_by_ids_by_mask(self, ids: List[str]):
@@ -265,23 +272,25 @@ class MultiIndexer(object):
       emb_files: List[str], 
       index_name: str = None):
     # group files by idx
-    hi2files: Dict[int, List[str]] = defaultdict(list)
+    ii2files: Dict[int, List[str]] = defaultdict(list)
     for f in sorted(emb_files):
-      hi2files[int(f.rsplit('.', 2)[-2])].append(f)
-    assert len(hi2files) >= len(self.indices), 'embedding files are not enought'
+      ii2files[int(f.rsplit('.', 2)[-2])].append(f)
+    assert len(ii2files) >= len(self.indices), 'embedding files are not enought'
     # load files for each idx
-    for hi, index in enumerate(self.indices):
-      _index_name = index_name + f'.{hi:02d}' if index_name is not None else None
-      index.load_from_npz(hi2files[hi], index_name=_index_name)
+    for ii, index in enumerate(self.indices):
+      _index_name = index_name + f'.{ii:02d}' if index_name is not None else None
+      index.load_from_npz(ii2files[ii], index_name=_index_name)
   
-  def search_knn(self, *args, **kwargs) -> List[Tuple[List[Union[str, int]], List[float], List[str]]]:
+  def search_knn(self, query_vectors, *args, term_weights=None, **kwargs) -> List[Tuple[List[Union[str, int]], List[float], List[str]]]:
     result_li = []
     return_external_id = True
     if 'return_external_id' in kwargs:
       return_external_id = kwargs['return_external_id']
       del kwargs['return_external_id']
-    for _, index in enumerate(self.indices):
-      result_li.append(index.search_knn(*args, return_external_id=False, **kwargs))  # return raw id
+    assert query_vectors.shape[0] == len(self.indices)
+    for ii, index in enumerate(self.indices):
+      tw = term_weights[ii] if term_weights is not None else None
+      result_li.append(index.search_knn(query_vectors[ii], *args, return_external_id=False, term_weights=tw, **kwargs))  # return raw id
     # perform max aggregation
     merged_result = []
     for i in range(len(result_li[0])):
@@ -312,5 +321,5 @@ class MultiIndexer(object):
       if flat_dids is not None:
         assert len(flat_dids) == len(_flat_dids)
       flat_dids = _flat_dids
-    flat_embs = np.stack(flat_embs, axis=1)  # (num_embs, num_indices, emb_size)
+    flat_embs = np.stack(flat_embs, axis=0)  # (num_indices, num_embs, emb_size)
     return flat_embs, flat_dids

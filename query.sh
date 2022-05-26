@@ -111,6 +111,5 @@ python ${prefix} retrieval.py \
   --hnsw_m 0 \
   --token_topk ${token_topk} \
   --doc_topk ${doc_topk} \
-  --save_or_load_index \
   --files_per_run ${files_per_run} \
   ${rerank} ${head_idx} ${faiss_gpus} ${extra} ${max_over_head}

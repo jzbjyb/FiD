@@ -603,6 +603,8 @@ class FiDT5Config(transformers.T5Config):
                encoder_encoder_kl_sparsity: int = 0,
                decoder_attn_ctx_normalize: bool = False,
                max_over_head: bool = False,
+               term_weight_parameter: bool = False,
+               embedding_normalize: bool = False,
                **kwargs):
     super().__init__(*args, **kwargs)
     self.n_layer_two_tower = n_layer_two_tower
@@ -632,6 +634,8 @@ class FiDT5Config(transformers.T5Config):
     self.encoder_encoder_kl_sparsity = encoder_encoder_kl_sparsity
     self.decoder_attn_ctx_normalize = decoder_attn_ctx_normalize
     self.max_over_head = max_over_head
+    self.term_weight_parameter = term_weight_parameter
+    self.embedding_normalize = embedding_normalize
 
 class FiDT5(transformers.T5ForConditionalGeneration):
     config_class = FiDT5Config
@@ -675,7 +679,9 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 encoder_encoder_kl: str = None,
                 encoder_encoder_kl_sparsity: int = 0,
                 decoder_attn_ctx_normalize: bool = False,
-                max_over_head: bool = False):
+                max_over_head: bool = False,
+                term_weight_parameter: bool = False,
+                embedding_normalize: bool = False):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
@@ -705,6 +711,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           encoder_encoder_kl_sparsity=encoder_encoder_kl_sparsity,
           decoder_attn_ctx_normalize=decoder_attn_ctx_normalize,
           max_over_head=max_over_head,
+          term_weight_parameter=term_weight_parameter,
+          embedding_normalize=embedding_normalize,
           **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
@@ -782,11 +790,14 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                      max_query_len: int = None,
                      random_position: bool = False):
         self.encoder(input_ids=input_ids, attention_mask=attention_mask, direct=True)
-        # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head)
-        query_embedding = self.encoder.get_collected_for_retrieval()['query_states']
+        collect = self.encoder.get_collected_for_retrieval()
+        query_embedding = collect['query_states']  # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head)
+        term_weights = collect['term_weights'] if 'term_weights' in collect else None  # (num_queries, n_layer, n_heads, seq_len)
         if self.config.keep_ctx_in_decoder_with_head is not None:
           hi = self.config.keep_ctx_in_decoder_with_head
           query_embedding = query_embedding[:, :, hi:hi + 1]  # (num_queries, n_layer, 1 (n_heads), seq_len, emb_size_per_head)
+          if term_weights is not None:
+            term_weights = term_weights[:, :, hi:hi + 1]  # (num_queries, n_layer, 1 (n_heads), seq_len)
         if max_query_len:
           num_queries, n_layer, n_heads, seq_len = query_embedding.size()[:4]
           assert seq_len <= max_query_len
@@ -804,7 +815,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head + max_query_len)
           query_embedding = torch.cat(
             [query_embedding, one_hot.unsqueeze(1).unsqueeze(1).repeat(1, n_layer, n_heads, 1, 1)], dim=-1)
-        return query_embedding
+        return query_embedding, term_weights
 
     # We need to resize the inputs here, as the generate method expect 2D tensors
     def generate(self, input_ids, attention_mask, attention_separate_mask=None, max_length=None, **kwargs):
@@ -869,7 +880,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         self.wrap_decoder(self.config)
 
     def load_from(self, model):
-      self.encoder.load_state_dict(model.encoder.state_dict())
+      self.encoder.load_state_dict(model.encoder.state_dict(), strict=False)
       if type(self.decoder) == type(model.decoder) == DecoderWrapper:
         self.decoder.load_state_dict(model.decoder.state_dict())
       else:
@@ -1406,6 +1417,8 @@ class T5blockWrapper(torch.nn.Module):
         self.use_for_retrieval = use_for_retrieval
         self.bi_encoder_forward = bi_encoder_forward
         self.retrieval_aggregation_method = config.retrieval_aggregation_method
+        self.term_weight_parameter = config.term_weight_parameter
+        self.embedding_normalize = config.embedding_normalize
         self.max_over_head = config.max_over_head
         self.in_batch_negative = config.in_batch_negative
         self.in_batch_negative_size = config.in_batch_negative_size
@@ -1419,6 +1432,11 @@ class T5blockWrapper(torch.nn.Module):
         self.num_heads = config.num_heads
         self.n_layer_two_tower = config.n_layer_two_tower
         self.need_collect = FiDT5.need_wrap_decoder(config) or bool(config.encoder_encoder_kl_ratio)
+        self.term_weight_linear = None
+        if self.use_for_retrieval and self.need_collect and self.term_weight_parameter:
+          self.term_weight_linear = nn.Linear(config.d_kv, 1, bias=True)
+          nn.init.constant_(self.term_weight_linear.weight, 0.0)
+          nn.init.constant_(self.term_weight_linear.bias, 0.0)
 
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
         # register callback for retrieval
@@ -1434,7 +1452,9 @@ class T5blockWrapper(torch.nn.Module):
                     field='query',
                     use_hidden_states=False,
                     n_context=self.n_passages if hasattr(self, 'n_passages') else None,
-                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower, self.max_over_head)), reg_point.SelfAttention)
+                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower, self.max_over_head),
+                    term_weight_linear=self.term_weight_linear,
+                    embedding_normalize=self.embedding_normalize), reg_point.SelfAttention)
             if self.in_batch_negative and self.training:
               reg_point.SelfAttention.in_batch_negative = types.MethodType(functools.partial(
                 in_batch_negative, n_context=self.n_passages, in_batch_negative_size=self.in_batch_negative_size,
@@ -1639,13 +1659,14 @@ def encoder_decoder_kl(
 
 def aggregate_attention(
      self,
-     scores: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, seq_len)
-     attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
+     scores: torch.FloatTensor,  # (bs, n_heads, seq_len, seq_len)
+     attention_mask: torch.BoolTensor,  # (bs, seq_len, seq_len)
      field: str,
      aggregation_method: str,
      max_over_head: bool = False,
      use_head_idx: int = None,
-     n_heads: int = None):
+     n_heads: int = None,
+     term_weights: torch.FloatTensor = None):  # (bs, n_heads, seq_len)
   pad_mask = attention_mask.max(1)[0]  # (bs, seq_len)
   query_field_mask = attention_mask[:, 0]  # (bs, seq_len)
   doc_field_mask = attention_mask[:, -1]  # (bs, seq_len)
@@ -1691,7 +1712,10 @@ def aggregate_attention(
     raise NotImplementedError
 
   if query_agg == 'avg':
-    scores = (scores * field_mask.unsqueeze(1)).sum(-1) / field_mask.unsqueeze(1).sum(-1)  # (bs, n_heads)
+    if term_weights is not None:
+      scores = (scores * term_weights).sum(-1)
+    else:
+      scores = (scores * field_mask.unsqueeze(1)).sum(-1) / field_mask.unsqueeze(1).sum(-1)  # (bs, n_heads)
   elif query_agg == 'maxsp':
     assert key_agg == 'maxsp', 'maxsp must be used consecutively'
     max_sparsify(scores, cross_mask, -2, inplace=True)  # (bs, n_heads, seq_len, seq_len)
@@ -1746,13 +1770,27 @@ def collect_for_retrieval(
      memory_bank_additional_encode: bool = False,
      pad_token_id: int = 0,
      bi_encoder_forward: Callable = None,
-     use_head_idx: int = None):
+     use_head_idx: int = None,
+     term_weight_linear: nn.Linear = None,
+     embedding_normalize: bool = False):
+    
+  def _get_term_weights(query_states, query_mask):  # (?, n_heads, seq_len, emb_size_per_head), (?, seq_len)
+    if term_weight_linear is None:
+      return None
+    weights = term_weight_linear(query_states)[:, :, :, 0]  # (?, n_heads, seq_len)
+    weights = torch.softmax(weights / 0.01 - (~query_mask.unsqueeze(1) * 1e5), dim=-1)  # (?, n_heads, seq_len)
+    #weights = weights * query_mask.unsqueeze(1)
+    return weights
+
   self.retrieval = {
     'scores': scores,
-    'query_states': query_states,
-    'key_states': key_states,
+    'query_states': F.normalize(query_states, dim=-1, p=2) if embedding_normalize else query_states,
+    'key_states': F.normalize(key_states, dim=-1, p=2) if embedding_normalize else key_states,
     'value_states': value_states,
     'preprocessed_mask': preprocessed_mask}
+  term_weights = _get_term_weights(query_states, attention_mask[:, 0])
+  if term_weights is not None:
+    self.retrieval['term_weights'] = term_weights
   if hasattr(self, 'just_collect') and self.just_collect:  # collect some tensors
     return
 
@@ -1772,12 +1810,20 @@ def collect_for_retrieval(
         doc_mask = _attention_mask[:, -1, min_qry_len:]  # (<=(n_gpu * bs)^2 * n_context, seq_len - min_qry_len)
         _query_states = _query_states[:, :, :max_qry_len]  # (<=(n_gpu * bs)^2 * n_context, n_heads, max_qry_len, emb_size_per_head)
         _key_states = _key_states[:, :, min_qry_len:]  # (<=(n_gpu * bs)^2 * n_context, n_heads, seq_len - min_qry_len, emb_size_per_head)
+        if term_weight_linear is not None:
+          term_weights = _get_term_weights(_query_states, query_mask)  # (<=(n_gpu * bs)^2 * n_context, n_heads, max_qry_len)
+          WandbLogger.log_w_step({'term-weights': torch.sort(term_weights[0, 0], descending=True)[0][:10]})
+        if embedding_normalize:
+          _query_states = F.normalize(_query_states, dim=-1, p=2)
+          _key_states = F.normalize(_key_states, dim=-1, p=2)
         # (<=(n_gpu * bs)^2 * n_context, n_heads, max_qry_len, seq_len - min_qry_len)
         scores = torch.matmul(_query_states, _key_states.transpose(3, 2))
         if use_head_idx is not None:
           scores = scores + position_bias[:, use_head_idx:use_head_idx + 1, :max_qry_len, min_qry_len:]
         else:
           scores = scores + position_bias[:, :, :max_qry_len, min_qry_len:]
+        if term_weight_linear is not None:
+          scores = (scores * term_weights.unsqueeze(-1))
         if max_over_head:
           assert use_head_idx is None
           scores, max_head_idx = scores.max(1, keepdim=True)  
@@ -1789,7 +1835,10 @@ def collect_for_retrieval(
           max_head_idx = torch.gather(max_head_idx, -1, max_doc_tok_idx.unsqueeze(-1))  # (<=(n_gpu * bs)^2 * n_context, 1, max_qry_len, 1)
           max_head_idx, max_head_count = torch.unique_consecutive(max_head_idx.view(-1).sort().values, return_counts=True)  # (<=n_heads,)
           WandbLogger.log_w_step({'max-over-head': (max_head_idx, max_head_count)})
-        scores = (scores * query_mask.unsqueeze(1)).sum(-1) / query_mask.unsqueeze(1).sum(-1)  # (<=(n_gpu * bs)^2 * n_context, n_heads)
+        if term_weight_linear is not None:
+          scores = (scores * query_mask.unsqueeze(1)).sum(-1)
+        else:
+          scores = (scores * query_mask.unsqueeze(1)).sum(-1) / query_mask.unsqueeze(1).sum(-1)  # (<=(n_gpu * bs)^2 * n_context, n_heads)
         if use_head_idx is not None:
           scores = torch.cat([torch.zeros_like(scores).repeat(1, use_head_idx), scores,
                               torch.zeros_like(scores).repeat(1, n_heads - use_head_idx - 1)], dim=1)
@@ -1803,12 +1852,15 @@ def collect_for_retrieval(
           scores = scores + position_bias
         aggregate_attention(
           self, scores, _attention_mask,
-          field=field, aggregation_method=aggregation_method, max_over_head=max_over_head, use_head_idx=use_head_idx, n_heads=n_heads)
+          field=field, aggregation_method=aggregation_method, max_over_head=max_over_head, 
+          use_head_idx=use_head_idx, n_heads=n_heads, term_weights=_get_term_weights(_query_states, _attention_mask[:, 0]))
         scores_li.append(self.retrieval['two_tower_attn_score'])
     self.retrieval['two_tower_attn_score'] = torch.cat(scores_li, dim=0)
     return
 
   if memory_bank is not None:
+    if term_weight_linear is not None:
+      raise NotImplementedError
     assert use_head_idx is not None  # TODO: add multi-head?
     n_heads, seq_len, emb_size = key_states.size()[1:]
     # (bs, n_context, seq_len, emb_size_per_head)
@@ -1922,7 +1974,7 @@ def collect_for_retrieval(
 
   aggregate_attention(
     self, scores, attention_mask,
-    field=field, aggregation_method=aggregation_method, max_over_head=max_over_head)
+    field=field, aggregation_method=aggregation_method, max_over_head=max_over_head, term_weights=term_weights)
 
 def cross_combine(values,  # (query_dim, doc_dim, seq_len, ...)
                   sep_lens,  # (query_dim)

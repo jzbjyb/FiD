@@ -101,6 +101,8 @@ class Options():
                                  help='compute decoder-attention for docs from memory bank')
         self.parser.add_argument('--memory_bank_gpu', type=str, default=None, help='gpu index connected by , used for memory bank')
         self.parser.add_argument('--max_over_head', action='store_true', help='max over all attention heads in aggregation')
+        self.parser.add_argument('--term_weight_parameter', action='store_true', help='use additional parameters to learn term weight')
+        self.parser.add_argument('--embedding_normalize', action='store_true', help='normalize embedding before computing the bi-encoder score')
 
     def add_retriever_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')

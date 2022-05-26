@@ -18,6 +18,7 @@ import pickle
 from multiprocessing import Queue, Process
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from transformers import T5Tokenizer, DPRContextEncoderTokenizer, DPRContextEncoder, \
   DPRQuestionEncoderTokenizer, DPRQuestionEncoder
@@ -33,28 +34,103 @@ sys.path.insert(0, f'{Path.home()}/exp/ColBERT')
 from colbert.infra import Run, RunConfig, ColBERTConfig
 from colbert.modeling.checkpoint import Checkpoint
 
-def flatten_embedding(
-     embeddings,  # (bs, n_layer, n_heads, seq_len, emb_size_per_head)
-     input_ids,  # (bs, seq_len)
-     attention_mask,  # (bs, seq_len)
-     ids,  # (bs,)
-     results: Dict[str, List],
-     head_idx: int = 0,
-     max_over_head: bool = False):
-  bs, _, num_heads, seq_len, emb_size_ph = embeddings.size()
-  # TODO: add support for multi-layer and multi-heads
-  # (num_tokens, emb_size_per_head)
-  if max_over_head:  # save all heads
-    for hi in range(num_heads):
-      results['embeddings'][hi].append(torch.masked_select(embeddings[:, 0, hi], attention_mask.unsqueeze(-1)).view(-1, emb_size_ph).cpu())
-  else:
-    results['embeddings'].append(torch.masked_select(embeddings[:, 0, head_idx], attention_mask.unsqueeze(-1)).view(-1, emb_size_ph).cpu())
-  results['words'].append(torch.masked_select(input_ids, attention_mask).cpu())  # (num_tokens,)
-  for i in range(bs):
-    num_toks = attention_mask[i].sum().item()
-    results['splits'].append((num_toks + results['splits'][-1]) if len(results['splits']) else num_toks)
-    for _ in range(num_toks):
-      results['ids'].append(ids[i])
+class EmbeddingAdapter:
+  def __init__(self, opt, config=None, logger = None):
+    self.opt = opt
+    self.num_heads = config.num_heads if config is not None else None
+    self.logger = logger
+    self.num_encoded = 0
+    self.save_count = 0
+    self._reinit_results()
+  
+  def __len__(self):
+    return len(self.results)
+
+  def _reinit_results(self):
+    self.results: Dict[str, List] = {
+      'ids': [], 
+      'embeddings': [[] for _ in range(self.num_heads)] if self.opt.max_over_head else [], 
+      'term_weights': [[] for _ in range(self.num_heads)] if self.opt.max_over_head else [], 
+      'words': [], 
+      'splits': []}
+  
+  def save(self, flush: bool = False):
+    want_save = (flush and len(self)) or (self.opt.save_every_n_doc and self.num_encoded_doc >= self.opt.save_every_n_doc)
+    need_save = len(self) > 0
+    if want_save and need_save:
+      self.results['words'] = torch.cat(self.results['words'], dim=0).numpy()
+      self.results['ids'] = np.array(self.results['ids'], dtype=str)
+      self.results['splits'] = np.array(self.results['splits'], dtype=int)
+      if self.opt.max_over_head:
+        for hi, emb in enumerate(self.results['embeddings']):  # save emb of each head in a separate file
+          emb = torch.cat(emb, dim=0).numpy()
+          out_file = self.opt.output_path / f'embedding_{self.opt.shard_id:02d}_{self.save_count:03d}.{hi:02d}.npz'
+          self.logger.info(f'saving {len(self.results["ids"])} embeddings to {out_file}')
+          with open(out_file, mode='wb') as f:
+            np.savez_compressed(f, embeddings=emb, **{k: self.results[k] for k in self.results if k != 'embeddings'})
+      else:
+        self.results['embeddings'] = torch.cat(self.results['embeddings'], dim=0).numpy()
+        out_file = self.opt.output_path / f'embedding_{self.opt.shard_id:02d}_{self.save_count:03d}.npz'
+        self.logger.info(f'saving {len(self.results["ids"])} embeddings to {out_file}')
+        with open(out_file, mode='wb') as f:
+          np.savez_compressed(f, **self.results)
+      self._reinit_results()
+    if want_save:
+      self.num_encoded = 0
+      self.save_count += 1
+  
+  def add_by_flatten(
+      self,
+      embeddings,  # (bs, n_layer, n_heads, seq_len, emb_size_per_head)
+      input_ids,  # (bs, seq_len)
+      attention_mask,  # (bs, seq_len)
+      ids,  # (bs,)
+      term_weights = None):  # (bs, n_layer, n_heads, seq_len)
+    self.num_encoded += input_ids.size(0)
+    bs, _, num_heads, seq_len, emb_size_ph = embeddings.size()
+    # TODO: add support for multi-layer and multi-heads
+    # (num_tokens, emb_size_per_head)
+    if self.opt.max_over_head:  # save all heads
+      for hi in range(num_heads):
+        self.results['embeddings'][hi].append(torch.masked_select(embeddings[:, 0, hi], attention_mask.unsqueeze(-1)).view(-1, emb_size_ph).cpu())
+        if term_weights is not None:
+          self.results['term_weights'][hi].append(torch.masked_select(term_weights[:, 0, hi], attention_mask).flatten().cpu())
+    else:
+      self.results['embeddings'].append(torch.masked_select(embeddings[:, 0, self.opt.head_idx], attention_mask.unsqueeze(-1)).view(-1, emb_size_ph).cpu())
+      if term_weights is not None:
+        self.results['term_weights'].append(torch.masked_select(term_weights[:, 0, self.opt.head_idx], attention_mask).flatten().cpu())
+    self.results['words'].append(torch.masked_select(input_ids, attention_mask).cpu())  # (num_tokens,)
+    for i in range(bs):
+      num_toks = attention_mask[i].sum().item()
+      self.results['splits'].append((num_toks + self.results['splits'][-1]) if len(self.results['splits']) else num_toks)
+      for _ in range(num_toks):
+        self.results['ids'].append(ids[i])
+  
+  def add_directly(
+      self,
+      embeddings,  # (bs, emb_size)
+      input_ids,  # (bs, seq_len)
+      ids):  # (bs,)
+    self.num_encoded += input_ids.size(0)
+    self.results['embeddings'].append(embeddings.cpu())
+    self.results['words'].append(input_ids[:, 0].cpu())  # TODO: store text
+    self.results['ids'].extend(ids)
+
+  def add_dummy(self, count: int):
+    self.num_encoded += count
+  
+  def prepare_query(self):
+    if self.opt.max_over_head:
+      self.results['embeddings'] = torch.stack([torch.cat(embs, dim=0) for embs in self.results['embeddings']], dim=0).numpy()  # (num_heads, num_query_tokens_in_total, emb_size)
+      if len(self.results['term_weights'][0]):
+        self.results['term_weights'] = torch.stack([torch.cat(tw, dim=0) for tw in self.results['term_weights']], dim=0).numpy()  # (num_heads, num_query_tokens_in_total)
+    else:
+      self.results['embeddings'] = torch.cat(self.results['embeddings'], dim=0).numpy()  # (num_query_tokens_in_total, emb_size)
+      if len(self.results['term_weights']):
+        self.results['term_weights'] = torch.cat(self.results['term_weights'], dim=0).numpy()  # (num_query_tokens_in_total)
+    self.results['words'] = torch.cat(self.results['words'], dim=0).numpy()
+    self.results['ids'] = np.array(self.results['ids'], dtype=str)
+    self.results['splits'] = np.array(self.results['splits'], dtype=int)
 
 def encode_context(
      opt,
@@ -67,37 +143,11 @@ def encode_context(
   collator = src.data.TextCollator(tokenizer, opt.passage_maxlength)
   dataset = src.data.ContextDataset(passages)
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=opt.num_workers, collate_fn=collator)
+  adapter = EmbeddingAdapter(opt, model.config if opt.model_type == 'fid' else None, logger)
   
-  def _init_results():
-    results: Dict[str, List] = {'ids': [], 'embeddings': [[] for _ in range(model.config.num_heads)] if opt.max_over_head else [], 'words': [], 'splits': []}
-    return results
-  
-  results = _init_results()
-  num_encoded_doc = 0
-  save_count = 0
-  
-  def _save():
-    results['words'] = torch.cat(results['words'], dim=0).numpy()
-    results['ids'] = np.array(results['ids'], dtype=str)
-    results['splits'] = np.array(results['splits'], dtype=int)
-    if opt.max_over_head:
-      for hi, emb in enumerate(results['embeddings']):  # save emb of each head in a separate file
-        emb = torch.cat(emb, dim=0).numpy()
-        out_file = opt.output_path / f'embedding_{opt.shard_id:02d}_{save_count:03d}.{hi:02d}.npz'
-        logger.info(f'saving {len(results["ids"])} embeddings to {out_file}')
-        with open(out_file, mode='wb') as f:
-          np.savez_compressed(f, embeddings=emb, **{k: results[k] for k in results if k != 'embeddings'})
-    else:
-      results['embeddings'] = torch.cat(results['embeddings'], dim=0).numpy()
-      out_file = opt.output_path / f'embedding_{opt.shard_id:02d}_{save_count:03d}.npz'
-      logger.info(f'saving {len(results["ids"])} embeddings to {out_file}')
-      with open(out_file, mode='wb') as f:
-        np.savez_compressed(f, **results)
-
   with torch.no_grad():
     for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
-      num_encoded_doc += input_ids.size(0)
-      need_compute = save_count >= opt.start_from
+      need_compute = adapter.save_count >= opt.start_from
       if need_compute:  # compute embedding
         input_ids = input_ids.to(device)
         attention_mask = attention_mask.to(device)
@@ -107,7 +157,7 @@ def encode_context(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_query_len=opt.query_maxlength if opt.use_position_bias else None)
-          flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx, max_over_head=opt.max_over_head)
+          adapter.add_by_flatten(embeddings, input_ids, attention_mask, ids)
         elif opt.model_type == 'colbert':
           # (num_docs, seq_len, emb_size)
           embeddings, input_ids, attention_mask = model.docFromText(
@@ -116,27 +166,33 @@ def encode_context(
             return_more=True)
           embeddings = embeddings.unsqueeze(1).unsqueeze(1)
           attention_mask = attention_mask.bool()
-          flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=0)
+          adapter.add_by_flatten(embeddings, input_ids, attention_mask, ids)
         elif opt.model_type == 'dpr':
           # (num_docs, emb_size)
           embeddings = model(input_ids=input_ids, attention_mask=attention_mask).pooler_output
-          results['embeddings'].append(embeddings.cpu())
-          results['words'].append(input_ids[:, 0].cpu())  # TODO: store text
-          results['ids'].extend(ids)
-          # TODO: add splits?
+          adapter.add_directly(embeddings, input_ids, ids)
         else:
           raise NotImplementedError
-      if opt.save_every_n_doc and num_encoded_doc >= opt.save_every_n_doc:  # output
-        if need_compute:
-          _save()
-          results = _init_results()
-        save_count += 1
-        num_encoded_doc = 0
-    if len(results['ids']) > 0:
-      _save()
-      results = _init_results()
-      save_count += 1
-      num_encoded_doc = 0
+      else:
+        adapter.add_dummy(input_ids.size(0))
+      adapter.save()
+    adapter.save(flush=True)
+
+def colbert_augmentation_postprocess(
+    embeddings,  # (bs, seq_len, emb_size)
+    input_ids,  # (bs, seq_len)
+    attention_mask):  # (bs, seq_len)  
+  attention_mask = attention_mask.to(embeddings.device)
+  input_ids = input_ids.to(embeddings.device)
+  bs, sl, es = embeddings.size()
+  sim_mat = embeddings @ embeddings.permute(0, 2, 1)  # (bs, seq_len, seq_len)
+  sim_mat = sim_mat - (attention_mask.unsqueeze(-1) | ~attention_mask.unsqueeze(1)) * 1e5
+  ind = sim_mat.max(-1)[1]  # (bs, seq_len)
+  emb_selected = torch.gather(embeddings.repeat(1, sl, 1).view(bs, sl, sl, es), 2, ind.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 1, es)).view(bs, sl, es)  # (bs, seq_len, emb_size)
+  emb_selected = attention_mask.unsqueeze(-1) * embeddings + ~attention_mask.unsqueeze(-1) * emb_selected
+  input_ids_selected = torch.gather(input_ids.repeat(1, sl).view(bs, sl, sl), 2, ind.unsqueeze(-1)).view(bs, sl)  # (bs, seq_len)
+  input_ids_selected = attention_mask * input_ids + ~attention_mask * input_ids_selected
+  return emb_selected, input_ids_selected
 
 def encode_query_and_search(
      opt,
@@ -147,51 +203,54 @@ def encode_query_and_search(
      debug: bool = False) -> Dict[str, List[Tuple[str, float]]]:
   device = model.device
   batch_size = opt.per_gpu_batch_size
-  collator = src.data.TextCollator(tokenizer, opt.query_maxlength, augmentation=opt.augmentation)
+  collator = src.data.TextCollator(tokenizer, opt.query_maxlength, augmentation=opt.augmentation if opt.model_type == 'fid' else None)
   dataset = src.data.QuestionDataset(queries)
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=opt.num_workers, collate_fn=collator)
   qid2rank: Dict[str, List[Tuple[str, float]]] = {}
   with torch.no_grad():
     for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
-      results: Dict[str, List] = {'ids': [], 'embeddings': [], 'words': [], 'splits': []}
+      # generate query embeddings
+      adapter = EmbeddingAdapter(opt, model.config if opt.model_type == 'fid' else None)
       input_ids = input_ids.to(device)
       attention_mask = attention_mask.to(device)
       if opt.model_type == 'fid':
         # (num_queries, n_layer, n_heads, seq_len, emb_size_per_head)
-        embeddings = model.encode_query(
+        embeddings, term_weights = model.encode_query(
           input_ids=input_ids,
           attention_mask=attention_mask,
           max_query_len=opt.query_maxlength if opt.use_position_bias else None)
-        flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=opt.head_idx)
+        if opt.normalize:
+          #norm = (embeddings * embeddings).sum(-1).sqrt()[:, 0, opt.head_idx].var(dim=-1).mean()
+          embeddings = F.normalize(embeddings, dim=-1, p=2)
+        adapter.add_by_flatten(embeddings, input_ids, attention_mask, ids, term_weights=term_weights)
       elif opt.model_type == 'dpr':
         # (num_queries, emb_size)
         embeddings = model(input_ids=input_ids, attention_mask=attention_mask).pooler_output
-        results['embeddings'].append(embeddings.cpu())
-        results['words'].append(input_ids[:, 0].cpu())  # TODO: store text
-        results['ids'].extend(ids)
+        adapter.add_directly(embeddings, input_ids, ids)
       elif opt.model_type == 'colbert':
         # (num_docs, seq_len, emb_size)
         embeddings, input_ids, attention_mask = model.queryFromText(texts, return_more=True)
-        embeddings = embeddings.unsqueeze(1).unsqueeze(1)
         attention_mask = attention_mask.bool()
-        flatten_embedding(embeddings, input_ids, attention_mask, ids, results=results, head_idx=0)
+        if opt.augmentation == 'mask-select':
+          embeddings, input_ids = colbert_augmentation_postprocess(embeddings, input_ids, attention_mask)
+        if opt.augmentation in {'mask', 'mask-select'}:  # colbert augmentation
+          attention_mask = torch.ones_like(attention_mask)
+        embeddings = embeddings.unsqueeze(1).unsqueeze(1)
+        adapter.add_by_flatten(embeddings, input_ids, attention_mask, ids)
       else:
         raise NotImplementedError
-      results['embeddings'] = torch.cat(results['embeddings'], dim=0).numpy()
-      results['words'] = torch.cat(results['words'], dim=0).numpy()
-      results['ids'] = np.array(results['ids'], dtype=str)
-      results['splits'] = np.array(results['splits'], dtype=int)
-
+      # search and aggregation
+      adapter.prepare_query()
       qid2did2score: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(lambda: 0))
       if opt.model_type in {'fid', 'colbert'}:
-        top_ids_and_scores = index.search_knn(results['embeddings'], opt.token_topk)
+        top_ids_and_scores = index.search_knn(adapter.results['embeddings'], opt.token_topk, term_weights=adapter.results['term_weights'] if opt.term_weights else None)
         qid2tokens2did2score: Dict[str, List[Dict[str, float]]] = defaultdict(list)
         for i, (docids, scores, texts) in enumerate(top_ids_and_scores):  # token-level scores
-          qid = results['ids'][i]
+          qid = adapter.results['ids'][i]
           qid2tokens2did2score[qid].append(defaultdict(lambda: -1e10))
           for did, score, text in zip(docids, scores, texts):
             if debug:
-              qword = tokenizer.convert_ids_to_tokens([results['words'][i]])[0]
+              qword = tokenizer.convert_ids_to_tokens([adapter.results['words'][i]])[0]
               dword = tokenizer.convert_ids_to_tokens([text])[0]
               print(qword, dword, score, did)
               input()
@@ -201,9 +260,9 @@ def encode_query_and_search(
             for did, score in token.items():
               qid2did2score[qid][did] += score
       elif opt.model_type == 'dpr':
-        top_ids_and_scores = index.search_knn(results['embeddings'], opt.doc_topk)
+        top_ids_and_scores = index.search_knn(adapter.results['embeddings'], opt.doc_topk)
         for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
-          qid = results['ids'][i]
+          qid = adapter.results['ids'][i]
           for did, score, text in zip(docids, scores, texts):
             qid2did2score[qid][did] = score
       else:
@@ -215,15 +274,32 @@ def encode_query_and_search(
           qid2rank[qid] = qid2rank[qid][:opt.doc_topk]
           continue
         dids = [did for did, _ in qid2rank[qid]][:opt.candidate_doc_topk]
-        flat_embs, flat_dids = index.get_by_ids(dids)  # (num_doc_tok_in_total, [num_heads,] emb_size), (num_doc_tok_in_total)
-        qry_embs = results['embeddings'][results['splits'][i - 1] if i else 0:results['splits'][i]]
-        qry_embs = torch.tensor(qry_embs).to(device)
+        flat_embs, flat_dids = index.get_by_ids(dids)  # ([num_heads,] num_doc_tok_in_total, emb_size), (num_doc_tok_in_total)
         flat_embs = torch.tensor(flat_embs).to(device)
         if opt.max_over_head:
-          ndt, nh, es = flat_embs.size()
-          sim_mat = (qry_embs @ flat_embs.view(-1, es).T).view(-1, ndt, nh).max(-1)[0]  # (num_qry_tok, num_doc_tok_in_total)
+          qry_embs = adapter.results['embeddings'][:, adapter.results['splits'][i - 1] if i else 0:adapter.results['splits'][i]]  # (num_heads, num_qry_tok, emb_size)
+          if opt.term_weights:
+            term_weights = adapter.results['term_weights'][:, adapter.results['splits'][i - 1] if i else 0:adapter.results['splits'][i]]  # (num_heads, num_qry_tok)
+        else:
+          qry_embs = adapter.results['embeddings'][adapter.results['splits'][i - 1] if i else 0:adapter.results['splits'][i]]  # (num_qry_tok, emb_size)
+          if opt.term_weights:
+            term_weights = adapter.results['term_weights'][adapter.results['splits'][i - 1] if i else 0:adapter.results['splits'][i]]  # (num_qry_tok,)
+        qry_words = adapter.results['words'][adapter.results['splits'][i - 1] if i else 0:adapter.results['splits'][i]]
+        qry_embs = torch.tensor(qry_embs).to(device)
+        if opt.term_weights:
+          term_weights = torch.tensor(term_weights).to(device)
+        if opt.max_over_head:
+          sim_mat = qry_embs @ flat_embs.permute(0, 2, 1)  # (num_heads, num_qry_tok, num_doc_tok_in_total)
+          if opt.term_weights:
+            sim_mat = sim_mat * term_weights.unsqueeze(-1)
+          sim_mat = sim_mat.max(0)[0]  # (num_qry_tok, num_doc_tok_in_total)
         else:
           sim_mat = (qry_embs @ flat_embs.T)  # (num_qry_tok, num_doc_tok_in_total)
+          if opt.term_weights:
+            #rint('\n'.join([f'{t} {s:.3f}' for t, s in zip(tokenizer.convert_ids_to_tokens(qry_words), term_weights.cpu().numpy().tolist())]), term_weights.sum(), end='\n\n')
+            #import time
+            #time.sleep(20)
+            sim_mat = sim_mat * term_weights.unsqueeze(-1)
         did2newdid: Dict[str, int] = {}
         newdid2did: Dict[int, str] = {}
         assert len(dids) == len(set(dids))
@@ -271,6 +347,8 @@ def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]]):
   main_device = torch.device(f'cuda:{cuda_device[0]}') if type(cuda_device) is list else torch.device(f'cuda:{cuda_device}')
   model, tokenizer = get_model_tokenizer(opt, is_querying=True)
   model = model.to(main_device)
+  # activate term weights based on model config
+  opt.term_weights = opt.model_type == 'fid' and model.config.term_weight_parameter
   # load query data
   queries = src.data.load_data(opt.queries)
   queries: List[Tuple[str, str]] = [(q['id'], q['question']) for q in queries]
@@ -287,6 +365,7 @@ def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]]):
       'n_bits': opt.n_bits, 
       'hnsw_m': opt.hnsw_m, 
       'keep_raw_vector': True, 
+      'normalize': opt.normalize,
       'cuda_device': cuda_device}
     if opt.max_over_head:
       index = src.index.MultiIndexer(num_indices=model.config.num_heads, **index_params)
@@ -300,6 +379,8 @@ def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]]):
       rank_file = opt.output_path / (f'qid2rank_{opt.token_topk}' + \
         (f'_{opt.candidate_doc_topk}' if opt.candidate_doc_topk else '') + \
         (f'_{opt.augmentation}' if opt.augmentation else '') + \
+        (f'_norm' if opt.normalize else '') + \
+        (f'_termweights' if opt.term_weights else '') + \
         (f'.{batch_index}' if batch_index >= 0 else '') + '.pkl')
     elif opt.model_type == 'dpr':
       rank_file = opt.output_path / f'qid2rank_{opt.doc_topk}.pkl'
@@ -400,10 +481,11 @@ if __name__ == '__main__':
   parser.add_argument('--faiss_gpus', type=str, default='-1', help='gpu indices for faiss or all')
   parser.add_argument('--use_position_bias', action='store_true', help='use position bias')
   parser.add_argument('--max_over_head', action='store_true', help='use all head and max to aggregate')
-  parser.add_argument('--augmentation', type=str, help='query augmentation', default=None, choices=[None, 'duplicate', 'mask'])
+  parser.add_argument('--augmentation', type=str, help='query augmentation', default=None, choices=[None, 'duplicate', 'mask', 'mask-select'])
   parser.add_argument('--save_every_n_doc', type=int, help='#doc to accumulate before saving. 0 means only saving after encoding all docs', default=0)
   parser.add_argument('--start_from', type=int, help='start from index which is used together with save_every_n_doc', default=0)
   parser.add_argument('--num_workers', type=int, help='#workers for dataloader', default=0)
+  parser.add_argument('--normalize', action='store_true', help='normalize query and doc embedding')
   args = parser.parse_args()
 
   src.slurm.init_distributed_mode(args)
