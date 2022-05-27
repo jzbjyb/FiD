@@ -578,6 +578,8 @@ def eval_answer(ret_file: str,
                 shuffle: bool = False,
                 topk: int = 100,
                 key_func: Callable = lambda x: x['score']):
+  tokenizer = SimpleTokenizer()
+  correlations = []
   with open(ret_file, 'r') as fin:
     data = json.load(fin)
     # aggregate ctx of the same query
@@ -589,11 +591,25 @@ def eval_answer(ret_file: str,
       query2example[example['question']]['ctxs'].extend(example['ctxs'])
     data = list(query2example.values())
     for example in data:
+      for ctx in example['ctxs']:
+        ctx['correct'] = has_answer(example['answers'], ctx['text'], tokenizer)
       if sort:
         example['ctxs'] = sorted(example['ctxs'], key=lambda x: float(key_func(x)), reverse=True)
       if shuffle:
         random.shuffle(example['ctxs'])
       example['ctxs'] = example['ctxs'][:topk]
+      if sort:
+        scores = list(map(lambda x: float(key_func(x)), example['ctxs']))
+      else:
+        scores = list(map(lambda x: x['score'], example['ctxs']))
+      corrects = np.array(list(map(lambda x: x['correct'], example['ctxs'])))
+      corrects_dist = corrects / (np.sum(corrects) or 1.0)
+      corr = scipy.stats.pearsonr(scores, corrects_dist)[0]
+      if not np.isnan(corr):
+        correlations.append(corr)
+      #print(list(zip(scores, corrects_dist)))
+      #input()
+    print(f'correlation: {np.mean(correlations)}')
     if beir_dir is not None:
       eval_retrieval(data, beir_dir, split=split)
     else:

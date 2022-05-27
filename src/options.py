@@ -103,6 +103,7 @@ class Options():
         self.parser.add_argument('--max_over_head', action='store_true', help='max over all attention heads in aggregation')
         self.parser.add_argument('--term_weight_parameter', action='store_true', help='use additional parameters to learn term weight')
         self.parser.add_argument('--embedding_normalize', action='store_true', help='normalize embedding before computing the bi-encoder score')
+        self.parser.add_argument('--use_gold_doc_dist', action='store_true', help='use gold document label distribution')
 
     def add_retriever_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')

@@ -57,14 +57,16 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             if step > opt.total_steps:
                 break
 
-            idx, labels, _, context_ids, context_mask, context_sep_mask, doc_ids = batch
+            idx, labels, _, context_ids, context_mask, context_sep_mask, doc_ids, gold_doc_dist = batch
             context_sep_mask = context_sep_mask.cuda() if context_sep_mask is not None else context_sep_mask
+            gold_doc_dist = gold_doc_dist.cuda() if gold_doc_dist is not None else gold_doc_dist
             train_loss = model(
                 input_ids=context_ids.cuda(),
                 attention_mask=context_mask.cuda(),
                 attention_separate_mask=context_sep_mask,
                 labels=labels.cuda(),
-                input_doc_ids=doc_ids
+                input_doc_ids=doc_ids,
+                gold_doc_dist=gold_doc_dist
             )[0]
             train_loss.backward()
 
@@ -116,7 +118,7 @@ def evaluate(model, dataset, tokenizer, collator, opt):
     model = model.module if hasattr(model, "module") else model
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
-            idx, _, _, context_ids, context_mask, context_sep_mask, _ = batch
+            idx, _, _, context_ids, context_mask, context_sep_mask, _, _ = batch
             context_sep_mask = context_sep_mask.cuda() if context_sep_mask is not None else context_sep_mask
             outputs = model.generate(
                 input_ids=context_ids.cuda(),
@@ -193,6 +195,7 @@ if __name__ == "__main__":
         global_rank=opt.global_rank, 
         world_size=opt.world_size,
         n_context=opt.n_context,
+        use_gold_doc_dist=opt.use_gold_doc_dist,
     )
     train_dataset = src.data.Dataset(train_examples, opt.n_context, augmentation=opt.augmentation)
     # use golbal rank and world size to split the eval set on multiple gpus
@@ -201,6 +204,7 @@ if __name__ == "__main__":
         global_rank=opt.global_rank,
         world_size=opt.world_size,
         n_context=opt.n_context,
+        use_gold_doc_dist=opt.use_gold_doc_dist,
     )
     if opt.eval_num_examples:
         eval_examples = eval_examples[:opt.eval_num_examples]
@@ -239,7 +243,8 @@ if __name__ == "__main__":
           encoder_attention_pre_softmax=opt.encoder_attention_pre_softmax,
           max_over_head=opt.max_over_head,
           term_weight_parameter=opt.term_weight_parameter,
-          embedding_normalize=opt.embedding_normalize)
+          embedding_normalize=opt.embedding_normalize,
+          use_gold_doc_dist=opt.use_gold_doc_dist)
         if opt.init_from:
           logger.info(f'Init from {opt.init_from}')
           _model = model_class.from_pretrained(opt.init_from)

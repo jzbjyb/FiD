@@ -43,7 +43,8 @@ def t5forconditionalgeneration_forward(
      output_attentions=None,
      output_hidden_states=None,
      return_dict=None,
-     input_doc_ids=None  # document identifiers 
+     input_doc_ids=None,  # document identifiers 
+     gold_doc_dist=None,  # gold document annotation
 ):
   r"""
   labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -135,6 +136,7 @@ def t5forconditionalgeneration_forward(
     output_attentions=output_attentions,
     output_hidden_states=output_hidden_states,
     return_dict=return_dict,
+    gold_doc_dist=gold_doc_dist,
   )
 
   sequence_output = decoder_outputs[0]
@@ -605,6 +607,7 @@ class FiDT5Config(transformers.T5Config):
                max_over_head: bool = False,
                term_weight_parameter: bool = False,
                embedding_normalize: bool = False,
+               use_gold_doc_dist: bool = False,
                **kwargs):
     super().__init__(*args, **kwargs)
     self.n_layer_two_tower = n_layer_two_tower
@@ -636,6 +639,7 @@ class FiDT5Config(transformers.T5Config):
     self.max_over_head = max_over_head
     self.term_weight_parameter = term_weight_parameter
     self.embedding_normalize = embedding_normalize
+    self.use_gold_doc_dist = use_gold_doc_dist
 
 class FiDT5(transformers.T5ForConditionalGeneration):
     config_class = FiDT5Config
@@ -681,7 +685,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 decoder_attn_ctx_normalize: bool = False,
                 max_over_head: bool = False,
                 term_weight_parameter: bool = False,
-                embedding_normalize: bool = False):
+                embedding_normalize: bool = False,
+                use_gold_doc_dist: bool = False):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
@@ -713,6 +718,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           max_over_head=max_over_head,
           term_weight_parameter=term_weight_parameter,
           embedding_normalize=embedding_normalize,
+          use_gold_doc_dist=use_gold_doc_dist,
           **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
@@ -1003,6 +1009,7 @@ class DecoderWrapper(torch.nn.Module):
     self.memory_bank_topk = config.memory_bank_topk
     self.memory_bank_additional_encode = config.memory_bank_additional_encode
     self.max_over_head = config.max_over_head
+    self.use_gold_doc_dist = config.use_gold_doc_dist
     if self.encoder_attention_pre_softmax and self.num_keep_ctx_in_decoder:
       raise NotImplementedError
     if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
@@ -1057,6 +1064,7 @@ class DecoderWrapper(torch.nn.Module):
        attention_mask=None,
        encoder_hidden_states=None,
        encoder_attention_mask=None,
+       gold_doc_dist=None,
        **kwargs):
     # fetch encoder importance
     # (num_q, num_d, num_layer, num_head, [num_toks]), (num_q, num_d, num_toks)
@@ -1142,6 +1150,7 @@ class DecoderWrapper(torch.nn.Module):
         encoder_decoder_kl,
         encoder_score=encoder_imp,
         encoder_score_mask=encoder_imp_tok_mask,
+        gold_doc_dist=gold_doc_dist,
         n_context=num_d,
         only_topk_n_context=self.only_topk_n_context,
         use_softmax=True,
@@ -1149,7 +1158,8 @@ class DecoderWrapper(torch.nn.Module):
         in_batch_negative=self.in_batch_negative and self.training,
         pairwise_loss=self.pairwise_loss,
         memory_bank_topk=self.memory_bank_topk if self.training else 0,
-        memory_bank_additional_encode=self.memory_bank_additional_encode if self.training else 0
+        memory_bank_additional_encode=self.memory_bank_additional_encode if self.training else 0,
+        use_gold_doc_dist=self.use_gold_doc_dist
       ), reg_point)
     else:
       raise NotImplementedError
@@ -1511,7 +1521,7 @@ def collect_cross_attention(
     # TODO: we sum over text_len to save space but is there any better workaround?
     s = scores.view(*(scores.size()[:3] + (n_context, -1)))  # (bs, n_heads, 1, n_context, text_len)
     m = mask.view(*(mask.size()[:3] + (n_context, -1)))  # (bs, n_heads or 1, 1, n_context, text_len)
-    s = (s * m).sum(-1) / m.sum(-1)  # (bs, n_heads, 1, n_context)
+    s = (s * m).sum(-1)  # (bs, n_heads, 1, n_context)
   else:
     s = scores
   if self.score_storage is None:
@@ -1542,7 +1552,9 @@ def encoder_decoder_kl(
      in_batch_negative: bool = False,
      pairwise_loss: str = None,
      memory_bank_topk: int = 0,
-     memory_bank_additional_encode: bool = False):
+     memory_bank_additional_encode: bool = False,
+     gold_doc_dist: torch.FloatTensor=None,  # (bs, n_context)
+     use_gold_doc_dist: bool = False):
   bs, _, _, enc_seq_len = decoder_score.size()
   has_token = encoder_score.dim() == 3
   use_memory_bank = memory_bank_topk and \
@@ -1579,6 +1591,11 @@ def encoder_decoder_kl(
   s = decoder_score.view(bs, n_context, -1)  # (bs, n_context, text_len)
   m = decoder_mask.view(bs, n_context, -1)  # (bs, n_context, text_len)
   s = (s * m).sum(-1)  # (bs, n_context)  # TODO: avg instead of sum since avg is used in final evaluation?
+
+  # use the gold distribution
+  if use_gold_doc_dist and gold_doc_dist is not None:
+    s = gold_doc_dist
+
   # kl
   kl_loss_func = torch.nn.KLDivLoss(reduction='batchmean')
   if use_softmax:

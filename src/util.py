@@ -292,7 +292,8 @@ def load_passages(
   restricted_ids: Set[str] = None, 
   use_csv_reader: bool = True, 
   as_numpy: bool = False, 
-  iterative: bool = False) -> List[Tuple[str, str, str]]:  # id, text, title
+  iterative: bool = False,
+  topk: int = None) -> List[Tuple[str, str, str]]:  # id, text, title
     if not os.path.exists(path):
         logger.info(f'{path} does not exist')
         return
@@ -324,6 +325,8 @@ def load_passages(
                     passages.append((did, text, title))
             except:
                 logger.warning(f'The following input line has not been correctly loaded: {row}')
+            if topk is not None and len(passages) >= topk:
+                break
         print()
     if not iterative:
         if as_numpy:

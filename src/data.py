@@ -10,6 +10,7 @@ import random
 import json
 import numpy as np
 from multiprocessing import Manager
+from src.evaluation import has_answer, SimpleTokenizer
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self,
@@ -186,6 +187,8 @@ class Collator(object):
 
     def __call__(self, batch):
         index = torch.tensor([ex['index'] for ex in batch])
+        scores = torch.stack([ex['scores'] for ex in batch], dim=0)
+        scores = scores / (scores.sum(-1, keepdim=True) + 1e-5)  # sum to one
 
         # decoder
         decoder_start_token = self.tokenizer.pad_token  # T5 uses pad as the start token of decoding
@@ -223,9 +226,15 @@ class Collator(object):
         # passage ids (from memory bank) 
         passage_idx: np.ndarray = np.array([example['passage_ids'] for example in batch], dtype=str)
         
-        return (index, target_ids, target_mask, passage_ids, passage_masks, passage_sep_masks, passage_idx)
+        return index, target_ids, target_mask, passage_ids, passage_masks, passage_sep_masks, passage_idx, scores
 
-def load_data(data_path=None, global_rank=-1, world_size=-1, n_context=None):
+def load_data(
+    data_path=None, 
+    global_rank=-1, 
+    world_size=-1, 
+    n_context=None, 
+    use_gold_doc_dist: bool = False):
+    tokenizer = SimpleTokenizer()
     assert data_path
     if data_path.endswith('.jsonl'):
         data = open(data_path, 'r')
@@ -238,14 +247,16 @@ def load_data(data_path=None, global_rank=-1, world_size=-1, n_context=None):
           if len(example['ctxs']) < n_context:
             continue
           example['ctxs'] = example['ctxs'][:n_context]
-        if global_rank > -1 and not k%world_size==global_rank:
+        if global_rank > -1 and not k % world_size==global_rank:
             continue
         if data_path is not None and data_path.endswith('.jsonl'):
             example = json.loads(example)
         if not 'id' in example:
             example['id'] = k
         for c in example['ctxs']:
-            if not 'score' in c:
+            if use_gold_doc_dist:
+                c['score'] = float(has_answer(example['answers'], c['text'], tokenizer))
+            elif not 'score' in c:
                 c['score'] = 1.0 / (k + 1)
         examples.append(example)
     ## egrave: is this needed?

@@ -55,7 +55,7 @@ class EmbeddingAdapter:
       'splits': []}
   
   def save(self, flush: bool = False):
-    want_save = (flush and len(self)) or (self.opt.save_every_n_doc and self.num_encoded_doc >= self.opt.save_every_n_doc)
+    want_save = (flush and len(self)) or (self.opt.save_every_n_doc and self.num_encoded >= self.opt.save_every_n_doc)
     need_save = len(self) > 0
     if want_save and need_save:
       self.results['words'] = torch.cat(self.results['words'], dim=0).numpy()

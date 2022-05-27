@@ -19,6 +19,8 @@ from src.options import Options
 import src.data
 import src.evaluation
 import src.model
+from src.util import global_context
+
 
 def evaluate(model, dataset, dataloader, tokenizer, opt):
     loss, curr_loss = 0.0, 0.0
@@ -34,7 +36,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
       if opt.write_results else None
     with src.util.open_file(write_path, 'a') as fw, torch.no_grad():
         for i, batch in tqdm(enumerate(dataloader), disable=not opt.is_main):
-            (idx, labels, _, context_ids, context_mask, context_sep_mask) = batch
+            idx, labels, _, context_ids, context_mask, context_sep_mask = batch[:6]
 
             if opt.write_crossattention_scores:
                 model.reset_score_storage()
@@ -105,6 +107,8 @@ if __name__ == "__main__":
     options.add_reader_options()
     options.add_eval_options()
     opt = options.parse()
+    global_context['opt'] = opt
+
     src.slurm.init_distributed_mode(opt)
     src.slurm.init_signal_handler()
     opt.train_batch_size = opt.per_gpu_batch_size * max(1, opt.world_size)
@@ -125,6 +129,7 @@ if __name__ == "__main__":
     collator_function = src.data.Collator(
         opt.text_maxlength,
         tokenizer,
+        answer_maxlength=opt.answer_maxlength,
         separate_query_passage=opt.attention_mask,
         query_in_decoder=opt.query_in_decoder)
     eval_examples = src.data.load_data(

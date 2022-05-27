@@ -82,7 +82,7 @@ for shard_id in $(seq 0 $((${num_shards} - 1))); do
       --per_gpu_batch_size ${passage_per_gpu_batch_size} \
       --passage_maxlength ${passage_maxlength} \
       --query_maxlength ${query_maxlength} \
-      ${head_idx} ${extra} ${max_over_head} &> ${output_path}/index${shard_id}.out &
+      ${head_idx} ${extra} ${max_over_head} &
   fi
 done
 wait
