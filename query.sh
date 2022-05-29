@@ -13,7 +13,7 @@ model_type=$1  # fid dpr colbert
 head_idx=""
 extra=""
 token_topk=0
-doc_topk=10
+doc_topk=100
 candidate_doc_topk=0
 faiss_gpus="--faiss_gpus all"
 rerank=""
@@ -72,6 +72,7 @@ elif [[ ${model_type} == 'colbert' ]]; then
   token_topk=$4
   candidate_doc_topk=$5
   index_dim=128
+  files_per_run=8
 
   get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 512
   output_path=${model_path}.index/${index_name}

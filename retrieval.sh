@@ -53,7 +53,6 @@ else
   exit 1
 fi
 
-mkdir -p ${output_path}
 for shard_id in $(seq 0 $((${num_shards} - 1))); do
   if (( ${num_shards} == 1 )); then
     python retrieval.py \

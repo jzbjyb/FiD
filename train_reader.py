@@ -244,7 +244,8 @@ if __name__ == "__main__":
           max_over_head=opt.max_over_head,
           term_weight_parameter=opt.term_weight_parameter,
           embedding_normalize=opt.embedding_normalize,
-          use_gold_doc_dist=opt.use_gold_doc_dist)
+          use_gold_doc_dist=opt.use_gold_doc_dist,
+          retrieval_projection=opt.retrieval_projection)
         if opt.init_from:
           logger.info(f'Init from {opt.init_from}')
           _model = model_class.from_pretrained(opt.init_from)

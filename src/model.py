@@ -608,6 +608,7 @@ class FiDT5Config(transformers.T5Config):
                term_weight_parameter: bool = False,
                embedding_normalize: bool = False,
                use_gold_doc_dist: bool = False,
+               retrieval_projection: str = None,
                **kwargs):
     super().__init__(*args, **kwargs)
     self.n_layer_two_tower = n_layer_two_tower
@@ -640,6 +641,7 @@ class FiDT5Config(transformers.T5Config):
     self.term_weight_parameter = term_weight_parameter
     self.embedding_normalize = embedding_normalize
     self.use_gold_doc_dist = use_gold_doc_dist
+    self.retrieval_projection = retrieval_projection
 
 class FiDT5(transformers.T5ForConditionalGeneration):
     config_class = FiDT5Config
@@ -686,7 +688,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 max_over_head: bool = False,
                 term_weight_parameter: bool = False,
                 embedding_normalize: bool = False,
-                use_gold_doc_dist: bool = False):
+                use_gold_doc_dist: bool = False,
+                retrieval_projection: str = None):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
@@ -719,6 +722,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           term_weight_parameter=term_weight_parameter,
           embedding_normalize=embedding_normalize,
           use_gold_doc_dist=use_gold_doc_dist,
+          retrieval_projection=retrieval_projection,
           **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
@@ -1010,6 +1014,7 @@ class DecoderWrapper(torch.nn.Module):
     self.memory_bank_additional_encode = config.memory_bank_additional_encode
     self.max_over_head = config.max_over_head
     self.use_gold_doc_dist = config.use_gold_doc_dist
+    self.retrieval_projection = config.retrieval_projection
     if self.encoder_attention_pre_softmax and self.num_keep_ctx_in_decoder:
       raise NotImplementedError
     if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
@@ -1018,7 +1023,8 @@ class DecoderWrapper(torch.nn.Module):
       assert self.num_keep_ctx_in_decoder and not self.encoder_decoder_kl_ratio, \
         'normalized decoder is not used in a proper setting'
     
-    if FiDT5.need_wrap_decoder(config) and not self.max_over_head:
+    if FiDT5.need_wrap_decoder(config) and not self.max_over_head and \
+      (not self.retrieval_projection or not self.retrieval_projection.startswith('hidden')):
       if config.keep_ctx_in_decoder_with_head is None:
         if self.layer_for_retrieval in {'first', 'emb'}:
           nw = config.num_heads
@@ -1442,11 +1448,26 @@ class T5blockWrapper(torch.nn.Module):
         self.num_heads = config.num_heads
         self.n_layer_two_tower = config.n_layer_two_tower
         self.need_collect = FiDT5.need_wrap_decoder(config) or bool(config.encoder_encoder_kl_ratio)
+        self.retrieval_projection = config.retrieval_projection
         self.term_weight_linear = None
         if self.use_for_retrieval and self.need_collect and self.term_weight_parameter:
           self.term_weight_linear = nn.Linear(config.d_kv, 1, bias=True)
           nn.init.constant_(self.term_weight_linear.weight, 0.0)
           nn.init.constant_(self.term_weight_linear.bias, 0.0)
+        self.hidden_linear = self.head_linear = None
+        if self.use_for_retrieval and self.need_collect:
+          if not self.retrieval_projection:
+            pass
+          elif self.retrieval_projection.startswith('hidden_linear.'):
+            retrieval_dim = int(self.retrieval_projection[len('hidden_linear.'):])
+            self.hidden_linear = nn.Linear(config.d_model, retrieval_dim, bias=False)
+            self.hidden_linear.weight.data.normal_(mean=0.0, std=config.initializer_factor * (config.d_model ** -0.5))
+          elif self.retrieval_projection.startswith('head_linear.'):
+            retrieval_dim = int(self.retrieval_projection[len('head_linear.'):])
+            self.head_linear = nn.Linear(config.d_kv, retrieval_dim, bias=False)
+            self.head_linear.weight.data.normal_(mean=0.0, std=config.initializer_factor * (config.d_kv ** -0.5))
+          else:
+            raise NotImplementedError
 
     def forward(self, hidden_states, attention_mask, position_bias, **kwargs):
         # register callback for retrieval
@@ -1464,7 +1485,9 @@ class T5blockWrapper(torch.nn.Module):
                     n_context=self.n_passages if hasattr(self, 'n_passages') else None,
                     use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower, self.max_over_head),
                     term_weight_linear=self.term_weight_linear,
-                    embedding_normalize=self.embedding_normalize), reg_point.SelfAttention)
+                    embedding_normalize=self.embedding_normalize,
+                    hidden_linear=self.hidden_linear,
+                    head_linear=self.head_linear), reg_point.SelfAttention)
             if self.in_batch_negative and self.training:
               reg_point.SelfAttention.in_batch_negative = types.MethodType(functools.partial(
                 in_batch_negative, n_context=self.n_passages, in_batch_negative_size=self.in_batch_negative_size,
@@ -1789,7 +1812,9 @@ def collect_for_retrieval(
      bi_encoder_forward: Callable = None,
      use_head_idx: int = None,
      term_weight_linear: nn.Linear = None,
-     embedding_normalize: bool = False):
+     embedding_normalize: bool = False,
+     hidden_linear: nn.Linear = None,
+     head_linear: nn.Linear = None):
     
   def _get_term_weights(query_states, query_mask):  # (?, n_heads, seq_len, emb_size_per_head), (?, seq_len)
     if term_weight_linear is None:
@@ -1798,6 +1823,16 @@ def collect_for_retrieval(
     weights = torch.softmax(weights / 0.01 - (~query_mask.unsqueeze(1) * 1e5), dim=-1)  # (?, n_heads, seq_len)
     #weights = weights * query_mask.unsqueeze(1)
     return weights
+  
+  if hidden_linear is not None:
+    ret_states = hidden_linear(hidden_states)  # (bs * n_context, seq_len, ret_size)
+    scores = torch.matmul(ret_states, ret_states.transpose(1, 2)).unsqueeze(1)  # (bs * n_context, 1, seq_len, seq_len)
+    query_states = ret_states.unsqueeze(1)
+    key_states = query_states
+  elif head_linear is not None:
+    query_states = head_linear(query_states)  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+    key_states = head_linear(key_states)  # (bs * n_context, n_heads, seq_len, emb_size_per_head)
+    scores = torch.matmul(query_states, key_states.transpose(3, 2))  # (bs * n_context, n_heads, seq_len, seq_len)
 
   self.retrieval = {
     'scores': scores,

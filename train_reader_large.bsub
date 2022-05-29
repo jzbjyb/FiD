@@ -34,7 +34,7 @@ combine_weight=0
 
 init_model=google/t5-large-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_inbatchneg16_gold
+name=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_headlinear64_gold
 init_from=${ckpt_dir}/nq_reader_large_v11lm_separate_layer12_bs16_step3k/checkpoint/latest
 only_topk_n_context=0
 n_layer_two_tower=12
@@ -90,9 +90,10 @@ python ${prefix} train_reader.py \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
+  --wandb_log_freq 10 \
   --init_from ${init_from} \
   --use_gold_doc_dist \
-  --in_batch_negative &>> ${ckpt_dir}/${name}.out
+  --retrieval_projection head_linear.64 &>> ${ckpt_dir}/${name}.out
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
 # --decoder_attn_ctx_normalize \
