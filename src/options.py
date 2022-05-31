@@ -105,6 +105,7 @@ class Options():
         self.parser.add_argument('--embedding_normalize', action='store_true', help='normalize embedding before computing the bi-encoder score')
         self.parser.add_argument('--use_gold_doc_dist', action='store_true', help='use gold document label distribution')
         self.parser.add_argument('--retrieval_projection', type=str, default=None, help='projection used to generate retrieval embeddings')
+        self.parser.add_argument('--kl_loss_reduction', type=str, default=None, help='how to use KL div', choices=[None, 'only_one_positive', 'neg3', 'only_one_positive-neg3', 'pos1-neg3'])
 
     def add_retriever_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')

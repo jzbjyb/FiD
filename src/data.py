@@ -188,7 +188,6 @@ class Collator(object):
     def __call__(self, batch):
         index = torch.tensor([ex['index'] for ex in batch])
         scores = torch.stack([ex['scores'] for ex in batch], dim=0)
-        scores = scores / (scores.sum(-1, keepdim=True) + 1e-5)  # sum to one
 
         # decoder
         decoder_start_token = self.tokenizer.pad_token  # T5 uses pad as the start token of decoding

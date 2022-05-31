@@ -8,6 +8,7 @@ from mimetypes import init
 from typing import Callable, List
 import types
 import warnings
+import random
 import torch
 import transformers
 import functools
@@ -609,6 +610,7 @@ class FiDT5Config(transformers.T5Config):
                embedding_normalize: bool = False,
                use_gold_doc_dist: bool = False,
                retrieval_projection: str = None,
+               kl_loss_reduction: str = None,
                **kwargs):
     super().__init__(*args, **kwargs)
     self.n_layer_two_tower = n_layer_two_tower
@@ -642,6 +644,7 @@ class FiDT5Config(transformers.T5Config):
     self.embedding_normalize = embedding_normalize
     self.use_gold_doc_dist = use_gold_doc_dist
     self.retrieval_projection = retrieval_projection
+    self.kl_loss_reduction = kl_loss_reduction
 
 class FiDT5(transformers.T5ForConditionalGeneration):
     config_class = FiDT5Config
@@ -689,7 +692,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 term_weight_parameter: bool = False,
                 embedding_normalize: bool = False,
                 use_gold_doc_dist: bool = False,
-                retrieval_projection: str = None):
+                retrieval_projection: str = None,
+                kl_loss_reduction: str = None):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
@@ -723,6 +727,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           embedding_normalize=embedding_normalize,
           use_gold_doc_dist=use_gold_doc_dist,
           retrieval_projection=retrieval_projection,
+          kl_loss_reduction=kl_loss_reduction,
           **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
@@ -1015,6 +1020,7 @@ class DecoderWrapper(torch.nn.Module):
     self.max_over_head = config.max_over_head
     self.use_gold_doc_dist = config.use_gold_doc_dist
     self.retrieval_projection = config.retrieval_projection
+    self.kl_loss_reduction = config.kl_loss_reduction
     if self.encoder_attention_pre_softmax and self.num_keep_ctx_in_decoder:
       raise NotImplementedError
     if self.encoder_decoder_kl_ratio and self.num_keep_ctx_in_decoder:
@@ -1165,7 +1171,8 @@ class DecoderWrapper(torch.nn.Module):
         pairwise_loss=self.pairwise_loss,
         memory_bank_topk=self.memory_bank_topk if self.training else 0,
         memory_bank_additional_encode=self.memory_bank_additional_encode if self.training else 0,
-        use_gold_doc_dist=self.use_gold_doc_dist
+        use_gold_doc_dist=self.use_gold_doc_dist,
+        kl_loss_reduction=self.kl_loss_reduction
       ), reg_point)
     else:
       raise NotImplementedError
@@ -1562,6 +1569,54 @@ def decoder_attn_ctx_normalize(
   s = s.view(*raw_size)  # (bs, n_heads, dec_seq_len, n_context * text_len)
   return s
 
+def compute_kl_loss_reduction(
+    prediction_logits: torch.FloatTensor,  # (bs, num_docs)
+    gold_probs: torch.FloatTensor,  # (bs, num_docs)
+    kl_loss_func: nn.KLDivLoss,
+    num_pos: int = None,
+    num_neg: int = None,
+    only_one_positive: bool = False):
+  preds: List[torch.FloatTensor] = []
+  golds: List[torch.FloatTensor] = []
+  for b in range(gold_probs.size(0)):
+    pos_doc_idxs = gold_probs[b].nonzero(as_tuple=False).squeeze(-1).sort().values
+    neg_doc_idxs = (~gold_probs[b].bool()).nonzero(as_tuple=False).squeeze(-1).tolist()
+    assert len(pos_doc_idxs) + len(neg_doc_idxs) == gold_probs.size(1)
+    if only_one_positive:  # each pos doc corresponds to a separate softmax
+      inf_mask = torch.zeros_like(prediction_logits[b])
+      inf_mask.scatter_(0, pos_doc_idxs, 1e5)
+      for doc_idx in pos_doc_idxs:
+          _gold = torch.zeros_like(gold_probs[b])
+          _gold[doc_idx] = 1.0  # one-hot
+          _inf_mask = inf_mask.scatter(0, doc_idx, 0)
+          if num_neg and len(neg_doc_idxs) > num_neg:  # use at most num_neg neg docs
+            discard_neg_doc_idxs = random.sample(neg_doc_idxs, k=len(neg_doc_idxs) - num_neg)
+            _inf_mask = _inf_mask.scatter(0, torch.tensor(discard_neg_doc_idxs).to(pos_doc_idxs), 1e5)
+          _pred = prediction_logits[b] - _inf_mask
+          golds.append(_gold)
+          preds.append(_pred)
+    else:
+      inf_mask = torch.zeros_like(prediction_logits[b])
+      _gold = gold_probs[b]
+      if num_pos and len(pos_doc_idxs) > num_pos:  # use the top num_pos pos docs (assume pos docs are at the beginning)
+        discard_pos_doc_idxs = pos_doc_idxs[num_pos:]
+        inf_mask = inf_mask.scatter(0, discard_pos_doc_idxs, 1e5)
+        _gold[num_pos:] = 0
+      if num_neg and len(neg_doc_idxs) > num_neg:  # use at most num_neg neg docs
+        discard_neg_doc_idxs = random.sample(neg_doc_idxs, k=len(neg_doc_idxs) - num_neg)
+        inf_mask = inf_mask.scatter(0, torch.tensor(discard_neg_doc_idxs).to(pos_doc_idxs), 1e5)
+      _pred = prediction_logits[b] - inf_mask
+      golds.append(_gold / (_gold.sum() or 1))
+      preds.append(_pred)
+  if len(golds):
+    preds = torch.stack(preds, dim=0)
+    golds = torch.stack(golds, dim=0)
+    preds = torch.log_softmax(preds, dim=-1)
+    kl_loss = kl_loss_func(preds, golds)
+  else:  # no annotation
+    kl_loss = kl_loss_func(torch.log_softmax(prediction_logits, dim=-1), gold_probs)
+  return kl_loss
+
 def encoder_decoder_kl(
      self,
      decoder_score: torch.FloatTensor,  # (bs, n_heads, dec_seq_len, enc_seq_len)
@@ -1577,7 +1632,8 @@ def encoder_decoder_kl(
      memory_bank_topk: int = 0,
      memory_bank_additional_encode: bool = False,
      gold_doc_dist: torch.FloatTensor=None,  # (bs, n_context)
-     use_gold_doc_dist: bool = False):
+     use_gold_doc_dist: bool = False,
+     kl_loss_reduction: str = None):
   bs, _, _, enc_seq_len = decoder_score.size()
   has_token = encoder_score.dim() == 3
   use_memory_bank = memory_bank_topk and \
@@ -1617,7 +1673,10 @@ def encoder_decoder_kl(
 
   # use the gold distribution
   if use_gold_doc_dist and gold_doc_dist is not None:
-    s = gold_doc_dist
+    if kl_loss_reduction is None:
+      s = gold_doc_dist / (gold_doc_dist.sum(-1, keepdim=True) + 1e-5)  # sum to one
+    else:
+      s = gold_doc_dist
 
   # kl
   kl_loss_func = torch.nn.KLDivLoss(reduction='batchmean')
@@ -1647,7 +1706,10 @@ def encoder_decoder_kl(
       encoder_score = encoder_score.view(-1, n_context + memory_bank_topk)  # (bs, n_context + memory_bank_topk)
       enc_attn = torch.log_softmax(encoder_score, dim=-1)
     else:
-      enc_attn = torch.log_softmax(encoder_score, dim=-1)
+      if kl_loss_reduction is not None:
+        enc_attn = encoder_score  # no need to normalize
+      else:
+        enc_attn = torch.log_softmax(encoder_score, dim=-1)
   if in_batch_negative:
     if pairwise_loss is None:  # kl over all docs
       # (n_gpu * bs, <=(n_gpu * bs) * n_context)
@@ -1685,7 +1747,16 @@ def encoder_decoder_kl(
     ori_kl = kl_loss_func(torch.log_softmax(encoder_score[:, :n_context], dim=-1), dec_attn[:, :n_context].detach())
     WandbLogger.log_w_step({'kl-loss-original': ori_kl.item()})
   else:
-    loss = kl_loss_func(enc_attn, dec_attn.detach())
+    if kl_loss_reduction == 'only_one_positive':
+      loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, only_one_positive=True)
+    elif kl_loss_reduction == 'only_one_positive-neg3':
+      loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, num_neg=3, only_one_positive=True)
+    elif kl_loss_reduction == 'neg3':
+      loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, num_neg=3, only_one_positive=False)
+    elif kl_loss_reduction == 'pos1-neg3':
+      loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, num_pos=1, num_neg=3, only_one_positive=False)
+    else:
+      loss = kl_loss_func(enc_attn, dec_attn.detach())
     WandbLogger.log_w_step({'kl-loss': loss.item()})
     if memory_bank_topk and memory_bank_additional_encode:  # track the original kl when additional_encode is used
       ori_n_context = n_context - memory_bank_topk
