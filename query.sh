@@ -18,6 +18,7 @@ candidate_doc_topk=0
 faiss_gpus="--faiss_gpus all"
 rerank=""
 max_over_head=""
+augmentation=""
 files_per_run=16  # about 70G embs
 
 # model specific arguments
@@ -71,11 +72,15 @@ elif [[ ${model_type} == 'colbert' ]]; then
   index_name=$3
   token_topk=$4
   candidate_doc_topk=$5
+  aug=$6
   index_dim=128
   files_per_run=8
 
   get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 512
   output_path=${model_path}.index/${index_name}
+  if [[ ${aug} == 'true' ]]; then
+    augmentation="--augmentation mask"
+  fi
   if (( ${token_topk} > 2048 )); then
     faiss_gpus="--faiss_gpus -1"
   fi
@@ -113,4 +118,4 @@ python ${prefix} retrieval.py \
   --token_topk ${token_topk} \
   --doc_topk ${doc_topk} \
   --files_per_run ${files_per_run} \
-  ${rerank} ${head_idx} ${faiss_gpus} ${extra} ${max_over_head}
+  ${rerank} ${head_idx} ${faiss_gpus} ${extra} ${max_over_head} ${augmentation}

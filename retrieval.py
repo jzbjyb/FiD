@@ -264,7 +264,7 @@ def encode_query_and_search(
         for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
           qid = adapter.results['ids'][i]
           for did, score, text in zip(docids, scores, texts):
-            qid2did2score[qid][did] = score
+            qid2did2score[qid][did] = float(score)
       else:
         raise NotImplementedError
       

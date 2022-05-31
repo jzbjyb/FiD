@@ -611,6 +611,7 @@ class FiDT5Config(transformers.T5Config):
                use_gold_doc_dist: bool = False,
                retrieval_projection: str = None,
                kl_loss_reduction: str = None,
+               no_qa: bool = False,
                **kwargs):
     super().__init__(*args, **kwargs)
     self.n_layer_two_tower = n_layer_two_tower
@@ -645,6 +646,7 @@ class FiDT5Config(transformers.T5Config):
     self.use_gold_doc_dist = use_gold_doc_dist
     self.retrieval_projection = retrieval_projection
     self.kl_loss_reduction = kl_loss_reduction
+    self.no_qa = no_qa
 
 class FiDT5(transformers.T5ForConditionalGeneration):
     config_class = FiDT5Config
@@ -658,6 +660,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         self.collect_kl_loss_from_encoder = bool(config.encoder_encoder_kl_ratio)
         self.n_layer_two_tower = config.n_layer_two_tower
         self.memory_bank_recompute = config.memory_bank_recompute
+        self.no_qa = config.no_qa
 
     @classmethod
     def from_t5(cls,
@@ -693,7 +696,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 embedding_normalize: bool = False,
                 use_gold_doc_dist: bool = False,
                 retrieval_projection: str = None,
-                kl_loss_reduction: str = None):
+                kl_loss_reduction: str = None,
+                no_qa: bool = False):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
@@ -728,6 +732,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           use_gold_doc_dist=use_gold_doc_dist,
           retrieval_projection=retrieval_projection,
           kl_loss_reduction=kl_loss_reduction,
+          no_qa=no_qa,
           **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
@@ -769,10 +774,11 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           kl_loss += self.decoder.get_kl_loss()
         if self.collect_kl_loss_from_encoder:
           kl_loss += self.encoder.get_kl_loss()
+        qa_loss_factor = 0.0 if self.no_qa else 1.0
         if 'return_dict' in kwargs and kwargs['return_dict'] and result.loss is not None:
-          result.loss = result.loss + kl_loss
+          result.loss = qa_loss_factor * result.loss + kl_loss
         elif 'labels' in kwargs and kwargs['labels'] is not None:
-          result = (result[0] + kl_loss,) + result[1:]
+          result = (qa_loss_factor * result[0] + kl_loss,) + result[1:]
         self.reset_attention_separate_mask()  # always reset separate mask to clean it up
         return result
 
