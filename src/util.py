@@ -55,7 +55,7 @@ class WandbLogger:
     cls._step = step
 
   @classmethod
-  def log_w_step(cls, data, name: str = 'default', interval: int = None):
+  def log_w_step(cls, data, name: str = 'default', interval: int = None, prefix_for_list: str = '', skip_first_for_list: bool = False):
     interval = interval or cls._default_interval
     if not cls.enabled():
       return
@@ -75,7 +75,7 @@ class WandbLogger:
         data[k] = data[k].detach().cpu().numpy().tolist()
       if type(data[k]) is list:
         for i in range(len(data[k])):
-          _data[f'{k}-{i}'] = data[k][i]
+          _data[f'{k}' + (f'-{prefix_for_list}{i}' if not skip_first_for_list or i > 0 else '')] = data[k][i]
       else:
         _data[k] = data[k]
     cls._wandb_logger.log(_data, step=cls._step)

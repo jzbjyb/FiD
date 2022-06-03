@@ -227,6 +227,8 @@ if __name__ == "__main__":
           keep_ctx_in_decoder_head_tau=opt.keep_ctx_in_decoder_head_tau,
           head_weights_norm_func=opt.head_weights_norm_func,
           encoder_decoder_kl_ratio=opt.encoder_decoder_kl_ratio,
+          encoder_decoder_kl_method=opt.encoder_decoder_kl_method,
+          encoder_encoder_kl_method=opt.encoder_encoder_kl_method,
           in_batch_negative=opt.in_batch_negative,
           in_batch_negative_size=opt.in_batch_negative_size,
           in_batch_negative_max_num_query=opt.in_batch_negative_max_num_query,

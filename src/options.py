@@ -74,6 +74,9 @@ class Options():
                                  help='only use a specific head to keep ctx in decoder')
         self.parser.add_argument('--encoder_decoder_kl_ratio', type=float, default=0,
                                  help='the ratio of KL divergence between encoder and decoder attn')
+        self.parser.add_argument('--encoder_decoder_kl_method', type=str, default='merge', 
+                                 help='method to compute encoder-decoder kl', choices=['merge', 'separate', 'cross'])
+        self.parser.add_argument('--encoder_encoder_kl_method', type=str, default=None, help='method to compute encoder-encoder kl', choices=[None, 'side'])
         self.parser.add_argument('--encoder_encoder_kl_ratio', type=float, default=0,
                                  help='the ratio of KL divergence between encoder and encoder attn of different layers')
         self.parser.add_argument('--encoder_encoder_kl_sparsity', type=int, default=0, help='topk doc tokens per query token')

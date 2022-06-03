@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from cmath import log
 from mimetypes import init
 from typing import Callable, List
 import types
@@ -592,6 +593,8 @@ class FiDT5Config(transformers.T5Config):
                head_weights_norm_func: str = 'softmax',
                encoder_attention_pre_softmax: bool = False,
                encoder_decoder_kl_ratio: float = 0,
+               encoder_decoder_kl_method: str = 'merge',
+               encoder_encoder_kl_method: str = None,
                in_batch_negative: bool = False,
                in_batch_negative_size: int = 0,
                in_batch_negative_max_num_query: int = None,
@@ -627,6 +630,8 @@ class FiDT5Config(transformers.T5Config):
     self.head_weights_norm_func = head_weights_norm_func
     self.encoder_attention_pre_softmax = encoder_attention_pre_softmax
     self.encoder_decoder_kl_ratio = encoder_decoder_kl_ratio
+    self.encoder_decoder_kl_method = encoder_decoder_kl_method
+    self.encoder_encoder_kl_method = encoder_encoder_kl_method
     self.in_batch_negative = in_batch_negative
     self.in_batch_negative_size = in_batch_negative_size
     self.in_batch_negative_max_num_query = in_batch_negative_max_num_query
@@ -678,6 +683,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 head_weights_norm_func: str = 'softmax',
                 encoder_attention_pre_softmax: bool = False,
                 encoder_decoder_kl_ratio: float = 0,
+                encoder_decoder_kl_method: str = 'merge',
+                encoder_encoder_kl_method: str = None,
                 in_batch_negative: bool = False,
                 in_batch_negative_size: int = 0,
                 in_batch_negative_max_num_query: int = None,
@@ -713,6 +720,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           head_weights_norm_func=head_weights_norm_func,
           encoder_attention_pre_softmax=encoder_attention_pre_softmax,
           encoder_decoder_kl_ratio=encoder_decoder_kl_ratio,
+          encoder_decoder_kl_method=encoder_decoder_kl_method,
+          encoder_encoder_kl_method=encoder_encoder_kl_method,
           in_batch_negative=in_batch_negative,
           in_batch_negative_size=in_batch_negative_size,
           in_batch_negative_max_num_query=in_batch_negative_max_num_query,
@@ -1017,6 +1026,8 @@ class DecoderWrapper(torch.nn.Module):
     self.decoder_attn_ctx_normalize = config.decoder_attn_ctx_normalize
     self.only_topk_n_context = config.only_topk_n_context
     self.layer_for_retrieval = config.layer_for_retrieval
+    self.encoder_decoder_kl_method = config.encoder_decoder_kl_method
+    self.encoder_encoder_kl_method = config.encoder_encoder_kl_method
     self.n_layer_two_tower = config.n_layer_two_tower
     self.encoder_attention_pre_softmax = config.encoder_attention_pre_softmax
     self.in_batch_negative = config.in_batch_negative
@@ -1038,19 +1049,34 @@ class DecoderWrapper(torch.nn.Module):
     if FiDT5.need_wrap_decoder(config) and not self.max_over_head and \
       (not self.retrieval_projection or not self.retrieval_projection.startswith('hidden')):
       if config.keep_ctx_in_decoder_with_head is None:
-        if self.layer_for_retrieval in {'first', 'emb'}:
-          nw = config.num_heads
-        elif self.layer_for_retrieval == 'emb-first':
-          nw = 2 * config.num_heads
-        elif self.layer_for_retrieval == 'prev-first':
-          nw = (self.n_layer_two_tower + 1) * config.num_heads
-        elif self.layer_for_retrieval == 'after-first':
-          nw = (config.num_layers - self.n_layer_two_tower) * config.num_heads
-        elif self.layer_for_retrieval == 'last-first':
-          nw = 2 * config.num_heads
+        if self.encoder_decoder_kl_method == 'merge':
+          if self.layer_for_retrieval in {'first', 'emb'}:
+            nw = config.num_heads
+          elif self.layer_for_retrieval == 'emb-first':
+            nw = 2 * config.num_heads
+          elif self.layer_for_retrieval == 'prev-first':
+            nw = (self.n_layer_two_tower + 1) * config.num_heads
+          elif self.layer_for_retrieval == 'after-first':
+            nw = (config.num_layers - self.n_layer_two_tower) * config.num_heads
+          elif self.layer_for_retrieval == 'last-first':
+            nw = 2 * config.num_heads
+          else:
+            raise NotImplementedError
+          self.head_weights = torch.nn.Parameter(torch.zeros(nw), requires_grad=True)  # merge considered layers
+        elif self.encoder_decoder_kl_method in {'separate', 'cross'}:
+          if self.layer_for_retrieval in {'first', 'emb'}:
+            nl = 1
+          elif self.layer_for_retrieval in {'emb-first', 'last-first'}:
+            nl = 2
+          elif self.layer_for_retrieval == 'prev-first':
+            nl = self.n_layer_two_tower + 1
+          elif self.layer_for_retrieval == 'after-first':
+            nl = config.num_layers - self.n_layer_two_tower
+          else:
+            raise NotImplementedError
+          self.head_weights = torch.nn.Parameter(torch.zeros(nl, config.num_heads), requires_grad=True)  # use different layers separately
         else:
           raise NotImplementedError
-        self.head_weights = torch.nn.Parameter(torch.zeros(nw), requires_grad=True)
       else:
         assert self.layer_for_retrieval == 'first', \
           'only the first layer after bi-encoder should used for retrieval when using a specific head'
@@ -1060,9 +1086,9 @@ class DecoderWrapper(torch.nn.Module):
     
     if FiDT5.need_wrap_decoder(config):
       if config.head_weights_norm_func == 'softmax':
-        self.head_weights_norm_func = lambda x: torch.softmax(x / self.keep_ctx_in_decoder_head_tau, 0)
+        self.head_weights_norm_func = lambda x: torch.softmax(x / self.keep_ctx_in_decoder_head_tau, -1)
       elif config.head_weights_norm_func == 'sparsemax':
-        self.head_weights_norm_func = lambda x: sparsemax(x, 0)
+        self.head_weights_norm_func = lambda x: sparsemax(x, -1)
       else:
         raise NotImplementedError
       self.init_combine_weight = config.combine_weight
@@ -1104,37 +1130,54 @@ class DecoderWrapper(torch.nn.Module):
       encoder_imp = torch.log_softmax(encoder_imp, dim=1)
 
     # reshape
-    if self.layer_for_retrieval in {'first', 'emb'}:  # use the first layer
-      encoder_imp = encoder_imp[:, :, 0]  # (num_q, num_d, num_head, [num_toks])
-    elif self.layer_for_retrieval in {'emb-first', 'last-first'}:  # use the emb/last layer and first layer after bi-encoder
-      assert encoder_imp.size(2) == 2, 'provide attn for emb and the first layer after bi-encoder'
-      v = (num_q, num_d, -1) if not has_token else (num_q, num_d, -1, num_toks)
-      encoder_imp = encoder_imp.view(*v)  # (num_q, num_d, 2 * num_head, [num_toks])
-    elif self.layer_for_retrieval in {'prev-first', 'after-first'}:  # use all layers before first and after first
-      v = (num_q, num_d, -1) if not has_token else (num_q, num_d, -1, num_toks)
-      encoder_imp = encoder_imp.view(*v)  # (num_q, num_d, ? * num_head, [num_toks])
-    else:
-      raise NotImplementedError
-    
-    if num_head == 1:
-      if has_token:
+    if self.encoder_decoder_kl_method == 'merge':
+      if self.layer_for_retrieval in {'first', 'emb'}:  # use the first layer
+        encoder_imp = encoder_imp[:, :, 0]  # (num_q, num_d, num_head, [num_toks])
+      elif self.layer_for_retrieval in {'emb-first', 'last-first'}:  # use the emb/last layer and first layer after bi-encoder
+        assert encoder_imp.size(2) == 2, 'provide attn for emb and the first layer after bi-encoder'
+        v = (num_q, num_d, -1) if not has_token else (num_q, num_d, -1, num_toks)
+        encoder_imp = encoder_imp.view(*v)  # (num_q, num_d, 2 * num_head, [num_toks])
+      elif self.layer_for_retrieval in {'prev-first', 'after-first'}:  # use all layers before first and after first
+        v = (num_q, num_d, -1) if not has_token else (num_q, num_d, -1, num_toks)
+        encoder_imp = encoder_imp.view(*v)  # (num_q, num_d, ? * num_head, [num_toks])
+      else:
         raise NotImplementedError
-      encoder_imp = encoder_imp[:, :, 0]  # (num_q, num_d)
-    else:
-      # combine multiple heads
+
+      if num_head == 1:
+        if has_token:
+          raise NotImplementedError
+        encoder_imp = encoder_imp[:, :, 0]  # (num_q, num_d)
+      else:
+        # combine multiple heads
+        hwn = self.head_weights_norm_func(self.head_weights)
+        WandbLogger.log_w_step({'head-weight': hwn})
+        if self.encoder_attention_pre_softmax:
+          assert not has_token, 'pre softmax might not be good for token-level loss'
+          encoder_imp = torch.logsumexp(encoder_imp + torch.log(torch.clamp(hwn, min=1e-10))[None, None, :], dim=-1)
+        else:
+          if not has_token:
+            encoder_imp = (encoder_imp * hwn[None, None, :]).sum(-1)  # (num_q, num_d)
+          else:
+            encoder_imp = (encoder_imp * hwn[None, None, :, None]).sum(-2)  # (num_q, num_d, num_toks)
+            # softmax over all toks in all context
+            encoder_imp = encoder_imp * encoder_imp_tok_mask - ~encoder_imp_tok_mask * 1e5
+            encoder_imp = torch.log_softmax(encoder_imp.view(num_q, -1), dim=-1).view(num_q, num_d, num_toks)
+
+    elif self.encoder_decoder_kl_method in {'separate', 'cross'}:
+      # combine each layer separately
       hwn = self.head_weights_norm_func(self.head_weights)
-      WandbLogger.log_w_step({'head-weight': hwn})
+      for li in range(hwn.size(0)):
+        WandbLogger.log_w_step({'head-weight' + ('' if li == 0 else f'-L{li}'): hwn[li]})
       if self.encoder_attention_pre_softmax:
-        assert not has_token, 'pre softmax might not be good for token-level loss'
-        encoder_imp = torch.logsumexp(encoder_imp + torch.log(torch.clamp(hwn, min=1e-10))[None, None, :], dim=-1)
+        raise NotImplementedError
       else:
         if not has_token:
-          encoder_imp = (encoder_imp * hwn[None, None, :]).sum(-1)  # (num_q, num_d)
+          encoder_imp = (encoder_imp * hwn[None, None, :, :]).sum(-1)  # (num_q, num_d, num_layer)
+          encoder_imp = encoder_imp.permute(2, 0, 1)  # (num_layer, num_q, num_d)
         else:
-          encoder_imp = (encoder_imp * hwn[None, None, :, None]).sum(-2)  # (num_q, num_d, num_toks)
-          # softmax over all toks in all context
-          encoder_imp = encoder_imp * encoder_imp_tok_mask - ~encoder_imp_tok_mask * 1e5
-          encoder_imp = torch.log_softmax(encoder_imp.view(num_q, -1), dim=-1).view(num_q, num_d, num_toks)
+          raise NotImplementedError
+    else:
+      raise NotImplementedError
 
     # used for output
     if not has_token:
@@ -1178,7 +1221,9 @@ class DecoderWrapper(torch.nn.Module):
         memory_bank_topk=self.memory_bank_topk if self.training else 0,
         memory_bank_additional_encode=self.memory_bank_additional_encode if self.training else 0,
         use_gold_doc_dist=self.use_gold_doc_dist,
-        kl_loss_reduction=self.kl_loss_reduction
+        kl_loss_reduction=self.kl_loss_reduction,
+        encoder_decoder_kl_method=self.encoder_decoder_kl_method,
+        encoder_encoder_kl_method=self.encoder_encoder_kl_method
       ), reg_point)
     else:
       raise NotImplementedError
@@ -1398,6 +1443,7 @@ class EncoderWrapper(torch.nn.Module):
         wrapped_layer = T5blockWrapper(
           config,
           layer,
+          layer_index=i,
           use_checkpoint=self.use_checkpoint,
           use_full_attention=i >= config.n_layer_two_tower,
           use_for_retrieval=use_for_retrieval,
@@ -1435,12 +1481,14 @@ class T5blockWrapper(torch.nn.Module):
     def __init__(self,
                  config,
                  module,
+                 layer_index: int,
                  use_checkpoint: bool = False,
                  use_full_attention: bool = True,
                  use_for_retrieval: bool = False,
                  bi_encoder_forward: Callable = None):
         super().__init__()
         self.module = module
+        self.layer_index = layer_index
         self.use_checkpoint = use_checkpoint
         self.use_full_attention = use_full_attention
         self.use_for_retrieval = use_for_retrieval
@@ -1496,7 +1544,7 @@ class T5blockWrapper(torch.nn.Module):
                     field='query',
                     use_hidden_states=False,
                     n_context=self.n_passages if hasattr(self, 'n_passages') else None,
-                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower, self.max_over_head),
+                    use_head_idx=get_single_head_idx(self.num_heads, self.n_layer_two_tower, self.max_over_head, layer_index=self.layer_index),
                     term_weight_linear=self.term_weight_linear,
                     embedding_normalize=self.embedding_normalize,
                     hidden_linear=self.hidden_linear,
@@ -1578,7 +1626,7 @@ def decoder_attn_ctx_normalize(
 def compute_kl_loss_reduction(
     prediction_logits: torch.FloatTensor,  # (bs, num_docs)
     gold_probs: torch.FloatTensor,  # (bs, num_docs)
-    kl_loss_func: nn.KLDivLoss,
+    kl_loss_func: Callable,
     num_pos: int = None,
     num_neg: int = None,
     only_one_positive: bool = False):
@@ -1627,7 +1675,7 @@ def encoder_decoder_kl(
      self,
      decoder_score: torch.FloatTensor,  # (bs, n_heads, dec_seq_len, enc_seq_len)
      decoder_mask: torch.BoolTensor,  # (bs, n_heads or 1, dec_seq_len, enc_seq_len)
-     encoder_score: torch.FloatTensor,  # (bs, n_context, [text_len]) or (<=(n_gpu * bs)^2, n_context) or (bs + ?, n_context)
+     encoder_score: torch.FloatTensor,  # (bs, n_context, [text_len]) or (<=(n_gpu * bs)^2, n_context) or (bs + ?, n_context) or (num_layer, bs, n_context)
      encoder_score_mask: torch.BoolTensor,  # (bs, n_context, text_len)
      n_context: int,
      only_topk_n_context: int = 0,
@@ -1639,12 +1687,21 @@ def encoder_decoder_kl(
      memory_bank_additional_encode: bool = False,
      gold_doc_dist: torch.FloatTensor=None,  # (bs, n_context)
      use_gold_doc_dist: bool = False,
-     kl_loss_reduction: str = None):
+     kl_loss_reduction: str = None,
+     encoder_decoder_kl_method: str = 'merge',
+     encoder_encoder_kl_method: str = None):
+
+  if encoder_decoder_kl_method == 'merge':  # add the layer dimension
+    encoder_score = encoder_score.unsqueeze(0)
+    encoder_score_mask = encoder_score_mask.unsqueeze(0) if encoder_score_mask is not None else None
+  num_layer = encoder_score.size(0)
+  multi_layer_log_w_step = lambda log_key, value: WandbLogger.log_w_step({log_key: value}, prefix_for_list='L', skip_first_for_list=True)
+
   bs, _, _, enc_seq_len = decoder_score.size()
-  has_token = encoder_score.dim() == 3
+  has_token = encoder_score.dim() == 4
   use_memory_bank = memory_bank_topk and \
                     not memory_bank_additional_encode and \
-                    encoder_score.size(0) > bs  # the first several batch might not use memory-bank
+                    encoder_score.size(1) > bs  # the first several batch might not use memory-bank
 
   if only_topk_n_context:  # only consider the topk context to mimic in-batch negative
     only_topk_enc_tok = (enc_seq_len // n_context) * only_topk_n_context
@@ -1658,6 +1715,7 @@ def encoder_decoder_kl(
   decoder_mask = decoder_mask[:, 0, 0]  # (bs, enc_seq_len)
 
   if has_token:  # token-level kl
+    assert num_layer == 1
     if in_batch_negative:
       raise NotImplementedError
     assert not encoder_score_pre_softmaxed
@@ -1685,7 +1743,22 @@ def encoder_decoder_kl(
       s = gold_doc_dist
 
   # kl
-  kl_loss_func = torch.nn.KLDivLoss(reduction='batchmean')
+  kldiv = torch.nn.KLDivLoss(reduction='batchmean')
+  def kl_loss_func(pred, gold, log_key: str = 'kl-loss'):
+    assert gold.dim() == 2
+    if pred.dim() == 2:
+      loss = kldiv(pred, gold)
+      WandbLogger.log_w_step({log_key: loss.item()})
+      return loss
+    if pred.dim() == 3:  # multiple layers
+      losses = [kldiv(_pred, gold) for _pred in pred]
+      multi_layer_log_w_step(log_key, losses)
+      loss = 0
+      for _loss in losses:
+        loss += _loss
+      return loss
+    raise Exception(f'prediction distribution shape {pred.size()} incorrect')
+  
   if use_softmax:
     dec_attn = s
   else:
@@ -1701,40 +1774,46 @@ def encoder_decoder_kl(
   else:
     if in_batch_negative:
       bs_t_ngpu = dec_attn.size(0)
-      encoder_score = encoder_score.view(bs_t_ngpu, -1)  # (n_gpu * bs, <=(n_gpu * bs) * n_context)
+      encoder_score = encoder_score.view(num_layer, bs_t_ngpu, -1)  # (num_layer, n_gpu * bs, <=(n_gpu * bs) * n_context)
       if pairwise_loss is None:  # kl over all docs
         enc_attn = torch.log_softmax(encoder_score, dim=-1)
       elif pairwise_loss == 'sigmoid':  # kl over current docs, sigmoid over others
-        enc_attn = torch.log_softmax(encoder_score[:, :n_context], dim=-1)
+        enc_attn = torch.log_softmax(encoder_score[:, :, :n_context], dim=-1)
       else:
         raise NotImplementedError
     elif use_memory_bank:
-      encoder_score = encoder_score.view(-1, n_context + memory_bank_topk)  # (bs, n_context + memory_bank_topk)
+      encoder_score = encoder_score.view(num_layer, -1, n_context + memory_bank_topk)  # (num_layer, bs, n_context + memory_bank_topk)
       enc_attn = torch.log_softmax(encoder_score, dim=-1)
     else:
       if kl_loss_reduction is not None:
         enc_attn = encoder_score  # no need to normalize
       else:
         enc_attn = torch.log_softmax(encoder_score, dim=-1)
+  
+  if encoder_decoder_kl_method == 'cross':  # assue the last layer is the cross encoder layer
+    enc_attn_for_ed_kl = enc_attn[-1:]
+    encoder_score_for_ed_kl = encoder_score[-1:]
+  else:
+    enc_attn_for_ed_kl = enc_attn
+    encoder_score_for_ed_kl = encoder_score
+
   if in_batch_negative:
     if pairwise_loss is None:  # kl over all docs
       # (n_gpu * bs, <=(n_gpu * bs) * n_context)
-      dec_attn = torch.cat([dec_attn, torch.zeros((bs_t_ngpu, enc_attn.size(1) - n_context)).to(enc_attn)], dim=-1)
-      loss = kl_loss_func(enc_attn, dec_attn.detach())
-      WandbLogger.log_w_step({'kl-loss': loss.item()})
-      pos_prob_sum = enc_attn[:, :n_context].exp().sum(-1).mean().item()
-      WandbLogger.log_w_step({'current-docs-encoder-prob-sum': pos_prob_sum})
-      ori_kl = kl_loss_func(torch.log_softmax(encoder_score[:, :n_context], dim=-1), dec_attn[:, :n_context].detach())
-      WandbLogger.log_w_step({'kl-loss-original': ori_kl.item()})
+      dec_attn = torch.cat([dec_attn, torch.zeros((bs_t_ngpu, enc_attn_for_ed_kl.size(2) - n_context)).to(enc_attn_for_ed_kl)], dim=-1)
+      loss = kl_loss_func(enc_attn_for_ed_kl, dec_attn.detach())
+      pos_prob_sum = enc_attn_for_ed_kl[:, :, :n_context].exp().sum(-1).mean(-1)  # (num_layer,)
+      multi_layer_log_w_step('current-docs-encoder-prob-sum', pos_prob_sum)
+      ori_kl = kl_loss_func(torch.log_softmax(encoder_score_for_ed_kl[:, :, :n_context], dim=-1), dec_attn[:, :n_context].detach(), log_key='kl-loss-original')
       if memory_bank_topk and memory_bank_additional_encode:  # track the original kl when additional_encode is used
         ori_n_context = n_context - memory_bank_topk
-        pos_prob_sum = enc_attn[:, :ori_n_context].exp().sum(-1).mean().item()
-        WandbLogger.log_w_step({'current-docs-encoder-prob-sum2': pos_prob_sum})
+        pos_prob_sum = enc_attn_for_ed_kl[:, :, :ori_n_context].exp().sum(-1).mean(-1)  # (num_layer,)
+        multi_layer_log_w_step('current-docs-encoder-prob-sum2', pos_prob_sum)
         ori_kl = kl_loss_func(
-          torch.log_softmax(encoder_score[:, :ori_n_context], dim=-1),
-          (dec_attn[:, :ori_n_context] / (dec_attn[:, :ori_n_context].sum(-1, keepdim=True) + 1e-10)).detach())
-        WandbLogger.log_w_step({'kl-loss-original2': ori_kl.item()})
+          torch.log_softmax(encoder_score_for_ed_kl[:, :, :ori_n_context], dim=-1),
+          (dec_attn[:, :ori_n_context] / (dec_attn[:, :ori_n_context].sum(-1, keepdim=True) + 1e-10)).detach(), log_key='kl-loss-original2')
     elif pairwise_loss == 'sigmoid':  # kl over current docs, sigmoid over others  # TODO: not tested
+      raise NotImplementedError
       loss = kl_loss_func(enc_attn, dec_attn.detach())
       WandbLogger.log_w_step({'kl-loss': loss.item()})
       # (n_gpu * bs, n_context, <=(n_gpu * bs - 1) * n_context)
@@ -1745,6 +1824,7 @@ def encoder_decoder_kl(
     else:
       raise NotImplementedError
   elif use_memory_bank:
+    raise NotImplementedError
     dec_attn = torch.cat([dec_attn, torch.zeros((bs, memory_bank_topk)).to(dec_attn)], dim=-1)  # (bs, n_context + memory_bank_topk)
     loss = kl_loss_func(enc_attn, dec_attn.detach())
     WandbLogger.log_w_step({'kl-loss': loss.item()})
@@ -1754,26 +1834,34 @@ def encoder_decoder_kl(
     WandbLogger.log_w_step({'kl-loss-original': ori_kl.item()})
   else:
     if kl_loss_reduction == 'only_one_positive':
-      loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, only_one_positive=True)
+      loss = compute_kl_loss_reduction(enc_attn_for_ed_kl, dec_attn.detach(), kl_loss_func=kl_loss_func, only_one_positive=True)
     elif kl_loss_reduction == 'only_one_positive-neg3':
-      loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, num_neg=3, only_one_positive=True)
+      loss = compute_kl_loss_reduction(enc_attn_for_ed_kl, dec_attn.detach(), kl_loss_func=kl_loss_func, num_neg=3, only_one_positive=True)
     elif kl_loss_reduction == 'neg3':
-      loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, num_neg=3, only_one_positive=False)
+      loss = compute_kl_loss_reduction(enc_attn_for_ed_kl, dec_attn.detach(), kl_loss_func=kl_loss_func, num_neg=3, only_one_positive=False)
     elif kl_loss_reduction == 'pos1-neg3':
-      loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, num_pos=1, num_neg=3, only_one_positive=False)
+      loss = compute_kl_loss_reduction(enc_attn_for_ed_kl, dec_attn.detach(), kl_loss_func=kl_loss_func, num_pos=1, num_neg=3, only_one_positive=False)
     elif kl_loss_reduction == 'pos1':
-      loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, num_pos=1, only_one_positive=False)
+      loss = compute_kl_loss_reduction(enc_attn_for_ed_kl, dec_attn.detach(), kl_loss_func=kl_loss_func, num_pos=1, only_one_positive=False)
     else:
-      loss = kl_loss_func(enc_attn, dec_attn.detach())
-    WandbLogger.log_w_step({'kl-loss': loss.item()})
+      loss = kl_loss_func(enc_attn_for_ed_kl, dec_attn.detach())
     if memory_bank_topk and memory_bank_additional_encode:  # track the original kl when additional_encode is used
       ori_n_context = n_context - memory_bank_topk
-      pos_prob_sum = enc_attn[:, :ori_n_context].exp().sum(-1).mean().item()
-      WandbLogger.log_w_step({'current-docs-encoder-prob-sum': pos_prob_sum})
+      pos_prob_sum = enc_attn_for_ed_kl[:, :, :ori_n_context].exp().sum(-1).mean(-1)  # (num_layer)
+      multi_layer_log_w_step('current-docs-encoder-prob-sum', pos_prob_sum)
       ori_kl = kl_loss_func(
-        torch.log_softmax(encoder_score[:, :ori_n_context], dim=-1),
-        (dec_attn[:, :ori_n_context] / (dec_attn[:, :ori_n_context].sum(-1, keepdim=True) + 1e-10)).detach())
-      WandbLogger.log_w_step({'kl-loss-original': ori_kl.item()})
+        torch.log_softmax(encoder_score_for_ed_kl[:, :, :ori_n_context], dim=-1),
+        (dec_attn[:, :ori_n_context] / (dec_attn[:, :ori_n_context].sum(-1, keepdim=True) + 1e-10)).detach(), log_key='kl-loss-original')
+  
+  # encoder kl
+  if encoder_encoder_kl_method is None:
+    pass
+  elif encoder_encoder_kl_method == 'side':  # use the top and bottom layer
+    enc_kl_loss = kl_loss_func(enc_attn[0], enc_attn[-1].detach().exp(), log_key='encoder-kl-loss')
+    loss += enc_kl_loss
+  else:
+    raise NotImplementedError
+ 
   return loss
 
 def aggregate_attention(
@@ -1855,12 +1943,18 @@ def aggregate_attention(
                         torch.zeros_like(scores).repeat(1, n_heads - use_head_idx - 1)], dim=1)
   self.retrieval['two_tower_attn_score'] = scores
 
-def get_single_head_idx(num_heads: int, n_layer_two_tower: int, max_over_head: bool = False):
+def get_single_head_idx(num_heads: int, n_layer_two_tower: int, max_over_head: bool = False, layer_index: int = None):
+  if layer_index is None:
+    layer_index = n_layer_two_tower
   if max_over_head:
     return None
   if num_heads == 12:  # 'google/t5-base-lm-adapt':
     assert n_layer_two_tower == 6
-    return 3
+    if layer_index == 6:
+      return 3
+    if layer_index == 11:
+      return 2
+    raise NotImplementedError
   if num_heads == 16:  # 'google/t5-large-lm-adapt':
     assert n_layer_two_tower == 12
     return 6
