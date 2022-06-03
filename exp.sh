@@ -11,7 +11,7 @@ out_datasets=(bioasq_500k_test cqadupstack_programmers msmarcoqa_dev fiqa cqadup
 all_datasets=("${in_datasets[@]}" "${out_datasets[@]}")
 declare -a gpu_topks=(100 1000 2048)
 declare -a cpu_topks=(4096 8192 16384)
-declare -a reranks=(0 100)
+declare -a reranks=(0 1000)
 
 domain=$1
 if [[ ${domain} == 'in' ]]; then

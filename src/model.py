@@ -1761,6 +1761,8 @@ def encoder_decoder_kl(
       loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, num_neg=3, only_one_positive=False)
     elif kl_loss_reduction == 'pos1-neg3':
       loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, num_pos=1, num_neg=3, only_one_positive=False)
+    elif kl_loss_reduction == 'pos1':
+      loss = compute_kl_loss_reduction(enc_attn, dec_attn.detach(), kl_loss_func=kl_loss_func, num_pos=1, only_one_positive=False)
     else:
       loss = kl_loss_func(enc_attn, dec_attn.detach())
     WandbLogger.log_w_step({'kl-loss': loss.item()})

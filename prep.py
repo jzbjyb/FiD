@@ -10,6 +10,7 @@ import random
 import logging
 import pickle
 import statistics
+from copy import deepcopy
 from tqdm import tqdm
 import spacy
 from spacy.lang.en import English
@@ -909,18 +910,34 @@ def add_doc_to_onlyid(query_file: str, psgs_tsv_file: str, out_json_file: str):
     json.dump(data, fout, indent=2)
 
 
-def merge_queries(pkl_file_pattern: str, out_pkl_file: str):
-  pkl_files = glob.glob(pkl_file_pattern)
-  print(f'#files {len(pkl_files)}')
-  datas = [pickle.load(open(pf, 'rb')) for pf in pkl_files]
-  qid2rank: Dict[str, List[Tuple[str, float]]] = {}
-  for qid in datas[0]:
-    all_ctxs = [ctx for data in datas for ctx in data[qid]]
-    assert len(all_ctxs) == len(set(ctx[0] for ctx in all_ctxs)), 'duplicated'
-    merged_ctxs = sorted(all_ctxs, key=lambda x: -x[1])[:len(datas[0][qid])]
-    qid2rank[qid] = merged_ctxs
-  with open(out_pkl_file, 'wb') as fout:
-     pickle.dump(qid2rank, fout)
+def merge_queries(file_pattern: str, out_file: str):
+  format = 'pkl' if file_pattern.endswith('.pkl') else None
+  format = 'json' if file_pattern.endswith('.json') else None
+  assert format
+  files = glob.glob(file_pattern)
+  print(f'#files {len(files)}')
+  if format == 'pkl':
+    datas = [pickle.load(open(pf, 'rb')) for pf in files]
+    qid2rank: Dict[str, List[Tuple[str, float]]] = {}
+    for qid in datas[0]:
+      all_ctxs = [ctx for data in datas for ctx in data[qid]]
+      assert len(all_ctxs) == len(set(ctx[0] for ctx in all_ctxs)), 'duplicated'
+      merged_ctxs = sorted(all_ctxs, key=lambda x: -x[1])[:len(datas[0][qid])]
+      qid2rank[qid] = merged_ctxs
+    with open(out_file, 'wb') as fout:
+      pickle.dump(qid2rank, fout)
+  raise NotImplementedError
+
+
+def concate_queries(file_pattern: str, out_file: str):
+  files = glob.glob(file_pattern)
+  print(f'#files {len(files)}')
+  data = []
+  for file in files:
+    with open(file, 'r') as fin:
+      data.extend(json.load(fin))
+  with open(out_file, 'w') as fout:
+    json.dump(data, fout, indent=2)
 
 
 def write_to_file(question: str, answers: List[str], ctx1: List[Dict], ctx2: List[Dict], fout):
@@ -1039,6 +1056,85 @@ def annotate_rank_file(rank_file: str, out_file: str):
     json.dump(data, fout, indent=2)
 
 
+def convert_colbert_data_to_fid_format(
+  qry_file: str, psg_file: str, annotation_file: str, out_file_original: str, out_file: str, merge: bool, num_doc_per_query: int = 100, one_positive_per_query: bool = False):
+  with open(out_file_original, 'r') as fin:
+    data = json.load(fin)
+  
+  qid2pdid2ndid: Dict[str, Dict[str, List[str]]] = defaultdict(lambda: defaultdict(list))
+  with open(annotation_file, 'r') as fin:
+    for l in fin:
+      qid, pdid, ndid = l.strip().lstrip('[').rstrip(']').split(',')
+      qid2pdid2ndid[qid][pdid].append(ndid)
+  num_pdid = np.sum([len(qid2pdid2ndid[qid]) for qid in qid2pdid2ndid])
+  num_ndid_per = np.mean([len(qid2pdid2ndid[qid][pdid]) for qid in qid2pdid2ndid for pdid in qid2pdid2ndid[qid]])
+  print(f'#qid {len(qid2pdid2ndid)}, #pdid {num_pdid}, #neg per qid-pdid {num_ndid_per}')
+  
+  # the following part is useless
+  query2qid: Dict[str, str] = {}
+  qid2query: Dict[str, str] = {}
+  with open(qry_file, 'r') as fin:
+    for l in fin:
+      qid, query = l.strip().split('\t')
+      query = query.strip()
+      if query in query2qid:
+        print(f'duplicate query: {query}')
+        continue
+      query2qid[query] = qid
+      qid2query[qid] = query
+  print(f'#qid after dedup: {len(qid2query)}')
+  
+  docs = next(src.util.load_passages(psg_file))
+  did2doc: Dict[str, Tuple] = {doc[0]: doc for doc in docs}
+  
+  new_data: List[Dict] = []
+  num_skips = 0
+  num_no_annotation = 0
+  for qid, example in tqdm(enumerate(data)):
+    qid = str(qid)
+    del example['ctxs']
+    if qid not in qid2pdid2ndid:
+      num_no_annotation += 1
+      continue
+    if merge:
+      new_example = deepcopy(example)
+      pdids = list(qid2pdid2ndid[qid].keys())
+      ndids = [qid2pdid2ndid[qid][pdid] for pdid in pdids]
+      for _ndids in ndids[1:]:
+        assert set(_ndids) == set(ndids[0]), f'{_ndids}, {ndids[0]}'
+      ndids = ndids[0]
+      all_dids = (pdids + ndids)[:num_doc_per_query]
+      if len(all_dids) < num_doc_per_query:
+        num_skips += 1
+        continue
+      new_example['ctxs'] = [{
+        'id': did,
+        'text': did2doc[did][1],
+        'title': did2doc[did][2],
+      } for did in all_dids]
+      new_data.append(new_example)
+    else:
+      for pdid in qid2pdid2ndid[qid]:
+        new_example = deepcopy(example)
+        new_example['ctxs'] = [{
+          'id': did,
+          'text': did2doc[did][1],
+          'title': did2doc[did][2],
+        } for did in [pdid] + qid2pdid2ndid[qid][pdid]]
+        if len(new_example['ctxs']) < num_doc_per_query:
+          num_skips += 1
+          continue
+        new_data.append(new_example)
+        if one_positive_per_query:
+          break
+  
+  print(f'#skip {num_skips}, #no annotation {num_no_annotation}')
+  print(f'#data {len(new_data)}')
+  os.makedirs(os.path.dirname(out_file), exist_ok=True)
+  with open(out_file, 'w') as fout:
+    json.dump(new_data, fout, indent=2)
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
@@ -1047,7 +1143,8 @@ if __name__ == '__main__':
     'add_negative', 'add_negative_mimic_inbatch', 'create_pseudo_queries_from_beir',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format', 'split_fid_file',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 
-    'create_whole_test', 'add_doc_to_onlyid', 'merge_queries', 'compare_two_rank_files', 'annotate_rank_file'])
+    'create_whole_test', 'add_doc_to_onlyid', 'merge_queries', 'concate_queries', 'compare_two_rank_files', 
+    'annotate_rank_file', 'convert_colbert_data_to_fid_format'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   parser.add_argument('--other', type=str, nargs='+', help='additional arguments')
@@ -1238,6 +1335,11 @@ if __name__ == '__main__':
     out_pkl_file = args.out[0]
     merge_queries(pkl_file_pattern, out_pkl_file)
   
+  elif args.task == 'concate_queries':
+    file_pattern = args.inp[0]
+    out_file = args.out[0]
+    concate_queries(file_pattern, out_file)
+  
   elif args.task == 'compare_two_rank_files':
     f1, f2 = args.inp
     out_file = args.out[0]
@@ -1247,3 +1349,9 @@ if __name__ == '__main__':
     rank_file = args.inp[0]
     out_file = args.out[0]
     annotate_rank_file(rank_file, out_file)
+
+  elif args.task == 'convert_colbert_data_to_fid_format':
+    qry_file, psg_file, annotation_file, qry_file_original = args.inp
+    out_file = args.out[0]
+    convert_colbert_data_to_fid_format(
+      qry_file, psg_file, annotation_file, qry_file_original, out_file, merge=False, one_positive_per_query=True)
