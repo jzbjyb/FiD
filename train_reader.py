@@ -249,7 +249,8 @@ if __name__ == "__main__":
           use_gold_doc_dist=opt.use_gold_doc_dist,
           retrieval_projection=opt.retrieval_projection,
           kl_loss_reduction=opt.kl_loss_reduction,
-          no_qa=opt.no_qa)
+          no_qa=opt.no_qa,
+          n_context_for_ibn=opt.n_context_for_ibn)
         if opt.init_from:
           logger.info(f'Init from {opt.init_from}')
           _model = model_class.from_pretrained(opt.init_from)

@@ -17,7 +17,8 @@ source utils.sh
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
-train_data=open_domain_data/NQ/train.json
+#train_data=open_domain_data/NQ/train.json
+train_data=../ColBERT/experiments/colbert-60000.dnn/indexes/nq.2bits/result_train_2probe_8192cand.json
 eval_data=open_domain_data/NQ/dev.json
 #train_data=open_domain_data/SciQ/train.json
 #eval_data=open_domain_data/SciQ/dev.json
@@ -34,15 +35,15 @@ combine_weight=0
 
 init_model=google/t5-large-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_bs24_inbatchneg24_83ratio8_step16k_ratio4
-init_from=${ckpt_dir}/nq_reader_large_v11lm_separate_layer12_bs16_step3k/checkpoint/latest
+name=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_bs24_inbatchneg24_83ratio8_step16k_ratio4_iterative_colbert_step8k
+init_from=${ckpt_dir}/nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_bs24_inbatchneg24_83ratio8_step16k_ratio4/checkpoint/latest
 only_topk_n_context=0
 n_layer_two_tower=12
 layer_for_retrieval=first
 keep_ctx_in_decoder_with_head=0
 keep_ctx_in_decoder_head_tau=0.001
 head_weights_norm_func=softmax
-encoder_decoder_kl_ratio=4.0
+encoder_decoder_kl_ratio=1.0
 encoder_encoder_kl_ratio=0.0
 encoder_encoder_kl="first|last=3|10"
 encoder_encoder_kl_sparsity=0
@@ -83,16 +84,16 @@ python ${prefix} train_reader.py \
   --retrieval_aggregation_method ${retrieval_aggregation_method} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 16000 \
-  --warmup_step 1600 \
-  --save_freq 4000 \
+  --total_step 8000 \
+  --warmup_step 800 \
+  --save_freq 8000 \
   --eval_freq 400 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
   --wandb_log_freq 10 \
-  --init_from ${init_from} \
-  --in_batch_negative &>> ${ckpt_dir}/${name}.out
+  --in_batch_negative \
+  --init_from ${init_from} &>> ${ckpt_dir}/${name}.out
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
 # --decoder_attn_ctx_normalize \

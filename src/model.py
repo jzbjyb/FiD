@@ -615,6 +615,7 @@ class FiDT5Config(transformers.T5Config):
                retrieval_projection: str = None,
                kl_loss_reduction: str = None,
                no_qa: bool = False,
+               n_context_for_ibn: int = None,
                **kwargs):
     super().__init__(*args, **kwargs)
     self.n_layer_two_tower = n_layer_two_tower
@@ -652,6 +653,7 @@ class FiDT5Config(transformers.T5Config):
     self.retrieval_projection = retrieval_projection
     self.kl_loss_reduction = kl_loss_reduction
     self.no_qa = no_qa
+    self.n_context_for_ibn = n_context_for_ibn
 
 class FiDT5(transformers.T5ForConditionalGeneration):
     config_class = FiDT5Config
@@ -704,7 +706,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
                 use_gold_doc_dist: bool = False,
                 retrieval_projection: str = None,
                 kl_loss_reduction: str = None,
-                no_qa: bool = False):
+                no_qa: bool = False,
+                n_context_for_ibn: int = None):
         t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
         config = cls.config_class(
           n_layer_two_tower=n_layer_two_tower,
@@ -742,6 +745,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
           retrieval_projection=retrieval_projection,
           kl_loss_reduction=kl_loss_reduction,
           no_qa=no_qa,
+          n_context_for_ibn=n_context_for_ibn,
           **t5.config.to_dict())
         model = cls(config)
         model.load_t5(t5.state_dict())
@@ -867,7 +871,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         r = self.get_collected_for_retrieval()
         ttas = r['two_tower_attn_score_full'] if 'two_tower_attn_score_full' in r else r['two_tower_attn_score']
         ttasfm = r['two_tower_attn_score_full_mask'] if 'two_tower_attn_score_full' in r else None
-        return ttas, ttasfm
+        n_context = r['n_context']
+        return ttas, ttasfm, n_context
       self.decoder = DecoderWrapper(config, self.decoder, gcif)
 
     def unwrap_decoder(self, config):
@@ -1112,13 +1117,13 @@ class DecoderWrapper(torch.nn.Module):
        **kwargs):
     # fetch encoder importance
     # (num_q, num_d, num_layer, num_head, [num_toks]), (num_q, num_d, num_toks)
-    encoder_imp, encoder_imp_tok_mask = self.get_encoder_importance_func()
+    encoder_imp, encoder_imp_tok_mask, n_context = self.get_encoder_importance_func()
     has_token = encoder_imp.dim() == 5
     num_q, num_d, num_layer, num_head = encoder_imp.size()[:4]
     num_toks = encoder_imp.size(4) if has_token else None
-    num_q, dt, _ = encoder_hidden_states.size()  # (num_q, num_d * ctx_len, emb_size)
-    assert dt % num_d == 0, 'encoder_hidden_states shape error'
-    ctx_len = dt // num_d
+    dt = encoder_hidden_states.size(1)  # n_context * ctx_len
+    assert dt % n_context == 0, 'encoder_hidden_states shape error'
+    ctx_len = dt // n_context
 
     # apply combine weight
     encoder_imp = torch.exp(self.combine_weight) * encoder_imp
@@ -1189,7 +1194,7 @@ class DecoderWrapper(torch.nn.Module):
       if has_token:
         raise NotImplementedError
       # spasify
-      assert self.num_keep_ctx_in_decoder <= num_d
+      assert self.num_keep_ctx_in_decoder <= n_context
       value, ind = encoder_imp.topk(self.num_keep_ctx_in_decoder, -1)
       encoder_imp_mask = torch.zeros_like(encoder_imp).bool()
       encoder_imp_mask.scatter_(-1, ind, True)  # encoder_imp still contains all values and we use this mask to force sparsity
@@ -1212,7 +1217,7 @@ class DecoderWrapper(torch.nn.Module):
         encoder_score=encoder_imp,
         encoder_score_mask=encoder_imp_tok_mask,
         gold_doc_dist=gold_doc_dist,
-        n_context=num_d,
+        n_context=n_context,
         only_topk_n_context=self.only_topk_n_context,
         use_softmax=True,
         encoder_score_pre_softmaxed=self.encoder_attention_pre_softmax,
@@ -1457,7 +1462,7 @@ class EncoderWrapper(torch.nn.Module):
       merge = {}
       for i, func in enumerate(self.retrieval_t5block_funcs):
         result = func()
-        for k, v in result.items():  # v is (bs, num_heads, ...)
+        for k, v in result.items():  # v is (bs, num_heads, ...) or (bs, ?, num_heads, ...) for two_tower attn_score
           if k.endswith('mask'):  # mask is the same across layers
             merge[k] = v
             continue
@@ -1466,11 +1471,15 @@ class EncoderWrapper(torch.nn.Module):
           else:
             merge[k].append(v)
       for k in merge:
-        if not k.endswith('mask'):
+        if k.startswith('two_tower_attn_score'):
+          merge[k] = torch.stack(merge[k], 2)  # (bs, ?, num_layers, num_heads, ...)
+        elif not k.endswith('mask'):
           merge[k] = torch.stack(merge[k], 1)  # (bs, num_layers, num_heads, ...)
-        if hasattr(self, 'n_passages'):
+        if hasattr(self, 'n_passages') and not k.startswith('two_tower_attn_score'):
           # (num_query, n_context, num_layers, num_heads, ...)
           merge[k] = merge[k].view(*((-1, self.n_passages) + merge[k].size()[1:]))
+      if hasattr(self, 'n_passages'):  # used by decoder
+        merge['n_context'] = self.n_passages
       return merge
 
 class T5blockWrapper(torch.nn.Module):
@@ -1508,6 +1517,7 @@ class T5blockWrapper(torch.nn.Module):
         self.pad_token_id = config.pad_token_id
         self.num_heads = config.num_heads
         self.n_layer_two_tower = config.n_layer_two_tower
+        self.n_context_for_ibn = config.n_context_for_ibn
         self.need_collect = FiDT5.need_wrap_decoder(config) or bool(config.encoder_encoder_kl_ratio)
         self.retrieval_projection = config.retrieval_projection
         self.term_weight_linear = None
@@ -1548,7 +1558,8 @@ class T5blockWrapper(torch.nn.Module):
                     term_weight_linear=self.term_weight_linear,
                     embedding_normalize=self.embedding_normalize,
                     hidden_linear=self.hidden_linear,
-                    head_linear=self.head_linear), reg_point.SelfAttention)
+                    head_linear=self.head_linear,
+                    n_context_for_ibn=self.n_context_for_ibn), reg_point.SelfAttention)
             if self.in_batch_negative and self.training:
               reg_point.SelfAttention.in_batch_negative = types.MethodType(functools.partial(
                 in_batch_negative, n_context=self.n_passages, in_batch_negative_size=self.in_batch_negative_size,
@@ -1987,8 +1998,9 @@ def collect_for_retrieval(
      term_weight_linear: nn.Linear = None,
      embedding_normalize: bool = False,
      hidden_linear: nn.Linear = None,
-     head_linear: nn.Linear = None):
-    
+     head_linear: nn.Linear = None,
+     n_context_for_ibn: int = None):
+  
   def _get_term_weights(query_states, query_mask):  # (?, n_heads, seq_len, emb_size_per_head), (?, seq_len)
     if term_weight_linear is None:
       return None
@@ -2023,11 +2035,105 @@ def collect_for_retrieval(
 
   if hasattr(self, 'in_batch_negative') and self.training:  # collect and combine from all gpu (only in training)
     only_self_attn_qd = True  # only compute self attn between query query vectors and doc key vectors to save memory
+    
+    if only_self_attn_qd:
+      # collect query, key, and attn across all gpus
+      if use_head_idx is not None:
+        global_q, global_k, global_attn = all_gather_tensors(
+          query_states[:, use_head_idx:use_head_idx + 1].contiguous(), key_states[:, use_head_idx:use_head_idx + 1].contiguous(), attention_mask)
+      else:
+        global_q, global_k, global_attn = all_gather_tensors(query_states, key_states, attention_mask)
+      # (n_q, n_context, n_heads, seq_len, emb_size_per_head) where n_q = n_gpu * bs
+      global_q = torch.cat(global_q, dim=0).view(-1, n_context, *global_q[0].size()[1:])
+      global_k = torch.cat(global_k, dim=0).view(-1, n_context, *global_k[0].size()[1:])
+      # (n_q, n_context, seq_len, seq_len)
+      global_attn = torch.cat(global_attn, dim=0).view(-1, n_context, *global_attn[0].size()[1:])
+      nq = global_attn.size(0)
+
+      # split into qry and doc representations
+      max_qry_len = global_attn[:, :, 0].sum(-1).max()
+      min_qry_len = global_attn[:, :, 0].sum(-1).min()
+      query_mask = global_attn[:, :, 0, :max_qry_len]  # (n_q, n_context, max_qry_len)
+      doc_mask = global_attn[:, :, -1, min_qry_len:]  # (n_q, n_context, seq_len - min_qry_len)
+      global_q = global_q[:, :, :, :max_qry_len]  # (n_q, n_context, n_heads, max_qry_len, emb_size_per_head)
+      global_k = global_k[:, :, :, min_qry_len:]  # (n_q, n_context, n_heads, seq_len - min_qry_len, emb_size_per_head)
+
+      # TODO: term weight, normalization, max over head
+
+      # compute attn between qry and associated docs
+      # (n_q, n_context, n_heads, max_qry_len, seq_len - min_qry_len)
+      scores = torch.matmul(global_q, global_k.transpose(4, 3))
+      # (n_q, n_context, max_qry_len, seq_len - min_qry_len)
+      scores_mask = query_mask.unsqueeze(-1) & doc_mask.unsqueeze(-2)
+
+      # sample a subset for the next step
+      if n_context_for_ibn:
+        assert n_context_for_ibn <= n_context
+        # (n_q, n_context_for_ibn)
+        sub_ind = torch.tensor([np.random.choice(n_context, size=n_context_for_ibn, replace=False) for _ in range(nq)]).to(attention_mask.device)
+        sub_mask = torch.zeros(nq, n_context).bool().to(attention_mask.device)  # (n_q, n_context)
+        sub_mask.scatter_(-1, sub_ind, True)
+        # (n_q, n_context_for_ibn, n_heads, max_qry_len, emb_size_per_head)
+        global_q_sub = torch.masked_select(global_q, sub_mask[:, :, None, None, None]).view(nq, n_context_for_ibn, *global_q.size()[2:])
+        # (n_q, n_context_for_ibn, n_heads, seq_len - min_qry_len, emb_size_per_head)
+        global_k_sub = torch.masked_select(global_k, sub_mask[:, :, None, None, None]).view(nq, n_context_for_ibn, *global_k.size()[2:])
+        # (n_q, n_context_for_ibn, max_qry_len)
+        query_mask_sub = torch.masked_select(query_mask, sub_mask[:, :, None]).view(nq, n_context_for_ibn, *query_mask.size()[2:])
+        # (n_q, n_context_for_ibn, seq_len - min_qry_len)
+        doc_mask_sub = torch.masked_select(doc_mask, sub_mask[:, :, None]).view(nq, n_context_for_ibn, *doc_mask.size()[2:])
+      else:
+        global_q_sub, global_k_sub, query_mask_sub, doc_mask_sub = global_q, global_k, query_mask, doc_mask
+      
+      # compute attn between qry and any docs
+      # (n_q, nq, <=n_context, n_heads, max_qry_len, seq_len - min_qry_len)
+      scores_ibn = torch.matmul(global_q_sub.unsqueeze(1), global_k_sub.transpose(4, 3).unsqueeze(0))
+      # (n_q, nq, <=n_context, max_qry_len, seq_len - min_qry_len)
+      scores_ibn_mask = query_mask_sub.unsqueeze(-1).unsqueeze(1) & doc_mask_sub.unsqueeze(-2).unsqueeze(0)
+
+      # remove attn between qry and associated docs
+      rm_mask = ~torch.eye(nq).bool().to(attention_mask.device)  # (n_q, n_q)
+      # masked_select will cause "transform: failed to synchronize: cudaerrorillegaladdress: an illegal memory access was encountered"
+      # (n_q, (nq - 1) * <=n_context, n_heads, max_qry_len, seq_len - min_qry_len)
+      #scores_ibn = torch.masked_select(scores_ibn, rm_mask[:, :, None, None, None, None]).view(nq, -1, *scores_ibn.size()[3:])
+      # (n_q, (nq - 1) * <=n_context, max_qry_len, seq_len - min_qry_len)
+      #scores_ibn_mask = torch.masked_select(scores_ibn_mask, rm_mask[:, :, None, None, None]).view(nq, -1, *scores_ibn_mask.size()[3:])
+
+      gather_index = torch.masked_select(torch.arange(nq).unsqueeze(0).to(attention_mask.device), rm_mask).view(nq, nq - 1)  # (n_q, n_q - 1)
+      # (n_q, (nq - 1) * <=n_context, n_heads, max_qry_len, seq_len - min_qry_len)
+      scores_ibn = torch.gather(scores_ibn, 1, gather_index[:, :, None, None, None, None].repeat(1, 1, *scores_ibn.size()[2:])).view(nq, -1, *scores_ibn.size()[3:])
+      # (n_q, (nq - 1) * <=n_context, max_qry_len, seq_len - min_qry_len)
+      scores_ibn_mask = torch.gather(scores_ibn_mask, 1, gather_index[:, :, None, None, None].repeat(1, 1, *scores_ibn_mask.size()[2:])).view(nq, -1, *scores_ibn_mask.size()[3:])
+
+      # combine two scores and add position bias
+      scores = torch.cat([scores, scores_ibn], dim=1)  # (n_q, n_context + (nq - 1) * <=n_context, n_heads, max_qry_len, seq_len - min_qry_len)
+      scores_mask = torch.cat([scores_mask, scores_ibn_mask], dim=1)  # (n_q, n_context + (nq - 1) * <=n_context, max_qry_len, seq_len - min_qry_len)
+      if use_head_idx is not None:
+        scores = scores + position_bias[None, :, use_head_idx:use_head_idx + 1, :max_qry_len, min_qry_len:]
+      else:
+        scores = scores + position_bias[None, :, :, :max_qry_len, min_qry_len:]
+
+      # aggregate scores
+      assert aggregation_method == 'all-avg-max'
+      # (n_q, n_context + (nq - 1) * <=n_context, n_heads, max_qry_len)
+      scores, max_doc_tok_idx = (scores - (~scores_mask.unsqueeze(2) * 1e5)).max(-1)
+      _query_mask = query_mask[:, :1, None, :]  # (n_q, 1, 1, max_qry_len)
+      # (n_q, n_context + (nq - 1) * <=n_context, n_heads)
+      scores = (scores * _query_mask).sum(-1) / _query_mask.sum(-1)
+
+      if use_head_idx is not None:
+        scores = torch.cat([
+          torch.zeros_like(scores).repeat(1, 1, use_head_idx), 
+          scores, 
+          torch.zeros_like(scores).repeat(1, 1, n_heads - use_head_idx - 1)], dim=-1)
+      self.retrieval['two_tower_attn_score'] = scores
+    
+    '''
     scores_li = []
     # (<=(n_gpu * bs)^2 * n_context, n_heads, seq_len, emb_size_per_head)
     # (<=(n_gpu * bs)^2 * n_context, seq_len, seq_len)
     for _query_states, _key_states, _attention_mask in self.in_batch_negative(
       query_states, key_states, attention_mask, head_idx=use_head_idx):
+
       if only_self_attn_qd:
         max_qry_len = _attention_mask[:, 0].sum(-1).max()  # (<=(n_gpu * bs)^2 * n_context)
         min_qry_len = _attention_mask[:, 0].sum(-1).min()  # (<=(n_gpu * bs)^2 * n_context)
@@ -2068,6 +2174,7 @@ def collect_for_retrieval(
           scores = torch.cat([torch.zeros_like(scores).repeat(1, use_head_idx), scores,
                               torch.zeros_like(scores).repeat(1, n_heads - use_head_idx - 1)], dim=1)
         scores_li.append(scores)
+      
       else:
         # (<=(n_gpu * bs)^2 * n_context, n_heads, seq_len, seq_len)
         scores = torch.matmul(_query_states, _key_states.transpose(3, 2))
@@ -2080,10 +2187,14 @@ def collect_for_retrieval(
           field=field, aggregation_method=aggregation_method, max_over_head=max_over_head, 
           use_head_idx=use_head_idx, n_heads=n_heads, term_weights=_get_term_weights(_query_states, _attention_mask[:, 0]))
         scores_li.append(self.retrieval['two_tower_attn_score'])
-    self.retrieval['two_tower_attn_score'] = torch.cat(scores_li, dim=0)
+      # ((n_gpu * bs)^2, n_context, n_heads, seq_len, seq_len)
+      self.retrieval['two_tower_attn_score'] = torch.cat(scores_li, dim=0).view(-1, n_context, *scores_li[0].size()[1:])
+    '''
+    
     return
 
   if memory_bank is not None:
+    raise NotImplementedError
     if term_weight_linear is not None:
       raise NotImplementedError
     assert use_head_idx is not None  # TODO: add multi-head?
@@ -2200,6 +2311,9 @@ def collect_for_retrieval(
   aggregate_attention(
     self, scores, attention_mask,
     field=field, aggregation_method=aggregation_method, max_over_head=max_over_head, term_weights=term_weights)
+  if n_context is not None:
+    ttas = self.retrieval['two_tower_attn_score']
+    self.retrieval['two_tower_attn_score'] = ttas.view(-1, n_context, *ttas.size()[1:])
 
 def cross_combine(values,  # (query_dim, doc_dim, seq_len, ...)
                   sep_lens,  # (query_dim)
