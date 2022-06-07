@@ -7,6 +7,7 @@
 import faiss
 import time
 import sys
+import random
 import torch
 import transformers
 import numpy as np
@@ -60,15 +61,26 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             idx, labels, _, context_ids, context_mask, context_sep_mask, doc_ids, gold_doc_dist = batch
             context_sep_mask = context_sep_mask.cuda() if context_sep_mask is not None else context_sep_mask
             gold_doc_dist = gold_doc_dist.cuda() if gold_doc_dist is not None else gold_doc_dist
+            '''
             train_loss = model(
                 input_ids=context_ids.cuda(),
                 attention_mask=context_mask.cuda(),
                 attention_separate_mask=context_sep_mask,
                 labels=labels.cuda(),
                 input_doc_ids=doc_ids,
-                gold_doc_dist=gold_doc_dist
+                gold_doc_dist=gold_doc_dist,
+                accumulate_steps=opt.accumulation_for_ibn,
             )[0]
-            train_loss.backward()
+            '''
+            train_loss = src.model.fid_run(
+                model, 
+                input_ids=context_ids.cuda(),
+                attention_mask=context_mask.cuda(),
+                attention_separate_mask=context_sep_mask,
+                labels=labels.cuda(),
+                input_doc_ids=doc_ids,
+                gold_doc_dist=gold_doc_dist,
+                accumulate_steps=opt.accumulation_for_ibn)[0]
 
             if _step % opt.accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), opt.clip)
@@ -152,6 +164,8 @@ if __name__ == "__main__":
     global_context['opt'] = opt
 
     torch.manual_seed(opt.seed)
+    np.random.seed(opt.seed)
+    random.seed(opt.seed)
     src.slurm.init_distributed_mode(opt, is_slurm_job=False)
     src.slurm.init_signal_handler()
 

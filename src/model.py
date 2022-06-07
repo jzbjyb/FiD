@@ -6,7 +6,7 @@
 
 from cmath import log
 from mimetypes import init
-from typing import Callable, List
+from typing import Callable, List, Dict
 import types
 import warnings
 import random
@@ -21,8 +21,8 @@ from transformers.models.t5.modeling_t5 import \
   T5Attention, T5Stack, T5LayerSelfAttention, T5ForConditionalGeneration, __HEAD_MASK_WARNING_MSG, logger
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, BaseModelOutput, Seq2SeqLMOutput
 from entmax import sparsemax
-from src.util import max_sparsify, WandbLogger, global_context
-from src.dist_utils import all_gather_tensors
+from src.util import RandContext, max_sparsify, WandbLogger, global_context
+from src.dist_utils import all_gather_tensors, get_rank, get_world_size
 from src.index import Indexer
 from src.memory_bank import MemoryBank, MemoryBankProcessHelper
 
@@ -47,6 +47,7 @@ def t5forconditionalgeneration_forward(
      return_dict=None,
      input_doc_ids=None,  # document identifiers 
      gold_doc_dist=None,  # gold document annotation
+     only_bi_encoder_forward: bool = False
 ):
   r"""
   labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -90,7 +91,10 @@ def t5forconditionalgeneration_forward(
       output_attentions=output_attentions,
       output_hidden_states=output_hidden_states,
       return_dict=return_dict,
-      input_doc_ids=input_doc_ids)
+      input_doc_ids=input_doc_ids,
+      only_bi_encoder_forward=only_bi_encoder_forward)
+    if only_bi_encoder_forward:
+      return encoder_outputs
   elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
     encoder_outputs = BaseModelOutput(
       last_hidden_state=encoder_outputs[0],
@@ -577,6 +581,82 @@ def t5attention_forward(
 
 T5Attention.forward = t5attention_forward
 
+def fid_run(model, input_ids=None, attention_mask=None, accumulate_steps: int = None, **kwargs):
+  if not accumulate_steps:
+    result = model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+    loss = result[0]
+    loss.backward()
+    return result
+  
+  # split tensors into accumulation_steps parts
+  bsz = input_ids.size(0)
+  assert bsz == attention_mask.size(0)
+  assert bsz % accumulate_steps == 0, 'batch size not dividable by accumulate_steps'
+  _input_ids = input_ids.chunk(accumulate_steps)
+  _attention_mask = attention_mask.chunk(accumulate_steps)
+  _kwargs = {}
+  _rand_states = []
+  for k in ['attention_separate_mask', 'input_doc_ids', 'gold_doc_dist', 'labels']:
+    if k in kwargs:
+      if type(kwargs[k]) is torch.Tensor:
+        assert kwargs[k].size(0) == bsz
+        _kwargs[k] = kwargs[k].chunk(accumulate_steps)
+      elif type(kwargs[k]) is np.ndarray:
+        assert kwargs[k].shape[0] == bsz
+        _kwargs[k] = np.split(kwargs[k], accumulate_steps)
+      else:
+        raise ValueError
+  def get_kwargs_chunk(step):
+    kwargs_chunk = {k: v for k, v in kwargs.items()}
+    for k in _kwargs:
+      kwargs_chunk[k] = _kwargs[k][step]
+    return kwargs_chunk
+
+  # TODO: not applicable to multiple layers
+  # run bi-encoder to get representations in training mode w/o gradient
+  accumulated = {
+    'total': accumulate_steps,
+    'query_states': [], 
+    'key_states': [],
+    'attention_mask': [],
+    'decoder_attention': []
+  }
+  with torch.no_grad():
+    for acc_step in range(accumulate_steps):
+      _rand_states.append(RandContext(*RandContext.get_input_tensors(
+        input_ids=_input_ids[acc_step], 
+        attention_mask=_attention_mask[acc_step], 
+        **get_kwargs_chunk(acc_step))))
+      enc_reg_point, use_head_idx, dec_reg_point = model(
+        input_ids=_input_ids[acc_step], 
+        attention_mask=_attention_mask[acc_step], 
+        **get_kwargs_chunk(acc_step), 
+        collect_necessary_for_ibn=True)
+      assert use_head_idx is not None
+      qs, ks, am = enc_reg_point.retrieval['query_states'], enc_reg_point.retrieval['key_states'], enc_reg_point.retrieval['attention_mask']
+      da = dec_reg_point.retrieval['decoder_attention']
+      global_q, global_k, global_attn, global_dec_attn = all_gather_tensors(
+        qs[:, use_head_idx:use_head_idx + 1].contiguous(), ks[:, use_head_idx:use_head_idx + 1].contiguous(), am, da)
+      accumulated['query_states'].extend(global_q)
+      accumulated['key_states'].extend(global_k)
+      accumulated['attention_mask'].extend(global_attn)
+      accumulated['decoder_attention'].extend(global_dec_attn)
+  
+  # run full model w/ gradient
+  # inform encoder and decoder
+  for acc_step in range(accumulate_steps):
+    state = _rand_states[acc_step]
+    accumulated['step'] = acc_step
+    with state:
+      result = model(
+        input_ids=_input_ids[acc_step], 
+        attention_mask=_attention_mask[acc_step], 
+        **get_kwargs_chunk(acc_step),
+        accumulated=accumulated)
+      loss = result[0]
+      loss.backward()
+  return result
+
 class FiDT5Config(transformers.T5Config):
   def __init__(self,
                *args,
@@ -666,6 +746,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         self.collect_kl_loss_from_decoder = bool(config.encoder_decoder_kl_ratio)
         self.collect_kl_loss_from_encoder = bool(config.encoder_encoder_kl_ratio)
         self.n_layer_two_tower = config.n_layer_two_tower
+        self.num_heads = config.num_heads
+        self.max_over_head = config.max_over_head
         self.memory_bank_recompute = config.memory_bank_recompute
         self.no_qa = config.no_qa
 
@@ -751,21 +833,11 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         model.load_t5(t5.state_dict())
         return model
 
-    def forward_(self, **kwargs):
-        if 'input_ids' in kwargs:
-            kwargs['input_ids'] = kwargs['input_ids'].view(kwargs['input_ids'].size(0), -1)
-        if 'attention_mask' in kwargs:
-            kwargs['attention_mask'] = kwargs['attention_mask'].view(kwargs['attention_mask'].size(0), -1)
-
-        return super(FiDT5, self).forward(
-            **kwargs
-        )
-
     # We need to resize as B x (N * L) instead of (B * N) x L here
     # because the T5 forward method uses the input tensors to infer
     # dimensions used in the decoder.
     # EncoderWrapper resizes the inputs as (B * N) x L.
-    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+    def forward(self, input_ids=None, attention_mask=None, accumulated=None, **kwargs):
         if 'attention_separate_mask' in kwargs:  # set separate mask for encoder
             asm = kwargs['attention_separate_mask']
             self.set_attention_separate_mask(asm)
@@ -777,17 +849,42 @@ class FiDT5(transformers.T5ForConditionalGeneration):
             input_ids = input_ids.view(input_ids.size(0), -1)
         if attention_mask != None:
             attention_mask = attention_mask.view(attention_mask.size(0), -1)
+        
+        collect_necessary_for_ibn = False
+        if 'collect_necessary_for_ibn' in kwargs:
+          collect_necessary_for_ibn = kwargs['collect_necessary_for_ibn']
+          del kwargs['collect_necessary_for_ibn']
+
+        if accumulated is not None:  # pass it to encoder and decoder
+            self.encoder.set_accumulated(accumulated)
+            self.decoder.set_accumulated(accumulated)
+        else:
+            self.encoder.delete_accumulated()
+            self.decoder.delete_accumulated()
         result = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             **kwargs
         )
+        if accumulated is not None:
+            self.encoder.delete_accumulated()
+            self.decoder.delete_accumulated()
+
+        if 'only_bi_encoder_forward' in kwargs and kwargs['only_bi_encoder_forward']:
+          return result
+        if collect_necessary_for_ibn:
+          enc_reg = self.encoder.get_reg_point()
+          dec_reg = self.decoder.get_reg_point()
+          return enc_reg, self.encoder.use_head_idx, dec_reg
+
         kl_loss = 0
         if self.collect_kl_loss_from_decoder:
           kl_loss += self.decoder.get_kl_loss()
         if self.collect_kl_loss_from_encoder:
           kl_loss += self.encoder.get_kl_loss()
         qa_loss_factor = 0.0 if self.no_qa else 1.0
+        if accumulated is not None:
+          qa_loss_factor /= accumulated['total']  # average across accumulations
         if 'return_dict' in kwargs and kwargs['return_dict'] and result.loss is not None:
           result.loss = qa_loss_factor * result.loss + kl_loss
         elif 'labels' in kwargs and kwargs['labels'] is not None:
@@ -1104,8 +1201,18 @@ class DecoderWrapper(torch.nn.Module):
     world_size = 1
     if self.in_batch_negative and global_context['opt'].is_distributed:  # to counter the gradient avg across gpus
       world_size = global_context['opt'].world_size
-    kl_loss = self.decoder.block[-1].layer[1].EncDecAttention.kl_loss * self.encoder_decoder_kl_ratio * world_size
+    kl_loss = self.get_reg_point().kl_loss * self.encoder_decoder_kl_ratio * world_size
     return kl_loss
+  
+  def get_reg_point(self):
+    return self.decoder.block[-1].layer[1].EncDecAttention
+  
+  def set_accumulated(self, accumulated: Dict):
+    self.accumulated = accumulated
+  
+  def delete_accumulated(self):
+    if hasattr(self, 'accumulated'):
+      del self.accumulated
 
   def forward(
        self,
@@ -1211,7 +1318,7 @@ class DecoderWrapper(torch.nn.Module):
             functools.partial(decoder_attn_ctx_normalize, n_context=num_d), reg_point)
     elif self.encoder_decoder_kl_ratio:
       # assign to the last cross attn module
-      reg_point = self.decoder.block[-1].layer[1].EncDecAttention
+      reg_point = self.get_reg_point()
       reg_point.encoder_decoder_kl = types.MethodType(functools.partial(
         encoder_decoder_kl,
         encoder_score=encoder_imp,
@@ -1228,7 +1335,8 @@ class DecoderWrapper(torch.nn.Module):
         use_gold_doc_dist=self.use_gold_doc_dist,
         kl_loss_reduction=self.kl_loss_reduction,
         encoder_decoder_kl_method=self.encoder_decoder_kl_method,
-        encoder_encoder_kl_method=self.encoder_encoder_kl_method
+        encoder_encoder_kl_method=self.encoder_encoder_kl_method,
+        accumulated=self.accumulated if hasattr(self, 'accumulated') else None,
       ), reg_point)
     else:
       raise NotImplementedError
@@ -1280,14 +1388,22 @@ class EncoderWrapper(torch.nn.Module):
         def bi_encoder_forward(
              input_ids,  # (bs, seq_len)
              attention_mask):  # (bs, seq_len, seq_len)
-          return self.encoder(input_ids, attention_mask, num_run_layers=self.n_layer_two_tower + 1)
+          reg_point = self.get_reg_point()
+          reg_point.just_collect = True
+          _ = self.encoder(input_ids, attention_mask, num_run_layers=self.n_layer_two_tower + 1)
+          del reg_point.just_collect
+          return reg_point, self.use_head_idx
         self.bi_encoder_forward = bi_encoder_forward
         self.apply_t5block_wrapper(config)
+    
+    def get_reg_point(self):
+      return self.encoder.block[self.n_layer_two_tower].module.layer[0].SelfAttention
 
     def forward(self, input_ids=None, attention_mask=None, input_doc_ids=None, **kwargs):
         if 'direct' in kwargs and kwargs['direct']:  # no reshaping, used in retrieval
           del kwargs['direct']
           return self.encoder(input_ids, attention_mask, **kwargs)
+
         # total_length = n_passages * passage_length
         bsz, total_length = input_ids.shape
         passage_length = total_length // self.n_passages
@@ -1307,11 +1423,8 @@ class EncoderWrapper(torch.nn.Module):
           self.eval()
           if use_memory_bank:  # generate bi-encoder representations
             n_context = self.n_passages
-            reg_point = self.encoder.block[self.n_layer_two_tower].module.layer[0].SelfAttention
-            reg_point.just_collect = True
-            self.bi_encoder_forward(input_ids, attention_mask)
-            del reg_point.just_collect
-            query_states, key_states = reg_point.retrieval['query_states'], reg_point.retrieval['key_states']
+            collected = self.bi_encoder_forward(input_ids, attention_mask)[0].retrieval
+            query_states, key_states = collected['query_states'], collected['key_states']
             if self.separate_process:
               self.memory_bank.start()
           if use_memory_bank_and_retrieve:  # retrieve, store, then update the input_ids and attention_mask
@@ -1337,6 +1450,11 @@ class EncoderWrapper(torch.nn.Module):
         for block in self.encoder.block:
           block.n_passages = self.n_passages
           block.input_ids = input_ids
+        
+        if 'only_bi_encoder_forward' in kwargs and kwargs['only_bi_encoder_forward']:
+          return self.bi_encoder_forward(input_ids, attention_mask)
+        if 'only_bi_encoder_forward' in kwargs:
+          del kwargs['only_bi_encoder_forward']
 
         outputs = self.encoder(input_ids, attention_mask, **kwargs)
 
@@ -1481,6 +1599,13 @@ class EncoderWrapper(torch.nn.Module):
       if hasattr(self, 'n_passages'):  # used by decoder
         merge['n_context'] = self.n_passages
       return merge
+    
+    def set_accumulated(self, accumulated: Dict):
+      self.encoder.block[self.n_layer_two_tower].accumulated = accumulated
+    
+    def delete_accumulated(self):
+      if hasattr(self.encoder.block[self.n_layer_two_tower], 'accumulated'):
+        del self.encoder.block[self.n_layer_two_tower].accumulated
 
 class T5blockWrapper(torch.nn.Module):
     """
@@ -1559,7 +1684,8 @@ class T5blockWrapper(torch.nn.Module):
                     embedding_normalize=self.embedding_normalize,
                     hidden_linear=self.hidden_linear,
                     head_linear=self.head_linear,
-                    n_context_for_ibn=self.n_context_for_ibn), reg_point.SelfAttention)
+                    n_context_for_ibn=self.n_context_for_ibn,
+                    accumulated=self.accumulated if hasattr(self, 'accumulated') else None), reg_point.SelfAttention)
             if self.in_batch_negative and self.training:
               reg_point.SelfAttention.in_batch_negative = types.MethodType(functools.partial(
                 in_batch_negative, n_context=self.n_passages, in_batch_negative_size=self.in_batch_negative_size,
@@ -1700,7 +1826,8 @@ def encoder_decoder_kl(
      use_gold_doc_dist: bool = False,
      kl_loss_reduction: str = None,
      encoder_decoder_kl_method: str = 'merge',
-     encoder_encoder_kl_method: str = None):
+     encoder_encoder_kl_method: str = None,
+     accumulated: Dict = None):
 
   if encoder_decoder_kl_method == 'merge':  # add the layer dimension
     encoder_score = encoder_score.unsqueeze(0)
@@ -1774,9 +1901,17 @@ def encoder_decoder_kl(
     dec_attn = s
   else:
     dec_attn = torch.softmax(s, dim=-1)  # no grad to decoder
+  self.retrieval = {'decoder_attention': dec_attn}
+  
   if in_batch_negative:  # collect dec_attn across gpus
-    dec_attn, = all_gather_tensors(dec_attn)
-    dec_attn = torch.cat(dec_attn, dim=0).to(dec_attn[0]).detach()  # (n_gpu * bs, n_context)
+    if accumulated is not None:
+      real_rank = accumulated['step'] * get_world_size() + get_rank()
+      _dec_attn = list(accumulated['decoder_attention'])
+      _dec_attn[real_rank] = dec_attn
+      dec_attn = torch.cat(_dec_attn, dim=0).to(dec_attn).detach()  # (n_gpu * bs * total, n_context)
+    else:
+      dec_attn, = all_gather_tensors(dec_attn)
+      dec_attn = torch.cat(dec_attn, dim=0).to(dec_attn[0]).detach()  # (n_gpu * bs, n_context)
   #WandbLogger.log_w_step({'decoder-dist-kl': torch.sort(dec_attn[0], descending=True)[0][:10]})
   if encoder_score_pre_softmaxed:
     if in_batch_negative:
@@ -1999,7 +2134,8 @@ def collect_for_retrieval(
      embedding_normalize: bool = False,
      hidden_linear: nn.Linear = None,
      head_linear: nn.Linear = None,
-     n_context_for_ibn: int = None):
+     n_context_for_ibn: int = None,
+     accumulated: Dict = None):
   
   def _get_term_weights(query_states, query_mask):  # (?, n_heads, seq_len, emb_size_per_head), (?, seq_len)
     if term_weight_linear is None:
@@ -2023,6 +2159,7 @@ def collect_for_retrieval(
     'scores': scores,
     'query_states': F.normalize(query_states, dim=-1, p=2) if embedding_normalize else query_states,
     'key_states': F.normalize(key_states, dim=-1, p=2) if embedding_normalize else key_states,
+    'attention_mask': attention_mask,
     'value_states': value_states,
     'preprocessed_mask': preprocessed_mask}
   term_weights = _get_term_weights(query_states, attention_mask[:, 0])
@@ -2037,18 +2174,28 @@ def collect_for_retrieval(
     only_self_attn_qd = True  # only compute self attn between query query vectors and doc key vectors to save memory
     
     if only_self_attn_qd:
-      # collect query, key, and attn across all gpus
-      if use_head_idx is not None:
-        global_q, global_k, global_attn = all_gather_tensors(
-          query_states[:, use_head_idx:use_head_idx + 1].contiguous(), key_states[:, use_head_idx:use_head_idx + 1].contiguous(), attention_mask)
-      else:
-        global_q, global_k, global_attn = all_gather_tensors(query_states, key_states, attention_mask)
-      # (n_q, n_context, n_heads, seq_len, emb_size_per_head) where n_q = n_gpu * bs
+      nqpg = query_states.size(0) // n_context  # num query per gpu
+      if accumulated is not None:  # use accumulated
+        real_rank = accumulated['step'] * get_world_size() + get_rank()
+        assert use_head_idx is not None
+        global_q, global_k, global_attn = list(accumulated['query_states']), list(accumulated['key_states']), list(accumulated['attention_mask'])
+        global_q[real_rank] = query_states[:, use_head_idx:use_head_idx + 1].contiguous()
+        global_k[real_rank] = key_states[:, use_head_idx:use_head_idx + 1].contiguous()
+        global_attn[real_rank] = attention_mask
+      else:  # collect query, key, and attn across all gpus
+        real_rank = get_rank()
+        if use_head_idx is not None:
+          global_q, global_k, global_attn = all_gather_tensors(
+            query_states[:, use_head_idx:use_head_idx + 1].contiguous(), key_states[:, use_head_idx:use_head_idx + 1].contiguous(), attention_mask)
+        else:
+          global_q, global_k, global_attn = all_gather_tensors(query_states, key_states, attention_mask)
+      # (n_q, n_context, n_heads, seq_len, emb_size_per_head) where n_q = n_gpu * bs [* accumulate_steps]
       global_q = torch.cat(global_q, dim=0).view(-1, n_context, *global_q[0].size()[1:])
       global_k = torch.cat(global_k, dim=0).view(-1, n_context, *global_k[0].size()[1:])
       # (n_q, n_context, seq_len, seq_len)
       global_attn = torch.cat(global_attn, dim=0).view(-1, n_context, *global_attn[0].size()[1:])
       nq = global_attn.size(0)
+      start_index, end_index = nqpg * real_rank, nqpg * (real_rank + 1)
 
       # split into qry and doc representations
       max_qry_len = global_attn[:, :, 0].sum(-1).max()

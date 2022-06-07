@@ -112,6 +112,7 @@ class Options():
             choices=[None, 'only_one_positive', 'neg3', 'only_one_positive-neg3', 'pos1', 'pos1-neg3'])
         self.parser.add_argument('--no_qa', action='store_true', help='remove qa loss')
         self.parser.add_argument('--n_context_for_ibn', type=int, default=None, help='number of context used in in batch negative')
+        self.parser.add_argument('--accumulation_for_ibn', type=int, default=None, help='number of accumulation steps to run for ibn')
 
     def add_retriever_options(self):
         self.parser.add_argument('--train_data', type=str, default='none', help='path of train data')

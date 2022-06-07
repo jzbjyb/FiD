@@ -25,9 +25,9 @@ eval_data=open_domain_data/NQ/dev.json
 #eval_data=open_domain_data/SciQ/dev.json
 metric=em
 
-num_gpu=4
+num_gpu=8
 batch_size=8
-accum=2
+accum=1
 n_context=100
 text_maxlength=250
 answer_maxlength=50
@@ -36,7 +36,7 @@ combine_weight=0
 
 init_model=google/t5-base-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_bs64_inbatchneg32
+name=nq_reader_base_v11lm_separate_layer6_continue_kl1_tau0001_bs64_inbatchneg64_accumulate4
 init_from=${ckpt_dir}/nq_reader_base_v11lm_separate_layer6/checkpoint/latest
 only_topk_n_context=0
 n_layer_two_tower=6
@@ -88,12 +88,13 @@ python ${prefix} train_reader.py \
   --total_step 1000 \
   --warmup_step 100 \
   --save_freq 1000 \
-  --eval_freq 200 \
+  --eval_freq 100 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
   --wandb_log_freq 10 \
   --in_batch_negative \
+  --accumulation_for_ibn 2 \
   --init_from ${init_from} &>> ${ckpt_dir}/${name}.out
 
 # --keep_ctx_in_decoder_with_head ${keep_ctx_in_decoder_with_head} \
