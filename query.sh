@@ -3,8 +3,8 @@ source utils.sh
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
-MAX_NUM_GPU_PER_NODE=4
-gpu=a100
+MAX_NUM_GPU_PER_NODE=8
+gpu=$(get_gpu_type)
 num_gpu=1
 
 model_type=$1  # fid dpr colbert
@@ -19,7 +19,11 @@ faiss_gpus="--faiss_gpus all"
 rerank=""
 max_over_head=""
 augmentation=""
-files_per_run=16  # about 70G embs
+if [[ ${gpu} == 'a100' ]]; then
+  files_per_run=16  # about 70G embs
+else
+  files_per_run=4  # about 30G embs
+fi
 
 # model specific arguments
 if [[ ${model_type} == 'fid' ]]; then
@@ -74,7 +78,11 @@ elif [[ ${model_type} == 'colbert' ]]; then
   candidate_doc_topk=$5
   aug=$6
   index_dim=128
-  files_per_run=8
+  if [[ ${gpu} == 'a100' ]]; then
+    files_per_run=8
+  else
+    files_per_run=4
+  fi
 
   get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 512
   output_path=${model_path}.index/${index_name}

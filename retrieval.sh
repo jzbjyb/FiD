@@ -3,7 +3,7 @@ source utils.sh
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
-gpu=a100
+gpu=$(get_gpu_type)
 
 model_type=$1  # fid dpr colbert
 

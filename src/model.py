@@ -10,6 +10,7 @@ from typing import Callable, List, Dict
 import types
 import warnings
 import random
+import contextlib
 import torch
 import transformers
 import functools
@@ -1402,7 +1403,7 @@ class EncoderWrapper(torch.nn.Module):
     def forward(self, input_ids=None, attention_mask=None, input_doc_ids=None, **kwargs):
         if 'direct' in kwargs and kwargs['direct']:  # no reshaping, used in retrieval
           del kwargs['direct']
-          return self.encoder(input_ids, attention_mask, **kwargs)
+          return self.bi_encoder_forward(input_ids, attention_mask)
 
         # total_length = n_passages * passage_length
         bsz, total_length = input_ids.shape
@@ -2106,6 +2107,71 @@ def get_single_head_idx(num_heads: int, n_layer_two_tower: int, max_over_head: b
     return 6
   raise NotImplementedError
 
+def compute_score_and_aggregate_in_batch(
+  query_emb: torch.FloatTensor,  # (nq1, n_context, n_heads, max_qry_len, emb_size_per_head)
+  doc_emb: torch.FloatTensor,  # (nq2, n_context, n_heads, max_doc_len, emb_size_per_head)
+  query_mask: torch.BoolTensor,  # (nq1, n_context, max_qry_len)
+  doc_mask: torch.BoolTensor,  # (nq2, n_context, max_doc_len)
+  position_bias: torch.FloatTensor,  # (n_heads, max_qry_len, max_doc_len)
+  aggregation_method: str = 'all-avg-max',
+  batch_size: int = None,
+  no_grad: bool = False,
+  iteration: str = 'cross'):
+  assert iteration in {'self', 'cross'}
+  nq1 = query_emb.size(0)
+  nq2 = doc_emb.size(0)
+  bsz1 = batch_size or nq1
+  bsz2 = batch_size or nq2
+  query_embs = query_emb.split(bsz1)
+  query_masks = query_mask.split(bsz1)
+  doc_embs = doc_emb.split(bsz2)
+  doc_masks = doc_mask.split(bsz2)
+
+  with torch.no_grad() if no_grad else contextlib.nullcontext():
+    if iteration == 'cross':
+      scores: List[List] = []
+      for qe, qm in zip(query_embs, query_masks):
+        scores.append([])
+        for de, dm in zip(doc_embs, doc_masks):
+          # (<=nq1, <=nq2, n_context, n_heads, max_qry_len, max_doc_len)
+          s = torch.matmul(qe.unsqueeze(1), de.transpose(4, 3).unsqueeze(0))
+          # (<=nq1, <=nq2, n_context, max_qry_len, max_doc_len)
+          m = qm.unsqueeze(-1).unsqueeze(1) & dm.unsqueeze(-2).unsqueeze(0)
+          s = s + position_bias[None, None, None]
+          # aggregate scores
+          assert aggregation_method == 'all-avg-max'
+          # (<=nq1, <=nq2, n_context, n_heads, max_qry_len)
+          s, max_doc_tok_idx = (s - (~m.unsqueeze(3) * 1e5)).max(-1)
+          _qm = qm[:, None, :, None]  # (<=nq1, 1, n_context, 1, max_qry_len)
+          # (<=nq1, <=nq2, n_context, n_heads)
+          s = (s * _qm).sum(-1) / _qm.sum(-1)
+          scores[-1].append(s)
+        scores[-1] = torch.cat(scores[-1], dim=1)  # (<=nq1, nq2, n_context, n_heads)
+      scores = torch.cat(scores, dim=0)  # (nq1, nq2, n_context, n_heads)
+      assert scores.size(0) == nq1 and scores.size(1) == nq2
+    elif iteration == 'self':
+      assert nq1 == nq2
+      scores: List = []
+      for qe, qm, de, dm in zip(query_embs, query_masks, doc_embs, doc_masks):
+        # (<=nq1, n_context, n_heads, max_qry_len, max_doc_len)
+        s = torch.matmul(qe, de.transpose(4, 3))
+        # (<=nq1, n_context, max_qry_len, max_doc_len)
+        m = qm.unsqueeze(-1) & dm.unsqueeze(-2)
+        s = s + position_bias[None, None]
+        # aggregate scores
+        assert aggregation_method == 'all-avg-max'
+        # (<=nq1, n_context, n_heads, max_qry_len)
+        s, max_doc_tok_idx = (s - (~m.unsqueeze(2) * 1e5)).max(-1)
+        _qm = qm[:, :, None]  # (<=nq1, n_context, 1, max_qry_len)
+        # (<=nq1, n_context, n_heads)
+        s = (s * _qm).sum(-1) / _qm.sum(-1)
+        scores.append(s)
+      scores = torch.cat(scores, dim=0)  # (nq1, n_context, n_heads)
+      assert scores.size(0) == nq1
+    else:
+      raise ValueError
+    return scores
+
 def collect_for_retrieval(
      self,
      scores: torch.FloatTensor,  # (bs * n_context, n_heads, seq_len, seq_len)
@@ -2205,15 +2271,21 @@ def collect_for_retrieval(
       global_q = global_q[:, :, :, :max_qry_len]  # (n_q, n_context, n_heads, max_qry_len, emb_size_per_head)
       global_k = global_k[:, :, :, min_qry_len:]  # (n_q, n_context, n_heads, seq_len - min_qry_len, emb_size_per_head)
 
+      # crop position_bias
+      if use_head_idx is not None:
+        position_bias = position_bias[0, use_head_idx:use_head_idx + 1, :max_qry_len, min_qry_len:]  # (1, max_qry_len, seq_len - min_qry_len)
+      else:
+        position_bias = position_bias[0, :, :max_qry_len, min_qry_len:]  # (n_heads, max_qry_len, seq_len - min_qry_len)
+
       # TODO: term weight, normalization, max over head
 
-      # compute attn between qry and associated docs
-      # (n_q, n_context, n_heads, max_qry_len, seq_len - min_qry_len)
-      scores = torch.matmul(global_q, global_k.transpose(4, 3))
-      # (n_q, n_context, max_qry_len, seq_len - min_qry_len)
-      scores_mask = query_mask.unsqueeze(-1) & doc_mask.unsqueeze(-2)
+      # compute self scores
+      # (n_q, n_context, n_heads)
+      scores = compute_score_and_aggregate_in_batch(
+        global_q, global_k, query_mask, doc_mask, position_bias=position_bias, 
+        aggregation_method=aggregation_method, no_grad=False, iteration='self')
 
-      # sample a subset for the next step
+      # sample a subset for the next step (TODO: bug)
       if n_context_for_ibn:
         assert n_context_for_ibn <= n_context
         # (n_q, n_context_for_ibn)
@@ -2230,43 +2302,35 @@ def collect_for_retrieval(
         doc_mask_sub = torch.masked_select(doc_mask, sub_mask[:, :, None]).view(nq, n_context_for_ibn, *doc_mask.size()[2:])
       else:
         global_q_sub, global_k_sub, query_mask_sub, doc_mask_sub = global_q, global_k, query_mask, doc_mask
-      
-      # compute attn between qry and any docs
-      # (n_q, nq, <=n_context, n_heads, max_qry_len, seq_len - min_qry_len)
-      scores_ibn = torch.matmul(global_q_sub.unsqueeze(1), global_k_sub.transpose(4, 3).unsqueeze(0))
-      # (n_q, nq, <=n_context, max_qry_len, seq_len - min_qry_len)
-      scores_ibn_mask = query_mask_sub.unsqueeze(-1).unsqueeze(1) & doc_mask_sub.unsqueeze(-2).unsqueeze(0)
+
+      # compute all ibn scores w/o grad
+      # (n_q, n_q, <=n_context, n_heads)
+      scores_cross = compute_score_and_aggregate_in_batch(
+        global_q_sub, global_k_sub, query_mask_sub, doc_mask_sub, position_bias=position_bias, 
+        aggregation_method=aggregation_method, batch_size=16, no_grad=True, iteration='cross')
+
+      # compute local ibn scores w/ grad
+      # (nqpg, n_q, <=n_context, n_heads)
+      scores_cross_q = compute_score_and_aggregate_in_batch(
+        global_q_sub[start_index:end_index], global_k_sub, query_mask_sub[start_index:end_index], doc_mask_sub, position_bias=position_bias, 
+        aggregation_method=aggregation_method, no_grad=False, iteration='cross')  # TODO: add batch_size?
+      # (n_q, nqpg, <=n_context, n_heads)
+      scores_cross_d = compute_score_and_aggregate_in_batch(
+        global_q_sub, global_k_sub[start_index:end_index], query_mask_sub, doc_mask_sub[start_index:end_index], position_bias=position_bias, 
+        aggregation_method=aggregation_method, no_grad=False, iteration='cross')  # TODO: add batch_size?
+
+      # merge ibn scores w/ and w/o grad
+      scores_cross = torch.cat([scores_cross[:start_index], scores_cross_q, scores_cross[end_index:]], dim=0)
+      scores_cross = torch.cat([scores_cross[:, :start_index], scores_cross_d, scores_cross[:, end_index:]], dim=1)
 
       # remove attn between qry and associated docs
       rm_mask = ~torch.eye(nq).bool().to(attention_mask.device)  # (n_q, n_q)
-      # masked_select will cause "transform: failed to synchronize: cudaerrorillegaladdress: an illegal memory access was encountered"
-      # (n_q, (nq - 1) * <=n_context, n_heads, max_qry_len, seq_len - min_qry_len)
-      #scores_ibn = torch.masked_select(scores_ibn, rm_mask[:, :, None, None, None, None]).view(nq, -1, *scores_ibn.size()[3:])
-      # (n_q, (nq - 1) * <=n_context, max_qry_len, seq_len - min_qry_len)
-      #scores_ibn_mask = torch.masked_select(scores_ibn_mask, rm_mask[:, :, None, None, None]).view(nq, -1, *scores_ibn_mask.size()[3:])
-
       gather_index = torch.masked_select(torch.arange(nq).unsqueeze(0).to(attention_mask.device), rm_mask).view(nq, nq - 1)  # (n_q, n_q - 1)
-      # (n_q, (nq - 1) * <=n_context, n_heads, max_qry_len, seq_len - min_qry_len)
-      scores_ibn = torch.gather(scores_ibn, 1, gather_index[:, :, None, None, None, None].repeat(1, 1, *scores_ibn.size()[2:])).view(nq, -1, *scores_ibn.size()[3:])
-      # (n_q, (nq - 1) * <=n_context, max_qry_len, seq_len - min_qry_len)
-      scores_ibn_mask = torch.gather(scores_ibn_mask, 1, gather_index[:, :, None, None, None].repeat(1, 1, *scores_ibn_mask.size()[2:])).view(nq, -1, *scores_ibn_mask.size()[3:])
+      # (n_q, (n_q - 1 * <=n_context), n_heads)
+      scores_cross = torch.gather(scores_cross, 1, gather_index[:, :, None, None].repeat(1, 1, *scores_cross.size()[2:])).view(nq, -1, *scores_cross.size()[3:])
 
-      # combine two scores and add position bias
-      scores = torch.cat([scores, scores_ibn], dim=1)  # (n_q, n_context + (nq - 1) * <=n_context, n_heads, max_qry_len, seq_len - min_qry_len)
-      scores_mask = torch.cat([scores_mask, scores_ibn_mask], dim=1)  # (n_q, n_context + (nq - 1) * <=n_context, max_qry_len, seq_len - min_qry_len)
-      if use_head_idx is not None:
-        scores = scores + position_bias[None, :, use_head_idx:use_head_idx + 1, :max_qry_len, min_qry_len:]
-      else:
-        scores = scores + position_bias[None, :, :, :max_qry_len, min_qry_len:]
-
-      # aggregate scores
-      assert aggregation_method == 'all-avg-max'
-      # (n_q, n_context + (nq - 1) * <=n_context, n_heads, max_qry_len)
-      scores, max_doc_tok_idx = (scores - (~scores_mask.unsqueeze(2) * 1e5)).max(-1)
-      _query_mask = query_mask[:, :1, None, :]  # (n_q, 1, 1, max_qry_len)
-      # (n_q, n_context + (nq - 1) * <=n_context, n_heads)
-      scores = (scores * _query_mask).sum(-1) / _query_mask.sum(-1)
-
+      # combine self scores and cross scores
+      scores = torch.cat([scores, scores_cross], dim=1)  # (n_q, n_context + (nq - 1) * <=n_context, n_heads)
       if use_head_idx is not None:
         scores = torch.cat([
           torch.zeros_like(scores).repeat(1, 1, use_head_idx), 

@@ -7,11 +7,13 @@
 set -e
 
 in_datasets=(nq_test_top10)
+pro=(cqadupstack_programmers)
 out_datasets=(bioasq_500k_test cqadupstack_programmers msmarcoqa_dev fiqa cqadupstack_mathematica cqadupstack_physics)
 all_datasets=("${in_datasets[@]}" "${out_datasets[@]}")
+cqa_datasets=(cqadupstack_programmers cqadupstack_mathematica cqadupstack_physics cqadupstack_android cqadupstack_english cqadupstack_gaming cqadupstack_gis cqadupstack_stats cqadupstack_tex cqadupstack_unix cqadupstack_webmasters cqadupstack_wordpress)
 declare -a gpu_topks=(100 1000 2048)
 declare -a cpu_topks=(4096 8192 16384)
-declare -a reranks=(0 1000)
+declare -a reranks=(0 1000 2048)
 
 domain=$1
 if [[ ${domain} == 'in' ]]; then
@@ -19,9 +21,9 @@ if [[ ${domain} == 'in' ]]; then
 elif [[ ${domain} == 'out' ]]; then
   datasets=("${out_datasets[@]}")
 elif [[ ${domain} == 'all' ]]; then
-  datasets=("${all_datasets[@]}")
+  datasets=("${all_datasets[@]}")  
 else
-  exit 1
+  datasets=(${domain})
 fi
 
 topk_range=$2
@@ -31,6 +33,10 @@ elif [[ ${topk_range} == 'cpu' ]]; then
   declare -a two_topks=(cpu_topks)
 elif [[ ${topk_range} == 'all' ]]; then
   declare -a two_topks=(gpu_topks cpu_topks)
+elif [[ ${topk_range} == 'best' ]]; then
+  declare -a gpu_topks=(2048)
+  declare -a two_topks=(gpu_topks)
+  declare -a reranks=(2048)
 else
   exit 1
 fi
@@ -60,7 +66,9 @@ for group in "${two_topks[@]}"; do
     fi
     for topk in "${topks[@]}"; do
       for rerank in "${reranks[@]}"; do
-        ./query.sh ${model_type} ${model} ${data} ${head} ${position} ${topk} ${rerank} ${use_max_over_head}  # TODO: DPR does not have rerank
+        if (( ${rerank} <= ${topk} )); then
+          ./query.sh ${model_type} ${model} ${data} ${head} ${position} ${topk} ${rerank} ${use_max_over_head}  # TODO: DPR does not have rerank
+        fi
       done
     done
   done

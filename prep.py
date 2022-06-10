@@ -45,6 +45,10 @@ class BEIRDataset:
   @classmethod
   def get_answer_techqa(cls, metadata: Dict) -> List[str]:
     return [metadata['answer']]
+  
+  @classmethod
+  def get_answer_scidocs(cls, metadata: Dict) -> List[str]:
+        return ['']
 
   @classmethod
   def get_answer_sciq(cls, metadata: Dict) -> List[str]:
@@ -127,10 +131,9 @@ def convert_beir_to_fid_format(
   hostname = 'localhost'
   number_of_shards = 1  # TODO
   corpus, _, _ = GenericDataLoader(data_folder=beir_dir).load(split=splits[0])
-  # TODO: debug
-  #model = BM25(index_name=dataset_name, hostname=hostname, initialize=True, number_of_shards=number_of_shards)
-  #model.index(corpus)
-  #time.sleep(5)
+  model = BM25(index_name=dataset_name, hostname=hostname, initialize=True, number_of_shards=number_of_shards)
+  model.index(corpus)
+  time.sleep(5)
 
   for split_ind, split in enumerate(splits):
     corpus, queries, qrels = GenericDataLoader(data_folder=beir_dir).load(split=split)
@@ -152,6 +155,7 @@ def convert_beir_to_fid_format(
         for lid, did in enumerate(corpus):
           title = clean_text_for_tsv(corpus[did].get('title'))
           text = clean_text_for_tsv(corpus[did].get('text'))
+          assert '\n' not in title and '\n' not in text
           fout.write(f'{did}\t{text}\t{title}\n')
           l2dfout.write(f'{lid}\t{did}\n')
 
@@ -749,11 +753,12 @@ def eval_qa(pred_file: str, gold_file_beir: str, metric: str = 'src.evaluation.e
     print(f'{qtype}\t{np.mean(scores)}')
 
 
-def aggregate_ctx(query_files: List[str], tsv_file: str, topk: int = None):
+def aggregate_ctx(query_files: List[str], tsv_file: str, topks: int):
+  assert len(query_files) == len(topks)
   seen_ids: Set[str] = set()
   with open(tsv_file, 'w') as fout:
     fout.write('id\ttext\ttitle\n')
-    for query_file in query_files:
+    for topk, query_file in zip(topk, query_files):
       with open(query_file, 'r') as fin:
         data = json.load(fin)
         for q in data:
@@ -766,6 +771,17 @@ def aggregate_ctx(query_files: List[str], tsv_file: str, topk: int = None):
             seen_ids.add(ctx['id'])
   print(f'total #ctx {len(seen_ids)}')
 
+def merge_psg_files(psg_files: List[str], tsv_file: str, sample_ratios: List[float], use_csv_readers: List[bool]):
+  assert len(psg_files) == len(sample_ratios)
+  seen_ids: Set[str] = set()
+  with open(tsv_file, 'w') as fout:
+    fout.write('id\ttext\ttitle\n')
+    for sample_ratio, use_csv_reader, psg_file in zip(sample_ratios, use_csv_readers, psg_files):
+      for did, text, title in tqdm(src.util.load_passages(psg_file, use_csv_reader=use_csv_reader, iterative=True)):
+        if did not in seen_ids and random.random() <= sample_ratio:
+          fout.write(f'{did}\t{clean_text_for_tsv(text)}\t{clean_text_for_tsv(title)}\n')
+          seen_ids.add(did)
+  print(f'total #ctx {len(seen_ids)}')
 
 def rank2json(rank_file: str, query_json_file: str, psge_tsv_file: str, out_json_file: str):
   with open(rank_file, 'rb') as fin:
@@ -912,7 +928,7 @@ def add_doc_to_onlyid(query_file: str, psgs_tsv_file: str, out_json_file: str):
 
 def merge_queries(file_pattern: str, out_file: str):
   format = 'pkl' if file_pattern.endswith('.pkl') else None
-  format = 'json' if file_pattern.endswith('.json') else None
+  format = format or ('json' if file_pattern.endswith('.json') else None)
   assert format
   files = glob.glob(file_pattern)
   print(f'#files {len(files)}')
@@ -926,7 +942,8 @@ def merge_queries(file_pattern: str, out_file: str):
       qid2rank[qid] = merged_ctxs
     with open(out_file, 'wb') as fout:
       pickle.dump(qid2rank, fout)
-  raise NotImplementedError
+  else:
+    raise NotImplementedError
 
 
 def concate_queries(file_pattern: str, out_file: str):
@@ -1139,7 +1156,7 @@ if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
     'convert_sciq_to_beir_format', 'convert_nq_to_beir_format', 'convert_techqa_to_beir_format', 'convert_quasar_to_beir_format',
-    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx', 'rank2json',
+    'convert_msmarcoqa_to_beir_fid_format', 'eval_qa', 'aggregate_ctx', 'merge_psg_files', 'rank2json',
     'add_negative', 'add_negative_mimic_inbatch', 'create_pseudo_queries_from_beir',
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format', 'split_fid_file',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 
@@ -1162,7 +1179,7 @@ if __name__ == '__main__':
   elif args.task == 'convert_beir_to_fid_format':
     beir_dir = args.inp[0]
     out_dir = args.out[0]
-    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='nq', splits=['train'], add_self=False)
+    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='cqadupstack', splits=['test'], add_self=False)
 
   elif args.task == 'convert_sciq_to_beir_format':
     sciq_dir = args.inp[0]
@@ -1290,7 +1307,12 @@ if __name__ == '__main__':
   elif args.task == 'aggregate_ctx':
     query_files = args.inp
     tsv_file = args.out[0]
-    aggregate_ctx(query_files, tsv_file, topk=None)
+    aggregate_ctx(query_files, tsv_file, topks=[10, None])
+  
+  elif args.task == 'merge_psg_files':
+    psg_files = args.inp
+    tsv_file = args.out[0]
+    merge_psg_files(psg_files, tsv_file, sample_ratios=[1.0, 0.05], use_csv_readers=[False, True])
 
   elif args.task == 'rank2json':
     rank_file, query_json_file, psgs_tsv_file = args.inp

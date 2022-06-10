@@ -118,9 +118,10 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
 
 def evaluate(model, dataset, tokenizer, collator, opt):
     sampler = SequentialSampler(dataset)
+    eval_batch_size = (opt.per_gpu_batch_size // opt.accumulation_for_ibn) if opt.accumulation_for_ibn else opt.per_gpu_batch_size
     dataloader = DataLoader(dataset,
         sampler=sampler,
-        batch_size=opt.per_gpu_batch_size,
+        batch_size=eval_batch_size,
         drop_last=False,
         num_workers=opt.num_workers,
         collate_fn=collator)
