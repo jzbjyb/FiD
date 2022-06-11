@@ -576,6 +576,16 @@ def eval_retrieval(
     print()
 
 
+def remove_special(text: Union[str, List[str]]):
+  if type(text) is str:
+    text = [text]
+  new_text = []
+  for t in text:
+    if t.strip().startswith('<extra_id_0>'):  # pseudo questoin
+      t = ' '.join([w for w in text.split() if not w.startswith('<extra_id_')])
+    new_text.append(t)
+  return new_text
+
 def eval_answer(ret_file: str,
                 beir_dir: str = None,
                 split: str = 'test',
@@ -590,6 +600,7 @@ def eval_answer(ret_file: str,
     # aggregate ctx of the same query
     query2example: Dict[str, Dict] = {}
     for example in data:
+      example['answers'] = [remove_special(a) for a in example['answers']]
       if example['question'] not in query2example:
         query2example[example['question']] = example
         continue
@@ -845,18 +856,21 @@ def add_negative_mimic_inbatch(query_file: str, out_file: str, batch_size: int =
 def create_pseudo_queries_from_corpus(
      beir_dir: str,
      out_beir_dir: str,
-     split: str,
+     split: str = 'train',
      subsample: int = None,
      num_sent_per_doc: int = 1,
-     max_num_mask_ent: int = 5):
+     max_num_mask_ent: int = 5,
+     rules: List[str] = ['single', 'nochar', 'skip_less_5_words', 'skip_long_512_chars']):
   sentencizer = English()
   sentencizer.add_pipe('sentencizer')
   ner = spacy.load('en_core_web_sm')
+  ner_types = {'DATE', 'EVENT', 'FAC', 'GPE', 'LANGUAGE', 'LAW', 'LOC', 'NORP', 'ORG', 'PERSON', 'PRODUCT', 'TIME', 'WORK_OF_ART'}
 
-  corpus, _, _ = GenericDataLoader(data_folder=beir_dir).load(split=split)
+  corpus, _, _ = GenericDataLoader(data_folder=beir_dir).load(split='test')
   overall_qid = 0
   qid2dict: Dict[str, Dict] = {}
   split2qiddid: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+  label2count: Dict[str, int] = defaultdict(lambda: 0)
   num_ents: List[int] = []
   if subsample:
     sampled_dids = random.sample(list(corpus.keys()), min(len(corpus), subsample))
@@ -870,30 +884,50 @@ def create_pseudo_queries_from_corpus(
     sent_idxs = random.sample(range(len(sents)), min(len(sents), num_sent_per_doc))
     for sent_idx in sent_idxs:
       query = str(sents[sent_idx])
+      if 'skip_long_512_chars' in rules and len(query) > 512:
+        continue
       context = ' '.join(map(str, sents[:sent_idx] + sents[sent_idx + 1:]))
       # ner
-      ents: List[Tuple[int, int, str]] = [(ent.start_char, ent.end_char, ent.label_) for ent in ner(query).ents]
+      ents: List[Tuple[int, int, str]] = [(ent.start_char, ent.end_char, ent.label_) for ent in ner(query).ents if ent.label_ in ner_types]
       # remove overlap
       ents = sorted(ents, key=lambda x: (x[0], x[1]))
       ents = [ent for i, ent in enumerate(ents) if (i <= 0 or ent[0] >= ents[i - 1][1])]
+      if 'nochar' in rules:
+        ents = [ent for ent in ents if ent[1] - ent[0] > 1]
+      if 'single' in rules:  # only use entity that appears once
+        entstr2inds: Dict[str, List[int]] = defaultdict(list)
+        for ind, ent in enumerate(ents):
+          entstr2inds[query[ent[0]:ent[1]].lower().strip()].append(ind)
+        _inds: List[int] = []
+        for inds in entstr2inds.values():
+          if len(inds) <= 1:
+            _inds.extend(inds)
+        ents = [ents[i] for i in sorted(_inds)]
       if len(ents) <= 0:
         continue
       # max num
       if len(ents) > max_num_mask_ent:
         ents = [ents[i] for i in sorted(random.sample(range(len(ents)), max_num_mask_ent))]
       num_ents.append(len(ents))
+      for ent in ents:
+        label2count[ent[-1]] += 1
       # mask
       masked_query: List[str] = []
+      masked_query_real_content: List[str] = []
       target: List[str] = []
       prev_idx = 0
       mask_idx = 0
       for i, ent in enumerate(ents):
         masked_query.append(query[prev_idx:ent[0]])
+        masked_query_real_content.append(masked_query[-1].strip())
         masked_query.append(f'<extra_id_{mask_idx}>')
         target.append(f'<extra_id_{mask_idx}> {query[ent[0]:ent[1]]}')
         prev_idx = ent[1]
         mask_idx += 1
       masked_query.append(query[prev_idx:])
+      masked_query_real_content.append(masked_query[-1].strip())
+      if 'skip_less_5_words' in rules and len(' '.join(masked_query_real_content).split()) < 5:
+        continue
       masked_query: str = ''.join(masked_query)
       target.append(f'<extra_id_{mask_idx}>')
       target: str = ' '.join(target)
@@ -908,6 +942,7 @@ def create_pseudo_queries_from_corpus(
       overall_qid += 1
   save_beir_format(out_beir_dir, qid2dict, None, split2qiddid)
   print(f'#queries {len(qid2dict)}, avg #entities {np.mean(num_ents)}')
+  print(sorted(label2count.items(), key=lambda x: -x[1]))
 
 
 def add_doc_to_onlyid(query_file: str, psgs_tsv_file: str, out_json_file: str):
@@ -1179,7 +1214,7 @@ if __name__ == '__main__':
   elif args.task == 'convert_beir_to_fid_format':
     beir_dir = args.inp[0]
     out_dir = args.out[0]
-    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='cqadupstack', splits=['test'], add_self=False)
+    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='pseudo', splits=['train'], add_self=True)
 
   elif args.task == 'convert_sciq_to_beir_format':
     sciq_dir = args.inp[0]
@@ -1332,7 +1367,7 @@ if __name__ == '__main__':
   elif args.task == 'create_pseudo_queries_from_beir':
     beir_dir = args.inp[0]
     out_beir_dir = args.out[0]
-    create_pseudo_queries_from_corpus(beir_dir, out_beir_dir, subsample=100000, split='test', max_num_mask_ent=5)
+    create_pseudo_queries_from_corpus(beir_dir, out_beir_dir, subsample=None, num_sent_per_doc=3, max_num_mask_ent=1)
 
   elif args.task == 'split_fid_file':
     query_file = args.inp[0]
