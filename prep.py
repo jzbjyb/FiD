@@ -806,9 +806,9 @@ def rank2json(rank_file: str, query_json_file: str, psge_tsv_file: str, out_json
       qid = query['id'] if 'id' in query else str(i)
       rank = qid2rank[qid]
       query['ctxs'] = [{
-        'id': did,
-        'text': did2doc[did][1],
-        'title': did2doc[did][2],
+        'id': str(did),
+        'text': did2doc[str(did)][1],
+        'title': did2doc[str(did)][2],
         'score': score,
       } for did, score in rank]
       queries_with_newctx.append(query)

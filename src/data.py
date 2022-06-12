@@ -251,7 +251,7 @@ def load_data(
         if data_path is not None and data_path.endswith('.jsonl'):
             example = json.loads(example)
         if not 'id' in example:
-            example['id'] = k
+            example['id'] = str(k)
         for c in example['ctxs']:
             if use_gold_doc_dist:
                 c['score'] = float(has_answer(example['answers'], c['text'], tokenizer))

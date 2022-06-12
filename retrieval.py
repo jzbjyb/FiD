@@ -129,8 +129,6 @@ class EmbeddingAdapter:
       if len(self.results['term_weights']):
         self.results['term_weights'] = torch.cat(self.results['term_weights'], dim=0).numpy()  # (num_query_tokens_in_total)
     self.results['words'] = torch.cat(self.results['words'], dim=0).numpy()
-    self.results['ids'] = np.array(self.results['ids'], dtype=str)
-    self.results['splits'] = np.array(self.results['splits'], dtype=int)
 
 def encode_context(
      opt,
@@ -207,6 +205,7 @@ def encode_query_and_search(
   dataset = src.data.QuestionDataset(queries)
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=opt.num_workers, collate_fn=collator)
   qid2rank: Dict[str, List[Tuple[str, float]]] = {}
+
   with torch.no_grad():
     for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
       # generate query embeddings
@@ -241,78 +240,27 @@ def encode_query_and_search(
         raise NotImplementedError
       # search and aggregation
       adapter.prepare_query()
-      qid2did2score: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(lambda: 0))
       if opt.model_type in {'fid', 'colbert'}:
-        top_ids_and_scores = index.search_knn(adapter.results['embeddings'], opt.token_topk, term_weights=adapter.results['term_weights'] if opt.term_weights else None)
-        qid2tokens2did2score: Dict[str, List[Dict[str, float]]] = defaultdict(list)
-        for i, (docids, scores, texts) in enumerate(top_ids_and_scores):  # token-level scores
-          qid = adapter.results['ids'][i]
-          qid2tokens2did2score[qid].append(defaultdict(lambda: -1e10))
-          for did, score, text in zip(docids, scores, texts):
-            if debug:
-              qword = tokenizer.convert_ids_to_tokens([adapter.results['words'][i]])[0]
-              dword = tokenizer.convert_ids_to_tokens([text])[0]
-              print(qword, dword, score, did)
-              input()
-            qid2tokens2did2score[qid][-1][did] = max(score, qid2tokens2did2score[qid][-1][did])
-        for qid, tokens in qid2tokens2did2score.items():  # aggregate token-level scores
-          for token in tokens:
-            for did, score in token.items():
-              qid2did2score[qid][did] += score
+        _qid2rank = index.search_knn(
+          adapter.results['embeddings'], 
+          opt.token_topk, 
+          term_weights=adapter.results['term_weights'] if opt.term_weights else None,
+          query_ids=adapter.results['ids'],
+          query_splits=adapter.results['splits'],
+          rank_topk=opt.doc_topk,
+          rerank_topk=opt.candidate_doc_topk,
+          device=device)
+        qid2rank.update(_qid2rank)
       elif opt.model_type == 'dpr':
         top_ids_and_scores = index.search_knn(adapter.results['embeddings'], opt.doc_topk)
         for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
           qid = adapter.results['ids'][i]
+          did2score: Dict[str, float] =  defaultdict(lambda: 0)
           for did, score, text in zip(docids, scores, texts):
-            qid2did2score[qid][did] = float(score)
+            did2score[did] = float(score)
+          qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))
       else:
         raise NotImplementedError
-      
-      for i, (qid, did2score) in enumerate(qid2did2score.items()):  # rank and only keep top docs
-        qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))
-        if opt.candidate_doc_topk <= 0:
-          qid2rank[qid] = qid2rank[qid][:opt.doc_topk]
-          continue
-        dids = [did for did, _ in qid2rank[qid]][:opt.candidate_doc_topk]
-        flat_embs, flat_dids = index.get_by_ids(dids)  # ([num_heads,] num_doc_tok_in_total, emb_size), (num_doc_tok_in_total)
-        flat_embs = torch.tensor(flat_embs).to(device)
-        if opt.max_over_head:
-          qry_embs = adapter.results['embeddings'][:, adapter.results['splits'][i - 1] if i else 0:adapter.results['splits'][i]]  # (num_heads, num_qry_tok, emb_size)
-          if opt.term_weights:
-            term_weights = adapter.results['term_weights'][:, adapter.results['splits'][i - 1] if i else 0:adapter.results['splits'][i]]  # (num_heads, num_qry_tok)
-        else:
-          qry_embs = adapter.results['embeddings'][adapter.results['splits'][i - 1] if i else 0:adapter.results['splits'][i]]  # (num_qry_tok, emb_size)
-          if opt.term_weights:
-            term_weights = adapter.results['term_weights'][adapter.results['splits'][i - 1] if i else 0:adapter.results['splits'][i]]  # (num_qry_tok,)
-        qry_words = adapter.results['words'][adapter.results['splits'][i - 1] if i else 0:adapter.results['splits'][i]]
-        qry_embs = torch.tensor(qry_embs).to(device)
-        if opt.term_weights:
-          term_weights = torch.tensor(term_weights).to(device)
-        if opt.max_over_head:
-          sim_mat = qry_embs @ flat_embs.permute(0, 2, 1)  # (num_heads, num_qry_tok, num_doc_tok_in_total)
-          if opt.term_weights:
-            sim_mat = sim_mat * term_weights.unsqueeze(-1)
-          sim_mat = sim_mat.max(0)[0]  # (num_qry_tok, num_doc_tok_in_total)
-        else:
-          sim_mat = (qry_embs @ flat_embs.T)  # (num_qry_tok, num_doc_tok_in_total)
-          if opt.term_weights:
-            #rint('\n'.join([f'{t} {s:.3f}' for t, s in zip(tokenizer.convert_ids_to_tokens(qry_words), term_weights.cpu().numpy().tolist())]), term_weights.sum(), end='\n\n')
-            #import time
-            #time.sleep(20)
-            sim_mat = sim_mat * term_weights.unsqueeze(-1)
-        did2newdid: Dict[str, int] = {}
-        newdid2did: Dict[int, str] = {}
-        assert len(dids) == len(set(dids))
-        for did in dids:
-          if did not in did2newdid:
-            did2newdid[did] = len(did2newdid)
-            newdid2did[did2newdid[did]] = did
-        flat_dids = torch.tensor([did2newdid[did] for did in flat_dids]).to(device)
-        agg_sim_mat = torch.zeros(sim_mat.size(0), len(did2newdid)).to(sim_mat)
-        agg_sim_mat = torch_scatter.scatter_max(sim_mat, flat_dids, out=agg_sim_mat, dim=-1)[0]  # (num_qry_tok, num_doc)
-        agg_sim_mat = agg_sim_mat.sum(0)  # (num_doc)
-        qid2rank[qid] = sorted([(newdid2did[nd], score.item()) for nd, score in enumerate(agg_sim_mat)], key=lambda x: -x[1])[:opt.doc_topk]
-
   return qid2rank
 
 def get_model_tokenizer(opt, is_querying: bool):
@@ -352,6 +300,8 @@ def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]]):
   # load query data
   queries = src.data.load_data(opt.queries)
   queries: List[Tuple[str, str]] = [(q['id'], q['question']) for q in queries]
+  if opt.debug:
+    queries = queries[:512]
   logger.info(f'#queries: {len(queries)}')
   while True:
     batch = input_queue.get()
@@ -486,6 +436,7 @@ if __name__ == '__main__':
   parser.add_argument('--start_from', type=int, help='start from index which is used together with save_every_n_doc', default=0)
   parser.add_argument('--num_workers', type=int, help='#workers for dataloader', default=0)
   parser.add_argument('--normalize', action='store_true', help='normalize query and doc embedding')
+  parser.add_argument('--debug', action='store_true')
   args = parser.parse_args()
 
   src.slurm.init_distributed_mode(args)

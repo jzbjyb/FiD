@@ -16,8 +16,11 @@ from collections import defaultdict
 from tqdm import tqdm
 import faiss
 import numpy as np
+import torch
+import torch_scatter
 
 from src.util import logger
+from src.strided_tensor import StridedTensor
 
 class Indexer(object):
   def __init__(self,
@@ -39,7 +42,7 @@ class Indexer(object):
     self.create_index()
     self.ids = np.empty((0), dtype=str)
     self.texts = np.empty((0), dtype=str)
-    self.embs = np.empty((0, vector_sz), dtype=np.float32)
+    self.embs = torch.zeros(0, vector_sz)
 
   def load_from_npz(
       self, 
@@ -67,8 +70,9 @@ class Indexer(object):
       logger.info(f'data indexing completed with time {time.time() - start_time_indexing:.1f} s.')
       if index_name is not None:
         self.serialize(root_dir, index_name=index_name)
-    self.build_length_offset()
-
+    self.build_int_ids()
+    self.build_strided()
+    
   def serialize(
       self, 
       dir_path: Path, 
@@ -105,6 +109,14 @@ class Indexer(object):
     if type(self.cuda_device) is int and self.cuda_device == -1:
       return False
     return True
+
+  @property
+  def main_gpu(self):
+    if self.use_gpu:
+      if type(self.cuda_device) is list:
+        return self.cuda_device[0]
+      return self.cuda_device
+    raise ValueError
 
   def create_index(self):
     metric = faiss.METRIC_INNER_PRODUCT
@@ -164,26 +176,40 @@ class Indexer(object):
       if not disable_log:
         logger.info(f'total data indexed {len(self)}')
   
-  def build_length_offset(self):
-    self.id2offset: Dict[str, int] = {}
-    self.id2len: Dict[str, int] = {}
-    self.id2indices: Dict[str, List[int]] = {}
-    for i, _id in enumerate(self.ids):
-      if _id not in self.id2offset:
-        self.id2offset[_id] = i
-        self.id2len[_id] = 1
-      else:
-        assert i == self.id2offset[_id] + self.id2len[_id]  # make sure ids are consecutive
-        self.id2len[_id] += 1
-    for _id, offset in self.id2offset.items():
-      length = self.id2len[_id]
-      self.id2indices[_id] = [offset + i for i in range(length)]
+  def build_strided(self):
+    self.embs_strided = StridedTensor(self.embs, torch.tensor(self.doclens).to(self.main_gpu))
   
-  def ids2indices(self, ids: List[str]):
-    indices: List[int] = []
-    for _id in ids:
-      indices.extend(self.id2indices[_id])
-    return indices
+  def build_int_ids(self):
+    '''
+    # np.unique will sort
+    self.unique_ids, self.order, self.ids_int = np.unique(self.ids, return_index=True, return_inverse=True)
+    self.order = np.unique(self.order, return_inverse=True)[1]  # used in strided tensor
+    '''
+
+    self.unique_ids: List[str] = []
+    self.doclens: List[int] = []
+    self.ids_int: List[str] = []
+    
+    id2offset: Dict[int, int] = {}
+    id2len: Dict[int, int] = {}
+    
+    for i, _id in enumerate(self.ids):
+      if _id not in id2offset:
+        id2offset[_id] = i
+        id2len[_id] = 1
+        self.unique_ids.append(_id)
+        self.doclens.append(1)
+        self.ids_int.append(len(self.unique_ids) - 1)
+      else:
+        assert i == id2offset[_id] + id2len[_id]  # make sure ids are consecutive
+        id2len[_id] += 1
+        self.doclens[-1] += 1
+        self.ids_int.append(len(self.unique_ids) - 1)
+    
+    assert len(self.unique_ids) == len(self.doclens)
+    self.unique_ids = np.array(self.unique_ids)
+    self.doclens = np.array(self.doclens)
+    self.ids_int = np.array(self.ids_int)
 
   def remove_data(self, num_unique_id: int):
     unique_ids: Set[str] = set()
@@ -207,45 +233,141 @@ class Indexer(object):
     self.texts = self.texts[i:]
     self.embs = self.embs[i:]
     assert len(self) == self.index.ntotal
+  
+  def compose_rank_list(self, dids: torch.LongTensor, scores: torch.FloatTensor):
+    dids = self.unique_ids[dids.cpu().numpy()]
+    return [(str(did), score.item()) for did, score in zip(dids, scores)]
 
-  def search_knn(self,
-                 query_vectors: np.array,
-                 top_docs: int,
-                 batch_size: int = 1024,
-                 return_external_id: bool = True,
-                 term_weights: np.array = None) -> List[Tuple[List[Union[str, int]], List[float], List[str]]]:
+  def search_knn(
+    self,
+    query_vectors: np.array,  # (nq_flat, emb_size)
+    topk: int,
+    batch_size: int = 1024,
+    return_external_id: bool = True,
+    term_weights: np.array = None,  # (nq_flat,)
+    query_ids: List[int] = None,  # (nq_flat,)
+    query_splits: List[int] = None,  # (uqq,)
+    rank_topk: int = 0,
+    rerank_topk: int = 0,
+    device: torch.device = None) -> List[Tuple[List[Union[str, int]], List[float], List[str]]]:
+    # TODO: directly use torch tensors with "import faiss.contrib.torch_utils"
+
     if term_weights is not None:
       assert term_weights.shape[0] == query_vectors.shape[0]
     query_vectors = query_vectors.astype('float32')
-    result = []
+    
+    scores_flat, doc_ids_flat = [], []
+    batch_size = batch_size or len(query_vectors)
     nbatch = (len(query_vectors) - 1) // batch_size + 1
+    
     for k in range(nbatch):
       start_idx = k * batch_size
-      end_idx = min((k + 1) * batch_size, len(query_vectors))
-      q = query_vectors[start_idx:end_idx]
-      scores, indices = self.index.search(q, top_docs)
+      end_idx = min(start_idx + batch_size, len(query_vectors))
+      qv = query_vectors[start_idx:end_idx]
+      _scores_flat, _doc_ids_flat = self.index.search(qv, topk)
       if term_weights is not None:
-        scores = scores * np.expand_dims(term_weights[start_idx:end_idx], axis=-1)
-      # convert to external ids
-      ext_ids = [self.ids[_indices] for _indices in indices]
+        tw = term_weights[start_idx:end_idx]
+        _scores_flat = _scores_flat * np.expand_dims(tw, axis=-1)
+      scores_flat.append(_scores_flat)
+      doc_ids_flat.append(_doc_ids_flat)
+    
+    scores_flat = np.concatenate(scores_flat, axis=0)  # (nq_flat, topk)
+    doc_ids_flat = np.concatenate(doc_ids_flat, axis=0)  # (nq_flat, topk)
+    
+    if not rank_topk:  # return raw results
       # get text
-      texts = [(self.texts[_indices] if len(self.texts) else None) for _indices in indices]
-      result.extend([(ext_ids[i] if return_external_id else indices[i], scores[i], texts[i]) for i in range(len(indices))])
-    return result
-  
-  def get_by_ids_by_mask(self, ids: List[str]):
-    mask = np.isin(self.ids, ids)
-    _ids = self.ids[mask]
-    assert self.keep_raw_vector, 'require raw vectors'
-    _embs = self.embs[mask]
-    return _embs, _ids
+      texts = self.texts[doc_ids_flat] if len(self.texts) else None
+      if return_external_id:  # convert to external ids
+        doc_ids_flat = self.ids[doc_ids_flat]
+      return doc_ids_flat, scores_flat, texts
+    
+    # aggregate scores with max-sum on one query at a time (to save mem)
+    assert return_external_id
+    doc_ids_flat = self.ids_int[doc_ids_flat]
 
-  def get_by_ids(self, ids: List[str]):
-    indices = self.ids2indices(ids)
-    _ids = self.ids[indices]
+    assert query_ids is not None and query_splits is not None
+    assert len(query_ids) == len(scores_flat)
+    device = device or torch.device('cpu')
+    scores_flat = torch.tensor(scores_flat).to(device)
+    doc_ids_flat = torch.tensor(doc_ids_flat).to(device)
+
+    qid2rank: Dict[int, List[str, float]] = {}
+    for qi in range(len(query_splits)):
+      qstart, qend = query_splits[qi - 1] if qi else 0, query_splits[qi]
+      qid = query_ids[qstart]
+
+      # split
+      scores = scores_flat[qstart:qend]  # (nq, topk)
+      doc_ids = doc_ids_flat[qstart:qend]  # (nq, topk)
+
+      # max
+      unique_doc_ids, doc_ids = torch.unique(doc_ids, return_inverse=True)  # (uqd,) (nq, topk) uqd is the number of unique docs
+      nq, uqd = scores.size(0), unique_doc_ids.size(0)
+      lowest = scores.min()
+      agg_scores = torch.zeros(nq, uqd).to(device) + lowest  # (nq, uqd)
+      agg_mask = torch.zeros(nq, uqd).to(device)  # (nq, uqd)
+      agg_scores = torch_scatter.scatter_max(scores, doc_ids, out=agg_scores, dim=-1)[0]
+      agg_mask = torch_scatter.scatter_max(torch.ones_like(scores), doc_ids, out=agg_mask, dim=-1)[0]
+      agg_scores = agg_scores * agg_mask  # assume zero score if a qry-doc pair is absent
+
+      # sum
+      agg_scores = agg_scores.sum(0)  # (uqd)
+
+      # sort
+      if not rerank_topk:  # return the first-stage ranking result
+        sort_scores, sort_i = torch.topk(agg_scores, min(rank_topk, uqd))  # (rank_topk)
+        sort_dids = unique_doc_ids[sort_i]
+        qid2rank[qid] = self.compose_rank_list(sort_dids, sort_scores)
+        continue
+        
+      # rerank
+      sort_scores, sort_i = torch.topk(agg_scores, min(rerank_topk, uqd))
+      cand_dids = unique_doc_ids[sort_i]  # (cd)
+      cd = cand_dids.size(0)
+
+      # collect doc
+      cand_emb_flat, cand_dids_flat = self.get_by_ids(cand_dids)  # (cd_flat, emb_size) (cd_flat)
+      cand_emb_flat = cand_emb_flat.to(device)
+      cand_dids_flat = cand_dids_flat.to(device)
+
+      # collect qry
+      qv = query_vectors[qstart:qend]  # (nq, emb_size)
+      qv = torch.tensor(qv).to(device)
+    
+      # dot product    
+      full_scores = (qv @ cand_emb_flat.T)  # (nq, cd_flat)
+        
+      # term weights
+      if term_weights is not None:
+        tw = term_weights[qstart:qend]  # (nq,)
+        tw = torch.tensor(tw).to(device)
+        full_scores = full_scores * term_weights.unsqueeze(-1)
+      
+      # max-sum
+      unique_cand_dids_flat, cand_dids_flat = torch.unique(cand_dids_flat, return_inverse=True)  # (cd,) (cd_flat)
+      assert len(cand_dids) == len(unique_cand_dids_flat)
+      lowest = full_scores.min()
+      agg_full_scores = torch.zeros(nq, cd).to(full_scores) + lowest
+      agg_full_scores = torch_scatter.scatter_max(full_scores, cand_dids_flat, out=agg_full_scores, dim=-1)[0]  # (nq, cd)
+      agg_full_scores = agg_full_scores.sum(0)  # (cd)
+
+      # sort
+      sort_scores, sort_i = torch.topk(agg_full_scores, min(rank_topk, cd))  # (rank_topk)
+      sort_dids = unique_cand_dids_flat[sort_i]
+      qid2rank[qid] = self.compose_rank_list(sort_dids, sort_scores)
+
+    return qid2rank
+
+  def get_by_ids(
+    self, 
+    ids_int: torch.LongTensor):  # (n)
     assert self.keep_raw_vector, 'require raw vectors'
-    _embs = self.embs[indices]
-    return _embs, _ids
+    # (n, max_seq_len, emb_size), (n, max_seq_len)
+    embs, mask = self.embs_strided.lookup(ids_int, output='padded')
+    max_seq_len = embs.size(1)
+    ids_packed = ids_int.unsqueeze(-1).repeat(1, max_seq_len)[mask]
+    embs_packed = embs[mask]
+    return embs_packed, ids_packed
 
   def _update_id_mapping(self, ids):
     ids = np.array(ids, dtype=str)
@@ -259,7 +381,9 @@ class Indexer(object):
   def _update_emb(self, emb):
     if not self.keep_raw_vector:
       return
-    self.embs = np.concatenate((self.embs, emb), axis=0)
+    if type(emb) is not torch.tensor:
+      emb = torch.tensor(emb)
+    self.embs = torch.cat([self.embs, emb], axis=0)
 
 
 class MultiIndexer(object):
