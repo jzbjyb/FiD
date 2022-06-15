@@ -153,6 +153,7 @@ class Options():
         self.parser.add_argument('--seed', type=int, default=0, help="random seed for initialization")
         self.parser.add_argument('--num_workers', type=int, default=0, help='number of workers for dataloader')
         self.parser.add_argument('--augmentation', type=str, default=None, help='query augmentation')
+        self.parser.add_argument('--join_multiple_answer', type=str, default=None, help='join multiple answer with this separator')
         # training parameters
         self.parser.add_argument('--eval_freq', type=int, default=500,
                         help='evaluate model every <eval_freq> steps during training')

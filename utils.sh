@@ -31,6 +31,12 @@ function get_dataset_settings() {
     passage_maxlength=$( min 200 ${length_limit} )
     text_maxlength=250
   
+  elif [[ ${index_name} == 'nq_train3k_top10' ]]; then
+    passages=${data_root}/NQ/psgs_w100.train3k_top10_aggregate.tsv
+    queries=${data_root}/NQ/train.3k.json
+    passage_maxlength=$( min 200 ${length_limit} )
+    text_maxlength=250
+  
   elif [[ ${index_name} == 'nq_test' ]]; then
     passages=${data_root}/NQ/psgs_w100.test_aggregate.tsv
     queries=${data_root}/NQ/test.json
@@ -107,6 +113,22 @@ function get_dataset_settings() {
     beir=${data_root}/scidocs_beir
     split=test
     passage_maxlength=$( min 1024 ${length_limit} )
+    text_maxlength=${passage_maxlength}
+  
+  elif [[ ${index_name} == 'trec_covid' ]]; then
+    passages=${data_root}/trec_covid/psgs.tsv
+    queries=${data_root}/trec_covid/test.json
+    beir=${data_root}/trec_covid_beir
+    split=test
+    passage_maxlength=$( min 512 ${length_limit} )
+    text_maxlength=${passage_maxlength}
+  
+   elif [[ ${index_name} == 'quora' ]]; then
+    passages=${data_root}/quora/psgs.tsv
+    queries=${data_root}/quora/test.json
+    beir=${data_root}/quora_beir
+    split=test
+    passage_maxlength=$( min 200 ${length_limit} )
     text_maxlength=${passage_maxlength}
 
   elif [[ ${index_name} == 'cqadupstack_android' ]]; then

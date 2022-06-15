@@ -17,26 +17,44 @@ source utils.sh
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 
-#train_data=open_domain_data/scidocs_pseudo/train.json
-#train_data=open_domain_data/cqadupstack/programmers_pseudo/train.json
-#eval_data=open_domain_data/NQ/dev.json
-train_data=open_domain_data/bioasq_500k.nosummary/train.json
-eval_data=open_domain_data/bioasq_500k.nosummary/test.json
-metric=em
+task=$1
 
-num_gpu=4
+basemodel=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_inbatchneg64_accumulate4_ratio8_step8k_step8k
+
+eval_data=open_domain_data/NQ/dev.json
+answer_maxlength=50
+extra=""
+if [[ ${task} == 'scidocs' ]]; then
+  train_data=open_domain_data/scidocs_pseudo5/train.json
+elif [[ ${task} == 'bioasq_500k' ]]; then
+  train_data=open_domain_data/bioasq_500k.nosummary/train.json
+  eval_data=open_domain_data/bioasq_500k.nosummary/test.json
+  extra='--join_multiple_answer ,'
+elif [[ ${task} == 'fiqa' ]]; then
+  train_data=open_domain_data/fiqa/train.json
+  eval_data=open_domain_data/fiqa/dev.json
+  answer_maxlength=128
+elif [[ ${task} == 'trec_covid' ]]; then
+  train_data=open_domain_data/trec_covid_pseudo1/train.json
+elif [[ ${task} == 'cqa' ]]; then
+  train_data=open_domain_data/cqadupstack/pseudo1_sub20k_train.json
+else
+  exit
+fi
+
+num_gpu=8
 batch_size=2
-accum=2
+accum=1
 n_context=30
 text_maxlength=512
-answer_maxlength=50
 num_keep_ctx_in_decoder=0
 combine_weight=0
+metric=em
 
 init_model=google/t5-large-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_bs24_inbatchneg24_83ratio8_step16k_ratio4_bioasq500k_pseudo
-init_from=${ckpt_dir}/nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_bs24_inbatchneg24_83ratio8_step16k_ratio4/checkpoint/latest
+name=${basemodel}_${task}_ibn16_step2k
+init_from=${ckpt_dir}/${basemodel}/checkpoint/latest
 only_topk_n_context=0
 n_layer_two_tower=12
 layer_for_retrieval=first
@@ -84,12 +102,13 @@ python ${prefix} train_reader.py \
   --retrieval_aggregation_method ${retrieval_aggregation_method} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 1000 \
-  --warmup_step 100 \
-  --save_freq 1000 \
+  --total_step 2000 \
+  --warmup_step 200 \
+  --save_freq 2000 \
   --eval_freq 200 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
   --wandb_log_freq 10 \
-  --init_from ${init_from} &>> ${ckpt_dir}/${name}.out
+  --in_batch_negative \
+  --init_from ${init_from} ${extra} &>> ${ckpt_dir}/${name}.out

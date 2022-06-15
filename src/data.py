@@ -21,7 +21,8 @@ class Dataset(torch.utils.data.Dataset):
                  passage_prefix='context:',
                  add_eos: bool = False,
                  in_batch_negative_mimic: int = 0,
-                 augmentation: str = None):
+                 augmentation: str = None,
+                 join_multiple_answer: str = None):
         self.data = data
         self.n_context = n_context
         self.question_prefix = question_prefix
@@ -31,6 +32,10 @@ class Dataset(torch.utils.data.Dataset):
         self.in_batch_negative_mimic = in_batch_negative_mimic
         assert augmentation in {'duplicate', 'mask', None}
         self.augmentation = augmentation
+        self.join_multiple_answer = join_multiple_answer
+        if self.join_multiple_answer and len(self.join_multiple_answer) == 1:
+            self.join_multiple_answer = self.join_multiple_answer + ' '  # append space
+        self.max_num_answer = 10
         self.sort_data()
 
     def __len__(self):
@@ -41,17 +46,21 @@ class Dataset(torch.utils.data.Dataset):
         import transformers
         add_eos = transformers.__version__ == '3.0.2'
         if 'target' in example:
-            target = example['target']
-            return target + (' </s>' if add_eos else '')
+            final_ans = example['target']
         elif 'answers' in example:
             assert type(example['answers']) is list
             if type(example['answers'][0]) is list:  # has alias
                 ans_li = [a[0] for a in example['answers']]  # use the first alias as target
             else:
                 ans_li = example['answers']
-            return random.choice(ans_li) + (' </s>' if add_eos else '')
+            if self.join_multiple_answer:
+                final_ans = self.join_multiple_answer.join(ans_li[:self.max_num_answer])
+            else:
+                final_ans = random.choice(ans_li)
         else:
             return None
+        final_ans = final_ans + (' </s>' if add_eos else '')
+        return final_ans
     
     def augment(self, text: str):
         if self.augmentation is None:

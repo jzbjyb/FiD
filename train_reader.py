@@ -212,7 +212,8 @@ if __name__ == "__main__":
         n_context=opt.n_context,
         use_gold_doc_dist=opt.use_gold_doc_dist,
     )
-    train_dataset = src.data.Dataset(train_examples, opt.n_context, augmentation=opt.augmentation)
+    train_dataset = src.data.Dataset(
+        train_examples, opt.n_context, augmentation=opt.augmentation, join_multiple_answer=opt.join_multiple_answer)
     # use golbal rank and world size to split the eval set on multiple gpus
     eval_examples = src.data.load_data(
         opt.eval_data,
@@ -223,7 +224,8 @@ if __name__ == "__main__":
     )
     if opt.eval_num_examples:
         eval_examples = eval_examples[:opt.eval_num_examples]
-    eval_dataset = src.data.Dataset(eval_examples, opt.n_context, augmentation=opt.augmentation)
+    eval_dataset = src.data.Dataset(
+        eval_examples, opt.n_context, augmentation=opt.augmentation, join_multiple_answer=opt.join_multiple_answer)
 
     if opt.is_distributed and opt.global_rank != 0:  # load model
         torch.distributed.barrier()

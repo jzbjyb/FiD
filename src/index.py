@@ -178,6 +178,7 @@ class Indexer(object):
   
   def build_strided(self):
     self.embs_strided = StridedTensor(self.embs, torch.tensor(self.doclens).to(self.main_gpu))
+    #self.ids_int_strided = StridedTensor(torch.tensor(self.ids_int), torch.tensor(self.doclens).to(self.main_gpu))
   
   def build_int_ids(self):
     '''
@@ -207,6 +208,7 @@ class Indexer(object):
         self.ids_int.append(len(self.unique_ids) - 1)
     
     assert len(self.unique_ids) == len(self.doclens)
+    assert len(self.ids) == len(self.ids_int)
     self.unique_ids = np.array(self.unique_ids)
     self.doclens = np.array(self.doclens)
     self.ids_int = np.array(self.ids_int)
@@ -357,6 +359,17 @@ class Indexer(object):
       qid2rank[qid] = self.compose_rank_list(sort_dids, sort_scores)
 
     return qid2rank
+  
+  def get_by_ids2(
+    self, 
+    ids_int: torch.LongTensor):  # (n)
+    assert self.keep_raw_vector, 'require raw vectors'
+    # (n, max_seq_len, emb_size), (n, max_seq_len)
+    embs, mask = self.ids_int_strided.lookup(ids_int, output='padded')
+    max_seq_len = embs.size(1)
+    ids_packed = ids_int.unsqueeze(-1).repeat(1, max_seq_len)[mask]
+    embs_packed = embs[mask]
+    return embs_packed, ids_packed
 
   def get_by_ids(
     self, 
