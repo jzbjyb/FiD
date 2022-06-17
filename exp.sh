@@ -21,8 +21,6 @@ declare -a reranks=(0 1000 2048)
 domain=$1
 if [[ ${domain} == 'in' ]]; then
   datasets=("${in_datasets[@]}")
-elif [[ ${domain} == 'nq' ]]; then
-  datasets=("${nq_datasets[@]}")
 elif [[ ${domain} == 'out' ]]; then
   datasets=("${out_datasets[@]}")
 elif [[ ${domain} == 'all' ]]; then

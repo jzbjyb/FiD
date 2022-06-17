@@ -291,10 +291,12 @@ def save_distributed_dataset(data, opt):
 def load_passages(
   path: str, 
   restricted_ids: Set[str] = None, 
-  use_csv_reader: bool = True, 
+  use_csv_reader: bool = None, 
   as_numpy: bool = False, 
   iterative: bool = False,
   topk: int = None) -> List[Tuple[str, str, str]]:  # id, text, title
+    if use_csv_reader is None:
+        use_csv_reader = 'psgs_w100.tsv' in path
     if not os.path.exists(path):
         logger.info(f'{path} does not exist')
         return

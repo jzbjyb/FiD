@@ -19,11 +19,6 @@ faiss_gpus="--faiss_gpus all"
 rerank=""
 max_over_head=""
 augmentation=""
-if [[ ${gpu} == 'a100' ]]; then
-  files_per_run=16  # about 70G embs
-else
-  files_per_run=4  # about 30G embs
-fi
 
 # model specific arguments
 if [[ ${model_type} == 'fid' ]]; then
@@ -78,11 +73,6 @@ elif [[ ${model_type} == 'colbert' ]]; then
   candidate_doc_topk=$5
   aug=$6
   index_dim=128
-  if [[ ${gpu} == 'a100' ]]; then
-    files_per_run=8
-  else
-    files_per_run=4
-  fi
 
   get_dataset_settings ${index_name} 512 ${gpu}  # bert's limit is 512
   output_path=${model_path}.index/${index_name}
@@ -112,6 +102,23 @@ else
   echo 'multi-node'
   prefix=""
   exit  # TODO: not implemented
+fi
+
+if [[ ${index_name} == 'bioasq_1m' ]]; then
+  if [[ ${gpu} == 'a100' ]]; then
+    files_per_run=6  # about 70G embs
+  else
+    files_per_run=2  # about 30G embs
+  fi
+else
+  if [[ ${gpu} == 'a100' ]]; then
+    files_per_run=16  # about 70G embs
+  else
+    files_per_run=4  # about 30G embs
+  fi
+fi
+if [[ ${model_type} == 'colbert' ]]; then
+   files_per_run=`expr $files_per_run / 2`
 fi
 
 python ${prefix} retrieval.py \

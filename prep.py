@@ -79,6 +79,10 @@ class BEIRDataset:
     return metadata['answer']
   
   @classmethod
+  def get_answer_msmarco(cls, metadata: Dict) -> List[str]:
+    return ['']
+  
+  @classmethod
   def get_answer_nq(cls, metadata: Dict) -> List[str]:
     return metadata['answer']
 
@@ -500,7 +504,6 @@ def convert_bioasq_to_beir_format(bioasq_dir: str, beir_dir: str, sub_sample: in
             covered_rel_dids.add(did)
           if len(rel_docs) <= 0:
             query_without_rel += 1
-            continue
           answers = extract_answer(question)
           while str(qid) in did2dict or str(qid) in qid2dict:
             qid += 1
@@ -1252,7 +1255,7 @@ if __name__ == '__main__':
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format', 'split_fid_file',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 
     'create_whole_test', 'add_doc_to_onlyid', 'merge_queries', 'concate_queries', 'compare_two_rank_files', 
-    'annotate_rank_file', 'convert_colbert_data_to_fid_format'])
+    'annotate_rank_file', 'convert_colbert_data_to_fid_format', 'subsample'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   parser.add_argument('--other', type=str, nargs='+', help='additional arguments')
@@ -1270,7 +1273,7 @@ if __name__ == '__main__':
   elif args.task == 'convert_beir_to_fid_format':
     beir_dir = args.inp[0]
     out_dir = args.out[0]
-    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='fiqa', splits=['train', 'dev', 'test'], add_self=False, add_qrel_as_answer='text')
+    convert_beir_to_fid_format(beir_dir, out_dir, dataset_name='pseudo', splits=['train'], add_self=True)
 
   elif args.task == 'convert_sciq_to_beir_format':
     sciq_dir = args.inp[0]
@@ -1313,7 +1316,7 @@ if __name__ == '__main__':
   elif args.task == 'convert_bioasq_to_beir_format':
     bioasq_dir = args.inp[0]
     beir_dir = args.out[0]
-    convert_bioasq_to_beir_format(bioasq_dir, beir_dir, sub_sample=500000)
+    convert_bioasq_to_beir_format(bioasq_dir, beir_dir, sub_sample=1000000)
 
   elif args.task == 'convert_fid_to_rag_format':
     fid_dir, beir_dir = args.inp
@@ -1423,7 +1426,7 @@ if __name__ == '__main__':
   elif args.task == 'create_pseudo_queries_from_beir':
     beir_dir = args.inp[0]
     out_beir_dir = args.out[0]
-    create_pseudo_queries_from_corpus(beir_dir, out_beir_dir, subsample=20000, num_sent_per_doc=1, max_num_mask_ent=1)
+    create_pseudo_queries_from_corpus(beir_dir, out_beir_dir, subsample=100000, num_sent_per_doc=1, max_num_mask_ent=1)
 
   elif args.task == 'split_fid_file':
     query_file = args.inp[0]
@@ -1468,3 +1471,15 @@ if __name__ == '__main__':
     out_file = args.out[0]
     convert_colbert_data_to_fid_format(
       qry_file, psg_file, annotation_file, qry_file_original, out_file, merge=False, one_positive_per_query=True)
+    
+  elif args.task == 'subsample':
+    query_file = args.inp[0]
+    out_file = args.out[0]
+    count = 1024
+    with open(query_file, 'r') as fin, open(out_file, 'w') as fout:
+      data = json.load(fin)
+      assert count <= len(data)
+      sam = random.sample(range(len(data)), count)
+      assert len(sam) == len(set(sam))
+      data = [data[i] for i in sam]
+      json.dump(data, fout, indent=2)

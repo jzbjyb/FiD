@@ -72,6 +72,28 @@ function get_dataset_settings() {
     passage_maxlength=$( min 200 ${length_limit} )
     text_maxlength=250
   
+  elif [[ ${index_name} == 'msmarco' ]]; then
+    passages=${data_root}/msmarco/psgs.tsv
+    queries=${data_root}/msmarco/dev.json
+    beir=${data_root}/msmarco_beir
+    split=dev
+    passage_maxlength=$( min 200 ${length_limit} )
+    text_maxlength=250
+    num_shards=$( nvidia-smi --query-gpu=name --format=csv,noheader | wc -l )  # use all gpus
+    save_every_n_doc=100000
+    num_workers=0
+  
+  elif [[ ${index_name} == 'bioasq_1m' ]]; then
+    passages=${data_root}/bioasq_1m/psgs.tsv
+    queries=${data_root}/bioasq_1m/test.json
+    beir=${data_root}/bioasq_1m_beir
+    split=test
+    passage_maxlength=$( min 1024 ${length_limit} )
+    text_maxlength=${passage_maxlength}
+    num_shards=$( nvidia-smi --query-gpu=name --format=csv,noheader | wc -l )  # use all gpus
+    save_every_n_doc=100000
+    num_workers=0
+  
   elif [[ ${index_name} == 'bioasq_500k' ]]; then
     passages=${data_root}/bioasq_500k.nosummary/psgs.tsv
     queries=${data_root}/bioasq_500k.nosummary/test.json

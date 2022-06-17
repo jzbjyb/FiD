@@ -394,7 +394,7 @@ def main(opt):
     model = model.cuda()
     logger = src.util.init_logger(opt.is_main, opt.is_distributed, opt.output_path / f'index{opt.shard_id}.log')
     # load data
-    passages = next(src.util.load_passages(opt.passages))  # TODO: only psgs_w100.tsv needs csv reader
+    passages = next(src.util.load_passages(opt.passages))
     shard_size = len(passages) // opt.num_shards
     start_idx = opt.shard_id * shard_size
     end_idx = start_idx + shard_size

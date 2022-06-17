@@ -22,7 +22,9 @@ task=$1
 basemodel=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_inbatchneg64_accumulate4_ratio8_step8k_step8k
 
 eval_data=open_domain_data/NQ/dev.json
+text_maxlength=512
 answer_maxlength=50
+n_context=30
 extra=""
 if [[ ${task} == 'scidocs' ]]; then
   train_data=open_domain_data/scidocs_pseudo5/train.json
@@ -30,6 +32,29 @@ elif [[ ${task} == 'bioasq_500k' ]]; then
   train_data=open_domain_data/bioasq_500k.nosummary/train.json
   eval_data=open_domain_data/bioasq_500k.nosummary/test.json
   extra='--join_multiple_answer ,'
+elif [[ ${task} == 'bioasq_1m' ]]; then
+  train_data=open_domain_data/bioasq_1m/train.json
+  eval_data=open_domain_data/bioasq_1m/test.json
+  extra='--join_multiple_answer ,'
+elif [[ ${task} == 'bioasq_1m_16' ]]; then
+  train_data=open_domain_data/bioasq_1m/train.16.json
+  eval_data=open_domain_data/bioasq_1m/test.json
+  extra='--join_multiple_answer ,'
+elif [[ ${task} == 'bioasq_1m_64' ]]; then
+  train_data=open_domain_data/bioasq_1m/train.64.json
+  eval_data=open_domain_data/bioasq_1m/test.json
+  extra='--join_multiple_answer ,'
+elif [[ ${task} == 'bioasq_1m_256' ]]; then
+  train_data=open_domain_data/bioasq_1m/train.256.json
+  eval_data=open_domain_data/bioasq_1m/test.json
+  extra='--join_multiple_answer ,'
+elif [[ ${task} == 'bioasq_1m_1024' ]]; then
+  train_data=open_domain_data/bioasq_1m/train.1024.json
+  eval_data=open_domain_data/bioasq_1m/test.json
+  extra='--join_multiple_answer ,'
+elif [[ ${task} == 'bioasq_1m_pseudo' ]]; then
+  train_data=open_domain_data/bioasq_1m_pseudo1_sub100k/train.json
+  eval_data=open_domain_data/bioasq_1m/test.json
 elif [[ ${task} == 'fiqa' ]]; then
   train_data=open_domain_data/fiqa/train.json
   eval_data=open_domain_data/fiqa/dev.json
@@ -38,6 +63,12 @@ elif [[ ${task} == 'trec_covid' ]]; then
   train_data=open_domain_data/trec_covid_pseudo1/train.json
 elif [[ ${task} == 'cqa' ]]; then
   train_data=open_domain_data/cqadupstack/pseudo1_sub20k_train.json
+elif [[ ${task} == 'scifact' ]]; then
+  train_data=open_domain_data/scifact_pseudo5/train.json
+elif [[ ${task} == 'msmarco' ]]; then
+  train_data=open_domain_data/msmarco_pseudo1_sub200k/train.json
+  text_maxlength=250
+  n_context=100
 else
   exit
 fi
@@ -45,15 +76,13 @@ fi
 num_gpu=8
 batch_size=2
 accum=1
-n_context=30
-text_maxlength=512
 num_keep_ctx_in_decoder=0
 combine_weight=0
 metric=em
 
 init_model=google/t5-large-lm-adapt
 ckpt_dir=trained_reader
-name=${basemodel}_${task}_ibn16_step2k
+name=${basemodel}_${task}_ibn16_step5h
 init_from=${ckpt_dir}/${basemodel}/checkpoint/latest
 only_topk_n_context=0
 n_layer_two_tower=12
@@ -102,10 +131,10 @@ python ${prefix} train_reader.py \
   --retrieval_aggregation_method ${retrieval_aggregation_method} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 2000 \
-  --warmup_step 200 \
-  --save_freq 2000 \
-  --eval_freq 200 \
+  --total_step 500 \
+  --warmup_step 50 \
+  --save_freq 500 \
+  --eval_freq 100 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
