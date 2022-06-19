@@ -129,6 +129,14 @@ function get_dataset_settings() {
     passage_maxlength=$( min 1024 ${length_limit} )
     text_maxlength=${passage_maxlength}
   
+  elif [[ ${index_name} == 'nfcorpus' ]]; then
+    passages=${data_root}/nfcorpus/psgs.tsv
+    queries=${data_root}/nfcorpus/test.json
+    beir=${data_root}/nfcorpus_beir
+    split=test
+    passage_maxlength=$( min 512 ${length_limit} )
+    text_maxlength=${passage_maxlength}
+  
   elif [[ ${index_name} == 'scidocs' ]]; then
     passages=${data_root}/scidocs/psgs.tsv
     queries=${data_root}/scidocs/test.json
@@ -144,6 +152,17 @@ function get_dataset_settings() {
     split=test
     passage_maxlength=$( min 512 ${length_limit} )
     text_maxlength=${passage_maxlength}
+  
+  elif [[ ${index_name} == 'touche2020' ]]; then
+    passages=${data_root}/touche2020/psgs.tsv
+    queries=${data_root}/touche2020/test.json
+    beir=${data_root}/touche2020_beir
+    split=test
+    passage_maxlength=$( min 512 ${length_limit} )
+    text_maxlength=${passage_maxlength}
+    num_shards=$( nvidia-smi --query-gpu=name --format=csv,noheader | wc -l )  # use all gpus
+    save_every_n_doc=100000
+    num_workers=0
   
    elif [[ ${index_name} == 'quora' ]]; then
     passages=${data_root}/quora/psgs.tsv

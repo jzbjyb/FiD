@@ -44,6 +44,18 @@ class BEIRDataset:
     return [labels[0].lower()]
   
   @classmethod
+  def get_answer_nfcorpus(cls, metadata: Dict) -> List[str]:
+    return ['']
+  
+  @classmethod
+  def get_answer_arguana(cls, metadata: Dict) -> List[str]:
+    return ['']
+  
+  @classmethod
+  def get_answer_touche2020(cls, metadata: Dict) -> List[str]:
+    return [metadata['description']]
+  
+  @classmethod
   def get_answer_trec_covid(cls, metadata: Dict) -> List[str]:
     return ['']
 
@@ -550,7 +562,8 @@ def eval_retrieval(
      topks: List[int] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 50, 100],
      use_raw_bioasq: bool = False,
      max_num_docs: int = 100,
-     metric: str = 'ndcg'):
+     metric: str = 'ndcg',
+     skip_same: bool = True):
   use_qid = False
   qid2dids: Dict[str, List[str]] = defaultdict(list)
   qid2scores: Dict[str, List[float]] = defaultdict(list)
@@ -558,6 +571,9 @@ def eval_retrieval(
     qid = example['id'] if ('id' in example and not use_raw_bioasq) else example['question']
     use_qid = True if ('id' in example and not use_raw_bioasq) else use_qid
     for rank, d in enumerate(example['ctxs']):
+      if skip_same and d['id'] == qid:
+        print(qid)
+        continue
       qid2dids[qid].append(d['id'])
       score = d['score'] if 'score' in d else (1 / (rank + 1))
       qid2scores[qid].append(score)
@@ -1246,6 +1262,35 @@ def convert_colbert_data_to_fid_format(
     json.dump(new_data, fout, indent=2)
 
 
+def add_qrel_as_answer(query_file: str, beir_dir: str, split: str, out_file: str, field: str = 'text', format: str = 'doc', subsample: int = None):
+  assert field in {'text', 'title'}
+  assert format in {'doc', 'relevance-doc'}
+  corpus, _, qrels = GenericDataLoader(data_folder=beir_dir).load(split=split)
+  no_rel_q = 0
+  all_q = 0
+  with open(query_file, 'r') as fin, open(out_file, 'w') as fout:
+    data = json.load(fin)
+    all_q = len(data)
+    ratio = 1.0
+    if subsample and len(data) > subsample:
+      ratio = subsample / len(data)
+    new_data = []
+    for query in tqdm(data):
+      if random.random() > ratio:
+        continue
+      qid = query['id']
+      if format == 'doc':
+        query['answers'] = [clean_text_for_tsv(corpus[did].get(field)) for did, rel in qrels[qid].items() if rel]
+      elif format == 'relevance-doc':
+        query['answers'] = [f'relevance: {rel}. {clean_text_for_tsv(corpus[did].get(field))}' for did, rel in qrels[qid].items() if rel]
+      else:
+        raise NotImplementedError
+      no_rel_q += int(len(query['answers']) <= 0)
+      new_data.append(query)
+    print(f'{no_rel_q} out of {all_q} have no rel')
+    json.dump(new_data, fout, indent=2)
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
@@ -1255,7 +1300,7 @@ if __name__ == '__main__':
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format', 'split_fid_file',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 
     'create_whole_test', 'add_doc_to_onlyid', 'merge_queries', 'concate_queries', 'compare_two_rank_files', 
-    'annotate_rank_file', 'convert_colbert_data_to_fid_format', 'subsample'])
+    'annotate_rank_file', 'convert_colbert_data_to_fid_format', 'subsample', 'add_qrel_as_answer'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   parser.add_argument('--other', type=str, nargs='+', help='additional arguments')
@@ -1426,7 +1471,7 @@ if __name__ == '__main__':
   elif args.task == 'create_pseudo_queries_from_beir':
     beir_dir = args.inp[0]
     out_beir_dir = args.out[0]
-    create_pseudo_queries_from_corpus(beir_dir, out_beir_dir, subsample=100000, num_sent_per_doc=1, max_num_mask_ent=1)
+    create_pseudo_queries_from_corpus(beir_dir, out_beir_dir, subsample=None, num_sent_per_doc=5, max_num_mask_ent=1)
 
   elif args.task == 'split_fid_file':
     query_file = args.inp[0]
@@ -1483,3 +1528,8 @@ if __name__ == '__main__':
       assert len(sam) == len(set(sam))
       data = [data[i] for i in sam]
       json.dump(data, fout, indent=2)
+  
+  elif args.task == 'add_qrel_as_answer':
+    query_file, split, beir_dir = args.inp
+    out_file = args.out[0]
+    add_qrel_as_answer(query_file, beir_dir, split, out_file, format='doc', subsample=50000)

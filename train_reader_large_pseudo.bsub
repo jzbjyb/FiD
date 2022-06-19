@@ -65,8 +65,22 @@ elif [[ ${task} == 'cqa' ]]; then
   train_data=open_domain_data/cqadupstack/pseudo1_sub20k_train.json
 elif [[ ${task} == 'scifact' ]]; then
   train_data=open_domain_data/scifact_pseudo5/train.json
+elif [[ ${task} == 'nfcorpus' ]]; then
+  train_data=open_domain_data/nfcorpus_pseudo5/train.json
+elif [[ ${task} == 'touche2020' ]]; then
+  train_data=open_domain_data/touche2020_pseudo1_sub100k/train.json
 elif [[ ${task} == 'msmarco' ]]; then
   train_data=open_domain_data/msmarco_pseudo1_sub200k/train.json
+  text_maxlength=250
+  n_context=100
+elif [[ ${task} == 'msmarco_doc' ]]; then
+  train_data=open_domain_data/msmarco/train_with_doc_sub50k.json
+  eval_data=open_domain_data/msmarco/dev_with_doc.json
+  text_maxlength=250
+  n_context=100
+elif [[ ${task} == 'msmarco_docrel' ]]; then
+  train_data=open_domain_data/msmarco/train_with_docrel_sub50k.json
+  eval_data=open_domain_data/msmarco/dev_with_docrel.json
   text_maxlength=250
   n_context=100
 else
@@ -82,7 +96,7 @@ metric=em
 
 init_model=google/t5-large-lm-adapt
 ckpt_dir=trained_reader
-name=${basemodel}_${task}_ibn16_step5h
+name=${basemodel}_${task}_ibn16_step4k
 init_from=${ckpt_dir}/${basemodel}/checkpoint/latest
 only_topk_n_context=0
 n_layer_two_tower=12
@@ -131,10 +145,10 @@ python ${prefix} train_reader.py \
   --retrieval_aggregation_method ${retrieval_aggregation_method} \
   --attention_mask ${attention_mask} \
   --query_in_decoder ${query_in_decoder} \
-  --total_step 500 \
-  --warmup_step 50 \
-  --save_freq 500 \
-  --eval_freq 100 \
+  --total_step 4000 \
+  --warmup_step 400 \
+  --save_freq 2000 \
+  --eval_freq 200 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
