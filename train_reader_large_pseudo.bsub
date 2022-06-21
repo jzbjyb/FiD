@@ -20,6 +20,7 @@ export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 task=$1
 
 basemodel=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_inbatchneg64_accumulate4_ratio8_step8k_step8k
+#basemodel=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_kl1_inbatchneg64_accumulate4_ratio8_step8k_step8k_msmarco_docrel_ibn16_step4k
 
 eval_data=open_domain_data/NQ/dev.json
 text_maxlength=512
@@ -83,12 +84,22 @@ elif [[ ${task} == 'msmarco_docrel' ]]; then
   eval_data=open_domain_data/msmarco/dev_with_docrel.json
   text_maxlength=250
   n_context=100
+elif [[ ${task} == 'msmarco_docrel_200k' ]]; then
+  train_data=open_domain_data/msmarco/train_with_docrel_sub200k.json
+  eval_data=open_domain_data/msmarco/dev_with_docrel.json
+  text_maxlength=250
+  n_context=100
+elif [[ ${task} == 'msmarco_docrel_all' ]]; then
+  train_data=open_domain_data/msmarco/train_with_docrel.json
+  eval_data=open_domain_data/msmarco/dev_with_docrel.json
+  text_maxlength=250
+  n_context=100
 else
   exit
 fi
 
-num_gpu=8
-batch_size=2
+num_gpu=4
+batch_size=4
 accum=1
 num_keep_ctx_in_decoder=0
 combine_weight=0
@@ -96,7 +107,7 @@ metric=em
 
 init_model=google/t5-large-lm-adapt
 ckpt_dir=trained_reader
-name=${basemodel}_${task}_ibn16_step4k
+name=${basemodel}_${task}_ibn16_step4k_ratio8
 init_from=${ckpt_dir}/${basemodel}/checkpoint/latest
 only_topk_n_context=0
 n_layer_two_tower=12
@@ -104,7 +115,7 @@ layer_for_retrieval=first
 keep_ctx_in_decoder_with_head=0
 keep_ctx_in_decoder_head_tau=0.001
 head_weights_norm_func=softmax
-encoder_decoder_kl_ratio=1.0
+encoder_decoder_kl_ratio=8.0
 encoder_encoder_kl_ratio=0.0
 encoder_encoder_kl="first|last=3|10"
 encoder_encoder_kl_sparsity=0
@@ -147,11 +158,12 @@ python ${prefix} train_reader.py \
   --query_in_decoder ${query_in_decoder} \
   --total_step 4000 \
   --warmup_step 400 \
-  --save_freq 2000 \
+  --save_freq 4000 \
   --eval_freq 200 \
   --eval_num_examples 200 \
   --metric ${metric} \
   --wandb_name ${ckpt_dir}/${name} \
   --wandb_log_freq 10 \
   --in_batch_negative \
+  --accumulation_for_ibn 2 \
   --init_from ${init_from} ${extra} &>> ${ckpt_dir}/${name}.out

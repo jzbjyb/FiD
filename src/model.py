@@ -230,6 +230,7 @@ def t5stack_forward(
      output_hidden_states=None,
      return_dict=None,
      num_run_layers: int = None,  # number of layers to run (added parameters)
+     gold_doc_dist = None,
 ):
   block_to_run = self.block if num_run_layers is None else self.block[:num_run_layers]
 
@@ -859,7 +860,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         if accumulated is not None:  # pass it to encoder and decoder
             self.encoder.set_accumulated(accumulated)
             self.decoder.set_accumulated(accumulated)
-        else:
+        elif hasattr(self.encoder, 'delete_accumulated') and hasattr(self.decoder, 'delete_accumulated'):
             self.encoder.delete_accumulated()
             self.decoder.delete_accumulated()
         result = super().forward(
@@ -2103,8 +2104,14 @@ def get_single_head_idx(num_heads: int, n_layer_two_tower: int, max_over_head: b
       return 2
     raise NotImplementedError
   if num_heads == 16:  # 'google/t5-large-lm-adapt':
-    assert n_layer_two_tower == 12
-    return 6
+    assert n_layer_two_tower in {6, 12, 18}
+    if layer_index == 6:
+      return 5
+    if layer_index == 12:
+      return 6
+    if layer_index == 18:
+      return 11
+    raise NotImplementedError
   raise NotImplementedError
 
 def compute_score_and_aggregate_in_batch(

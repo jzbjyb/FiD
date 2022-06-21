@@ -25,6 +25,7 @@ function get_dataset_settings() {
   num_workers=4
   query_maxlength=$( min 50 ${length_limit} )  # 50 query tokens
   answer_maxlength=50
+  
   if [[ ${index_name} == 'nq_test_top10' ]]; then
     passages=${data_root}/NQ/psgs_w100.test_top10_aggregate.tsv
     queries=${data_root}/NQ/test.json
@@ -63,6 +64,12 @@ function get_dataset_settings() {
     num_shards=$( nvidia-smi --query-gpu=name --format=csv,noheader | wc -l )  # use all gpus
     save_every_n_doc=100000
     num_workers=0
+  
+  elif [[ ${index_name} == 'sciq' ]]; then
+    passages=${data_root}/SciQ/psgs.tsv
+    queries=${data_root}/SciQ/test.json
+    passage_maxlength=$( min 200 ${length_limit} )
+    text_maxlength=250
   
   elif [[ ${index_name} == 'msmarcoqa_dev' ]]; then
     passages=${data_root}/msmarco_qa/psgs.dev_aggregate.tsv

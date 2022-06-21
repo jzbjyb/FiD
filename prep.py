@@ -1383,8 +1383,8 @@ if __name__ == '__main__':
       layer_index, head_index = int(args.other[3]), int(args.other[4])
     #key = 'score'  # score two_tower_attn_score encoder_score
     #method = 'avg'
-    n_two_tower_layers = 6
-    num_heads = 12
+    n_two_tower_layers = 0
+    num_heads = 16
 
     ret_file = args.inp[0]
     beir_dir = args.inp[1] if len(args.inp) > 1 else None
@@ -1415,6 +1415,12 @@ if __name__ == '__main__':
     elif method == 'flat':
       sort = True
       key_func = lambda x: np.mean([b for a in x[key] for b in a][head_index])
+    elif method == 'all':
+      for l in range(1):
+        for i in range(num_heads):
+          print(f'layer {l}, head {i}')
+          eval_answer(ret_file, beir_dir=beir_dir, split=split, sort=True, key_func=lambda x: np.mean(x[key][l][i]), metric=metric)
+      exit()
     else:
       for l in range(12 - n_two_tower_layers):
         if method == 'avg_layer':
@@ -1532,4 +1538,4 @@ if __name__ == '__main__':
   elif args.task == 'add_qrel_as_answer':
     query_file, split, beir_dir = args.inp
     out_file = args.out[0]
-    add_qrel_as_answer(query_file, beir_dir, split, out_file, format='doc', subsample=50000)
+    add_qrel_as_answer(query_file, beir_dir, split, out_file, format='relevance-doc', subsample=200000)

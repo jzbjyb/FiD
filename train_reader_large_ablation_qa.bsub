@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+
+#BSUB -J fid
+#BSUB -o bosch/%J.stdout
+#BSUB -e bosch/%J.stderr
+#BSUB -W 48:00
+#BSUB -n 4
+#BSUB -M 32000
+#BSUB -gpu "num=4:mode=exclusive_process:mps=no"
+#BSUB -q batch_a100
+
+n_layer_two_tower=12
+encoder_decoder_kl_ratio=0.0
+
+source activate beir
+source utils.sh 
+
+#module load proxy4server-access
+#source /fs/applications/p4s-access/1.0/ActivateP4S.sh -a
+
+export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
+
+train_data=open_domain_data/NQ/train.json
+#train_data=open_domain_data/NQ_bm25/train.json
+eval_data=open_domain_data/NQ/dev.json
+#train_data=open_domain_data/SciQ/train.json
+#eval_data=open_domain_data/SciQ/dev.json
+metric=em
+
+num_gpu=8
+batch_size=2
+accum=1
+n_context=100
+text_maxlength=250
+answer_maxlength=50
+num_keep_ctx_in_decoder=0
+combine_weight=0
+
+init_model=google/t5-large-lm-adapt
+ckpt_dir=trained_reader
+name=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_abl_nbl${n_layer_two_tower}_qa
+init_from=${ckpt_dir}/nq_reader_large_v11lm_separate_layer12_bs16_step3k/checkpoint/latest
+only_topk_n_context=0
+layer_for_retrieval=first
+keep_ctx_in_decoder_with_head=0
+keep_ctx_in_decoder_head_tau=0.001
+head_weights_norm_func=softmax
+encoder_encoder_kl_ratio=0.0
+encoder_encoder_kl="first|last=3|10"
+encoder_encoder_kl_sparsity=0
+retrieval_aggregation_method=all-avg-max
+attention_mask=separate
+query_in_decoder=no
+
+get_prefix ${num_gpu}
+
+cat ./train_reader_large_ablation_qa.bsub &> ${ckpt_dir}/${name}.out
+python ${prefix} train_reader.py \
+  --train_data ${train_data} \
+  --eval_data ${eval_data} \
+  --model_size ${init_model} \
+  --use_checkpoint \
+  --text_maxlength ${text_maxlength} \
+  --answer_maxlength ${answer_maxlength} \
+  --per_gpu_batch_size ${batch_size} \
+  --accumulation_steps ${accum} \
+  --n_context ${n_context} \
+  --only_topk_n_context ${only_topk_n_context} \
+  --name ${name} \
+  --checkpoint_dir ${ckpt_dir} \
+  --lr 0.00005 \
+  --optim adamw \
+  --scheduler linear \
+  --weight_decay 0.01 \
+  --n_layer_two_tower ${n_layer_two_tower} \
+  --layer_for_retrieval ${layer_for_retrieval} \
+  --num_keep_ctx_in_decoder ${num_keep_ctx_in_decoder} \
+  --combine_weight ${combine_weight} \
+  --keep_ctx_in_decoder_head_tau ${keep_ctx_in_decoder_head_tau} \
+  --head_weights_norm_func ${head_weights_norm_func} \
+  --encoder_decoder_kl_ratio ${encoder_decoder_kl_ratio} \
+  --encoder_encoder_kl_ratio ${encoder_encoder_kl_ratio} \
+  --encoder_encoder_kl ${encoder_encoder_kl} \
+  --encoder_encoder_kl_sparsity ${encoder_encoder_kl_sparsity} \
+  --retrieval_aggregation_method ${retrieval_aggregation_method} \
+  --attention_mask ${attention_mask} \
+  --query_in_decoder ${query_in_decoder} \
+  --total_step 1000 \
+  --warmup_step 100 \
+  --save_freq 1000 \
+  --eval_freq 200 \
+  --eval_num_examples 200 \
+  --metric ${metric} \
+  --wandb_name ${ckpt_dir}/${name} \
+  --wandb_log_freq 10 \
+  --init_from ${init_from} &>> ${ckpt_dir}/${name}.out
