@@ -34,6 +34,11 @@ class MemoryBank:
     else:
       cuda_device = use_gpu  # use specified device
     self.get_index = lambda: Indexer(indexing_dimension, n_subquantizers=0, n_bits=0, hnsw_m=0, cuda_device=cuda_device)
+    self.main_device = cuda_device[0] if type(cuda_device) is list else cuda_device
+    if self.main_device >= 0:
+      self.main_device = torch.device(self.main_device)
+    else:
+      self.main_device = torch.device('cpu')
     self.index = self.get_index()
     self.remove_count_when_full: Union[int, float] = 0.5  # absolute count of ratio
     self.dedup = True
@@ -138,6 +143,7 @@ class MemoryBank:
             token_id: torch.LongTensor,  # (bs, max_qry_len)
             filter_doc_id: np.ndarray = None,  # (bs, num_filter_doc)
             token_topk: int = 1,
+            rerank_topk: int = 0,
             doc_topk: int = 1,
             use_random: bool = False,
             debug: bool = False):
@@ -146,38 +152,34 @@ class MemoryBank:
     assert key.size(-1) == query.size(-1) == self.indexing_dimension
     assert key.size(0) == query.size(0) == mask.size(0)
     assert key.size(1) == query.size(1) == mask.size(1)
+    doc_to_keep = doc_topk + (filter_doc_id.shape[1] if self.dedup else 0)
 
     # token-level retrieval
     embs_for_query = torch.masked_select(query, mask.unsqueeze(-1)).view(-1, emb_size).detach().cpu().numpy()
     qids = [i for i in range(bs) for j in range(mask[i].sum())]
-    top_ids_and_scores = self.index.search_knn(embs_for_query, token_topk)
-    assert len(embs_for_query) == len(qids) == len(top_ids_and_scores)
-
-    # aggregate
-    qid2tokens2did2score: Dict[int, List[Dict[int, float]]] = defaultdict(list)
-    for i, (dids, scores, texts) in enumerate(top_ids_and_scores):
-      qid = qids[i]
-      qid2tokens2did2score[qid].append(defaultdict(lambda: -1e10))
-      for did, score in zip(dids, scores):
-        did = int(did)
-        qid2tokens2did2score[qid][-1][did] = max(score, qid2tokens2did2score[qid][-1][did])
-    qid2did2score: Dict[int, Dict[int, float]] = defaultdict(lambda: defaultdict(lambda: 0))
-    for qid, tokens in qid2tokens2did2score.items():
-      for token in tokens:
-        for did, score in token.items():
-          qid2did2score[qid][did] += score
+    query_lens = mask.sum(-1)  # (bs)
+    query_splits = torch.cumsum(query_lens, dim=0)  # (bs)
+    #top_ids_and_scores = self.index.search_knn(embs_for_query, token_topk)
+    qid2rank = self.index.search_knn(
+      embs_for_query, 
+      token_topk,  # 2048
+      term_weights=None,
+      query_ids=qids,
+      query_splits=query_splits.tolist(),
+      rank_topk=doc_to_keep,
+      rerank_topk=rerank_topk,
+      device=self.main_device)
+    assert bs == len(qid2rank)
 
     # concatenate
-    doc_to_keep = doc_topk + (filter_doc_id.shape[1] if self.dedup else 0)
     concat_key, concat_qry, concat_mask, concat_tokid = [], [], [], []
     retrieved_count: List[int] = []
     filtered_count: List[int] = []
     for qid in range(bs):
-      did2score = qid2did2score[qid]
-      query_len = mask[qid].sum().item()
-      dids = list(sorted(did2score.items(), key=lambda x: -x[1]))[:doc_to_keep]
+      rank = qid2rank[qid]
+      query_len = query_lens[qid]
+      dids = [int(did) - self.ids[0] for did, _ in rank[:doc_to_keep]]  # use the first id as offset
       retrieved_count.append(len(dids))
-      dids = [did - self.ids[0] for did, _ in dids]  # use the first id as offset
 
       if debug:
         print(tokenizer.decode(tokid[qid][:query_len]))
@@ -298,7 +300,7 @@ class MemoryBank:
     # (bs, memory_bank_topk, seq_len)
     _key_states, _query_states, _attention_mask, _input_ids, filtered_count, retrieved_count = self.query(
       key_to_query, query_to_query, mask_to_query, input_ids_to_query, filter_doc_id=input_doc_ids,
-      token_topk=2048, doc_topk=self.bank_topk, use_random=self.use_random)
+      token_topk=2048, rerank_topk=0, doc_topk=self.bank_topk, use_random=self.use_random)
     # (bs * memory_bank_topk, seq_len)
     # (bs * memory_bank_topk, seq_len, seq_len)
     return _input_ids.view(-1, seq_len), _attention_mask.view(-1, seq_len, seq_len), filtered_count, retrieved_count
@@ -365,6 +367,7 @@ class MemoryBankProcessHelper:
       return
     if not hasattr(self, 'process'):  # create process
       self.in_queue = Queue()
+      self.in_queue_cache = []
       self.out_queue = Queue()
       self.process = Process(target=functools.partial(memory_bank_process, **self.init_kwargs), args=(self.in_queue, self.out_queue))
       self.process.daemon = True
@@ -429,12 +432,13 @@ class MemoryBankProcessHelper:
     attention_mask: torch.BoolTensor,  # (bs * n_context, seq_len, seq_len)
     input_ids: torch.LongTensor,  # (bs * n_context, seq_len)
     input_doc_ids: np.ndarray,  # (bs * n_context)
-    n_context: int):
+    n_context: int,
+    flush: bool = False):
     query_states, key_states, attention_mask, input_ids, input_doc_ids = self._gather(
       query_states, key_states, attention_mask, input_ids, input_doc_ids)
     if not self.is_distributed or self.rank == self.master_rank:
       total_n_doc = query_states.size(0)
-      self.in_queue.put({
+      req = {
         'query_states': query_states.cpu(),
         'key_states': key_states.cpu(),
         'attention_mask': attention_mask.cpu(),
@@ -442,12 +446,18 @@ class MemoryBankProcessHelper:
         'input_doc_ids': input_doc_ids,
         'n_context': n_context,
         'action': 'add'
-      })
-      rec = self.out_queue.get()  # get the current size
-      self.bank_size = rec['size']
-      WandbLogger.log_w_step({'memory-band-size': self.bank_size})
-      WandbLogger.log_w_step({'memory-band-dup-count': rec['dup_count'] / total_n_doc})
-    self._broadcast_bank_size()
+      }
+      self.in_queue_cache.append(req)
+      if flush:
+        for req in self.in_queue_cache:
+          self.in_queue.put(req)
+          rec = self.out_queue.get()  # get the current size
+          self.bank_size = rec['size']
+          WandbLogger.log_w_step({'memory-band-size': self.bank_size})
+          WandbLogger.log_w_step({'memory-band-dup-count': rec['dup_count'] / total_n_doc})
+        self.in_queue_cache = []
+    if flush:
+      self._broadcast_bank_size()
     if self.is_distributed:
       torch.distributed.barrier()
   

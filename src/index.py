@@ -237,7 +237,10 @@ class Indexer(object):
     assert len(self) == self.index.ntotal
   
   def compose_rank_list(self, dids: torch.LongTensor, scores: torch.FloatTensor):
-    dids = self.unique_ids[dids.cpu().numpy()]
+    if hasattr(self, 'unique_ids'):
+      dids = self.unique_ids[dids.cpu().numpy()]
+    else:
+      dids = dids.tolist()
     return [(str(did), score.item()) for did, score in zip(dids, scores)]
 
   def search_knn(
@@ -285,7 +288,10 @@ class Indexer(object):
     
     # aggregate scores with max-sum on one query at a time (to save mem)
     assert return_external_id
-    doc_ids_flat = self.ids_int[doc_ids_flat]
+    if hasattr(self, 'ids_int'):  # use ids_int or assume ids are int
+      doc_ids_flat = self.ids_int[doc_ids_flat]
+    else:
+      doc_ids_flat = self.ids[doc_ids_flat].astype('int')
 
     assert query_ids is not None and query_splits is not None
     assert len(query_ids) == len(scores_flat)
@@ -303,7 +309,16 @@ class Indexer(object):
       doc_ids = doc_ids_flat[qstart:qend]  # (nq, topk)
 
       # max
-      unique_doc_ids, doc_ids = torch.unique(doc_ids, return_inverse=True)  # (uqd,) (nq, topk) uqd is the number of unique docs
+      try:
+        unique_doc_ids, doc_ids = torch.unique(doc_ids, return_inverse=True)  # (uqd,) (nq, topk) uqd is the number of unique docs
+        # sorter = pids.sort()
+        # pids = sorter.values
+        # pids, pids_counts = torch.unique_consecutive(pids, return_counts=True)
+      except:  # RuntimeError: radix_sort: failed on 1st step: cudaErrorInvalidDevice: invalid device ordinal
+        raw_size = doc_ids.size()
+        unique_doc_ids, doc_ids = np.unique(doc_ids.cpu(), return_inverse=True) 
+        unique_doc_ids = torch.tensor(unique_doc_ids).to(device)
+        doc_ids = torch.tensor(doc_ids).to(device).view(*raw_size)
       nq, uqd = scores.size(0), unique_doc_ids.size(0)
       lowest = scores.min()
       agg_scores = torch.zeros(nq, uqd).to(device) + lowest  # (nq, uqd)

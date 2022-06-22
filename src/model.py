@@ -48,7 +48,9 @@ def t5forconditionalgeneration_forward(
      return_dict=None,
      input_doc_ids=None,  # document identifiers 
      gold_doc_dist=None,  # gold document annotation
-     only_bi_encoder_forward: bool = False
+     only_bi_encoder_forward: bool = False,
+     add_to_memory_bank: bool = False,
+     add_to_memory_bank_flush: bool = False,
 ):
   r"""
   labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -93,7 +95,9 @@ def t5forconditionalgeneration_forward(
       output_hidden_states=output_hidden_states,
       return_dict=return_dict,
       input_doc_ids=input_doc_ids,
-      only_bi_encoder_forward=only_bi_encoder_forward)
+      only_bi_encoder_forward=only_bi_encoder_forward,
+      add_to_memory_bank=add_to_memory_bank,
+      add_to_memory_bank_flush=add_to_memory_bank_flush)
     if only_bi_encoder_forward:
       return encoder_outputs
   elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
@@ -585,7 +589,12 @@ T5Attention.forward = t5attention_forward
 
 def fid_run(model, input_ids=None, attention_mask=None, accumulate_steps: int = None, **kwargs):
   if not accumulate_steps:
-    result = model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+    result = model(
+      input_ids=input_ids, 
+      attention_mask=attention_mask, 
+      **kwargs, 
+      add_to_memory_bank=True,
+      add_to_memory_bank_flush=True)
     loss = result[0]
     loss.backward()
     return result
@@ -647,6 +656,7 @@ def fid_run(model, input_ids=None, attention_mask=None, accumulate_steps: int = 
   # run full model w/ gradient
   # inform encoder and decoder
   for acc_step in range(accumulate_steps):
+    is_last = acc_step == accumulate_steps - 1
     state = _rand_states[acc_step]
     accumulated['step'] = acc_step
     with state:
@@ -654,6 +664,8 @@ def fid_run(model, input_ids=None, attention_mask=None, accumulate_steps: int = 
         input_ids=_input_ids[acc_step], 
         attention_mask=_attention_mask[acc_step], 
         **get_kwargs_chunk(acc_step),
+        add_to_memory_bank=True,
+        add_to_memory_bank_flush=is_last,
         accumulated=accumulated)
       loss = result[0]
       loss.backward()
@@ -839,7 +851,14 @@ class FiDT5(transformers.T5ForConditionalGeneration):
     # because the T5 forward method uses the input tensors to infer
     # dimensions used in the decoder.
     # EncoderWrapper resizes the inputs as (B * N) x L.
-    def forward(self, input_ids=None, attention_mask=None, accumulated=None, **kwargs):
+    def forward(
+      self, 
+      input_ids=None, 
+      attention_mask=None, 
+      accumulated=None, 
+      add_to_memory_bank=False,
+      add_to_memory_bank_flush=False,
+      **kwargs):
         if 'attention_separate_mask' in kwargs:  # set separate mask for encoder
             asm = kwargs['attention_separate_mask']
             self.set_attention_separate_mask(asm)
@@ -866,6 +885,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         result = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            add_to_memory_bank=add_to_memory_bank,
+            add_to_memory_bank_flush=add_to_memory_bank_flush,
             **kwargs
         )
         if accumulated is not None:
@@ -1402,9 +1423,18 @@ class EncoderWrapper(torch.nn.Module):
       return self.encoder.block[self.n_layer_two_tower].module.layer[0].SelfAttention
 
     def forward(self, input_ids=None, attention_mask=None, input_doc_ids=None, **kwargs):
-        if 'direct' in kwargs and kwargs['direct']:  # no reshaping, used in retrieval
+        if 'direct' in kwargs:  # no reshaping, used in retrieval
           del kwargs['direct']
           return self.bi_encoder_forward(input_ids, attention_mask)
+        
+        add_to_memory_bank = add_to_memory_bank_flush = False
+        if 'add_to_memory_bank' in kwargs:
+          add_to_memory_bank = kwargs['add_to_memory_bank']
+          del kwargs['add_to_memory_bank']
+        if 'add_to_memory_bank_flush' in kwargs:
+          add_to_memory_bank_flush = kwargs['add_to_memory_bank_flush']
+          del kwargs['add_to_memory_bank_flush']
+        assert add_to_memory_bank or not add_to_memory_bank_flush
 
         # total_length = n_passages * passage_length
         bsz, total_length = input_ids.shape
@@ -1420,6 +1450,7 @@ class EncoderWrapper(torch.nn.Module):
 
         use_memory_bank = self.training and self.memory_bank_inference and self.memory_bank is not None
         use_memory_bank_and_retrieve = use_memory_bank and self.memory_bank_topk and len(self.memory_bank) >= (self.memory_bank_topk + self.n_passages)
+        use_memory_bank_and_add = use_memory_bank and add_to_memory_bank
         with torch.no_grad():
           was_training = self.training
           self.eval()
@@ -1429,8 +1460,8 @@ class EncoderWrapper(torch.nn.Module):
             query_states, key_states = collected['query_states'], collected['key_states']
             if self.separate_process:
               self.memory_bank.start()
-          if use_memory_bank_and_retrieve:  # retrieve, store, then update the input_ids and attention_mask
-            _input_ids, _attention_mask = self.memory_bank.query_then_add_from_t5(
+          if use_memory_bank_and_retrieve:  # retrieve
+            _input_ids, _attention_mask = self.memory_bank.query_from_t5(
               query_states, key_states, attention_mask, input_ids, input_doc_ids, n_context=n_context)[:2]
             if self.memory_bank_additional_encode:
               self.attention_mask = _attention_mask  # for decoder
@@ -1439,13 +1470,14 @@ class EncoderWrapper(torch.nn.Module):
                 raw_tensor.view(-1, self.n_passages, *raw_tensor.size()[1:]),
                 memory_bank_tensor.view(-1, self.memory_bank_topk, *memory_bank_tensor.size()[1:])], dim=1).view(
                 -1, *raw_tensor.size()[1:])
+          if use_memory_bank_and_add:  # store
+            self.memory_bank.add_from_t5(
+              query_states, key_states, attention_mask, input_ids, input_doc_ids, n_context=n_context, flush=add_to_memory_bank_flush)
+          if use_memory_bank_and_retrieve:  # then update the input_ids and attention_mask
             # (bs * (n_context + memory_bank_topk), ...)
             input_ids = cat_by_doc(input_ids, _input_ids)
             attention_mask = cat_by_doc(attention_mask, _attention_mask)
             self.n_passages = self.n_passages + self.memory_bank_topk
-          elif use_memory_bank:  # only store
-            self.memory_bank.add_from_t5(
-              query_states, key_states, attention_mask, input_ids, input_doc_ids, n_context=n_context)            
           if was_training:
             self.train()
 

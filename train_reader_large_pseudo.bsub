@@ -98,8 +98,8 @@ else
   exit
 fi
 
-num_gpu=4
-batch_size=4
+num_gpu=8
+batch_size=2
 accum=1
 num_keep_ctx_in_decoder=0
 combine_weight=0
@@ -107,7 +107,7 @@ metric=em
 
 init_model=google/t5-large-lm-adapt
 ckpt_dir=trained_reader
-name=${basemodel}_${task}_ibn16_step4k_ratio8
+name=${basemodel}_${task}_ibn16_step4k
 init_from=${ckpt_dir}/${basemodel}/checkpoint/latest
 only_topk_n_context=0
 n_layer_two_tower=12
@@ -115,7 +115,7 @@ layer_for_retrieval=first
 keep_ctx_in_decoder_with_head=0
 keep_ctx_in_decoder_head_tau=0.001
 head_weights_norm_func=softmax
-encoder_decoder_kl_ratio=8.0
+encoder_decoder_kl_ratio=1.0
 encoder_encoder_kl_ratio=0.0
 encoder_encoder_kl="first|last=3|10"
 encoder_encoder_kl_sparsity=0
@@ -165,5 +165,4 @@ python ${prefix} train_reader.py \
   --wandb_name ${ckpt_dir}/${name} \
   --wandb_log_freq 10 \
   --in_batch_negative \
-  --accumulation_for_ibn 2 \
   --init_from ${init_from} ${extra} &>> ${ckpt_dir}/${name}.out
