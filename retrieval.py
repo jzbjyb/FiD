@@ -252,12 +252,12 @@ def encode_query_and_search(
           device=device)
         qid2rank.update(_qid2rank)
       elif opt.model_type == 'dpr':
-        top_ids_and_scores = index.search_knn(adapter.results['embeddings'], opt.doc_topk)
-        for i, (docids, scores, texts) in enumerate(top_ids_and_scores):
+        doc_ids_flat, scores_flat, texts_flat = index.search_knn(adapter.results['embeddings'], opt.doc_topk)
+        for i, (docids, scores, texts) in enumerate(zip(doc_ids_flat, scores_flat, texts_flat)):
           qid = adapter.results['ids'][i]
           did2score: Dict[str, float] =  defaultdict(lambda: 0)
           for did, score, text in zip(docids, scores, texts):
-            did2score[did] = float(score)
+            did2score[str(did)] = float(score)
           qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))
       else:
         raise NotImplementedError
@@ -291,6 +291,7 @@ def get_model_tokenizer(opt, is_querying: bool):
 def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]]):
   # log
   logger = src.util.init_logger()
+  src.util.global_context['opt'] = opt
   # load model
   main_device = torch.device(f'cuda:{cuda_device[0]}') if type(cuda_device) is list else torch.device(f'cuda:{cuda_device}')
   model, tokenizer = get_model_tokenizer(opt, is_querying=True)

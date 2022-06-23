@@ -646,13 +646,17 @@ def eval_retrieval(
 
 
 def remove_special(text: Union[str, List[str]]):
+  is_str = False
   if type(text) is str:
+    is_str = True
     text = [text]
   new_text = []
   for t in text:
     if t.strip().startswith('<extra_id_0>'):  # pseudo questoin
       t = ' '.join([w for w in text.split() if not w.startswith('<extra_id_')])
     new_text.append(t)
+  if is_str:
+    return new_text[0]
   return new_text
 
 def eval_answer(ret_file: str,
@@ -690,7 +694,7 @@ def eval_answer(ret_file: str,
       #  scores = list(map(lambda x: x['score'], example['ctxs']))
       #corrects = np.array(list(map(lambda x: x['correct'], example['ctxs'])))
       #corrects_dist = corrects / (np.sum(corrects) or 1.0)
-      #corr = scipy.stats.pearsonr(scores, corrects_dist)[0]
+      #corr = scipy.stats.pearsonr(scores, corrects)[0]
       #if not np.isnan(corr):
       #  correlations.append(corr)
       #print(list(zip(scores, corrects_dist)))

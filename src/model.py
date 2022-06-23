@@ -1856,6 +1856,7 @@ def encoder_decoder_kl(
      pairwise_loss: str = None,
      memory_bank_topk: int = 0,
      memory_bank_additional_encode: bool = False,
+     memory_bank_additional_encode_dontuse: bool = True,  # this turns off memory_bank_additional_encode by assuming 0 dec-attn
      gold_doc_dist: torch.FloatTensor=None,  # (bs, n_context)
      use_gold_doc_dist: bool = False,
      kl_loss_reduction: str = None,
@@ -1881,6 +1882,11 @@ def encoder_decoder_kl(
 
   # apply softmax
   if use_softmax:
+    if memory_bank_topk and memory_bank_additional_encode and memory_bank_additional_encode_dontuse:
+      # assume zero dec-attn for memory bank
+      ori_n_context = n_context - memory_bank_topk
+      to_keep = (enc_seq_len // n_context) * ori_n_context
+      decoder_score[:, :, :, to_keep:] = -1e5
     decoder_score = torch.softmax(decoder_score.float(), dim=-1).type_as(decoder_score)
   # avg over head, use the first decoder tok
   decoder_score = decoder_score.mean(1)[:, 0]  # (bs, enc_seq_len)

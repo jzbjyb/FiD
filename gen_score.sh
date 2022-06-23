@@ -4,8 +4,9 @@ source utils.sh
 num_gpu=$1  # use all gpus
 model=$2/checkpoint/latest  # pretrained_models/nq_reader_base
 index_name=$3
-ckpt_dir=${model}.rerank/${index_name}
-other="${@:4}"
+ckpt_dir=${model}.rerank/specific
+queries_another=$4
+other="${@:5}"
 
 n_context=100
 attention_mask=separate
@@ -15,7 +16,7 @@ get_prefix ${num_gpu}
 
 python ${prefix} test_reader.py \
   --model_path ${model} \
-  --eval_data ${queries} \
+  --eval_data ${queries_another} \
   --per_gpu_batch_size ${fid_per_gpu_batch_size} \
   --n_context ${n_context} \
   --text_maxlength ${text_maxlength} \
