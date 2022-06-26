@@ -22,7 +22,7 @@ from beir.retrieval.evaluation import EvaluateRetrieval
 from beir.retrieval.search.lexical import BM25Search as BM25
 from passage_retrieval import validate
 from src.util import clean_text_for_tsv
-from src.evaluation import has_answer, SimpleTokenizer
+from src.evaluation import has_answer, SimpleTokenizer, normalize_answer
 import src.evaluation
 
 logging.basicConfig(level=logging.DEBUG)
@@ -1295,6 +1295,49 @@ def add_qrel_as_answer(query_file: str, beir_dir: str, split: str, out_file: str
     json.dump(new_data, fout, indent=2)
 
 
+def em_only_one(preds: List[str], golds: List[str]):
+  preds = set(normalize_answer(p) for p in preds)
+  golds = set(normalize_answer(g) for g in golds)
+  return len(preds & golds) > 0
+
+
+def bioasq_eval_answer_rag(target_file: str, pred_file: str, join_sep = ' # '):
+  ems = []
+  with open(target_file, 'r') as tfin, open(pred_file, 'r') as pfin:
+    for l in tfin:
+      targets = [a.strip() for a in l.strip().split('\t') if len(a.strip())]
+      preds = [p.strip() for p in pfin.readline().rstrip().split('\t')[0].strip().split(join_sep) if len(p.strip())]
+      ems.append(em_only_one(preds, targets))
+  print(np.mean(ems), len(ems))
+
+
+def convert_bioasq_ret_to_fid(ret_file, lineid2docidfile, qid_file, ref_query_file, out_file):
+    lid2did: Dict[str, str] = {}
+    with open(lineid2docidfile, 'r') as fin:
+      for l in fin:
+        lid, did = l.strip().split('\t')
+        lid2did[lid] = did
+    qid2dids: Dict[str, List[str]] = {}
+    with open(ret_file, 'r') as rfin, open(qid_file, 'r') as qfin:
+      for l in rfin:
+        qid = qfin.readline().strip()
+        dids = [lid2did[d.split(' || ')[0]] for d in l.strip().split('\t')]
+        qid2dids[qid] = dids
+    with open(ref_query_file, 'r') as rfin, open(out_file, 'w') as fout:
+      data = json.load(rfin)
+      qid2example = {e['id']: e for e in data}
+      new_data = []
+      for qid, dids in qid2dids.items():
+        e = qid2example[qid]
+        e['ctxs'] = [{
+          'id': did,
+          'title': '',
+          'text': '',
+        } for did in dids]
+        new_data.append(e)
+      json.dump(new_data, fout, indent=2) 
+
+
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='preprocessing')
   parser.add_argument('--task', type=str, choices=[
@@ -1304,7 +1347,8 @@ if __name__ == '__main__':
     'convert_bioasq_to_beir_format', 'filter_beir_query', 'convert_fid_to_rag_format', 'split_fid_file',
     'aggregate_ctxs', 'eval_variance', 'convert_beir_to_fid_format', 'eval_answer', 
     'create_whole_test', 'add_doc_to_onlyid', 'merge_queries', 'concate_queries', 'compare_two_rank_files', 
-    'annotate_rank_file', 'convert_colbert_data_to_fid_format', 'subsample', 'add_qrel_as_answer'])
+    'annotate_rank_file', 'convert_colbert_data_to_fid_format', 'subsample', 'add_qrel_as_answer', 
+    'bioasq_eval_answer_rag', 'convert_bioasq_ret_to_fid'])
   parser.add_argument('--inp', type=str, help='input file', nargs='+')
   parser.add_argument('--out', type=str, help='output file', nargs='+')
   parser.add_argument('--other', type=str, nargs='+', help='additional arguments')
@@ -1543,3 +1587,12 @@ if __name__ == '__main__':
     query_file, split, beir_dir = args.inp
     out_file = args.out[0]
     add_qrel_as_answer(query_file, beir_dir, split, out_file, format='relevance-doc', subsample=200000)
+  
+  elif args.task == 'bioasq_eval_answer_rag':
+    target_file, pred_file = args.inp
+    bioasq_eval_answer_rag(target_file, pred_file)
+  
+  elif args.task == 'convert_bioasq_ret_to_fid':
+    ret_file, lineid2docidfile, qid_file, ref_query_file = args.inp
+    out_file = args.out[0]
+    convert_bioasq_ret_to_fid(ret_file, lineid2docidfile, qid_file, ref_query_file, out_file)

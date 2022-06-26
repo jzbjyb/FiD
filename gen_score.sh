@@ -24,6 +24,6 @@ python ${prefix} test_reader.py \
   --attention_mask ${attention_mask} \
   --name test \
   --checkpoint_dir ${ckpt_dir} \
-  --write_crossattention_scores \
   --write_results \
+  --write_crossattention_scores \
   ${other}

@@ -149,8 +149,12 @@ def check_type(ground_truths: Union[str, List, List[List]]) -> List[str]:
     ground_truths = [a for e in ground_truths for a in e]
   return ground_truths
 
-def ems(prediction, ground_truths: Union[str, List, List[List]]):
+def ems(prediction, ground_truths: Union[str, List, List[List]], join_sep: str = None):
   ground_truths = check_type(ground_truths)
+  if join_sep:
+    prediction = [normalize_answer(p.strip()) for p in prediction.strip().split(join_sep) if p.strip()]
+    ground_truths = [normalize_answer(g) for g in ground_truths]
+    return len(set(prediction) & set(ground_truths)) > 0
   return max([exact_match_score(prediction, gt) for gt in ground_truths])
 
 def rougels(prediction, ground_truths: Union[str, List, List[List]]):
