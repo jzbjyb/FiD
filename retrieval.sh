@@ -1,4 +1,20 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=nq
+#SBATCH --cpus-per-task=80
+#SBATCH --nodes=1
+#SBATCH --time=72:00:00
+#SBATCH --partition=side
+#SBATCH -o slurm/%j.out
+#SBATCH -e slurm/%j.err
+#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --mem=1024GB
+
+# env
+eval "$(conda shell.bash hook)"
+conda activate raat
+
+# utils
 source utils.sh
 
 export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
