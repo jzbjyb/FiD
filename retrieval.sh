@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=nq
-#SBATCH --cpus-per-task=80
+#SBATCH --cpus-per-task=10
 #SBATCH --nodes=1
-#SBATCH --time=72:00:00
+#SBATCH --time=6:00:00
 #SBATCH --partition=side
 #SBATCH -o slurm/%j.out
 #SBATCH -e slurm/%j.err
 #SBATCH --gpus-per-node=8
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=8
 #SBATCH --mem=1024GB
 
 # env
@@ -69,35 +69,14 @@ else
   exit 1
 fi
 
-for shard_id in $(seq 0 $((${num_shards} - 1))); do
-  if (( ${num_shards} == 1 )); then
-    python retrieval.py \
-      --model_type ${model_type} \
-      --model_path ${model_path} \
-      --passages ${passages} \
-      --output_path ${output_path} \
-      --shard_id ${shard_id} \
-      --num_shards ${num_shards} \
-      --save_every_n_doc ${save_every_n_doc} \
-      --num_workers ${num_workers} \
-      --per_gpu_batch_size ${passage_per_gpu_batch_size} \
-      --passage_maxlength ${passage_maxlength} \
-      --query_maxlength ${query_maxlength} \
-      ${head_idx} ${extra} ${max_over_head}
-  else
-    CUDA_VISIBLE_DEVICES=${shard_id} python retrieval.py \
-      --model_type ${model_type} \
-      --model_path ${model_path} \
-      --passages ${passages} \
-      --output_path ${output_path} \
-      --shard_id ${shard_id} \
-      --num_shards ${num_shards} \
-      --save_every_n_doc ${save_every_n_doc} \
-      --num_workers ${num_workers} \
-      --per_gpu_batch_size ${passage_per_gpu_batch_size} \
-      --passage_maxlength ${passage_maxlength} \
-      --query_maxlength ${query_maxlength} \
-      ${head_idx} ${extra} ${max_over_head} &
-  fi
-done
-wait
+srun python retrieval.py \
+  --model_type ${model_type} \
+  --model_path ${model_path} \
+  --passages ${passages} \
+  --output_path ${output_path} \
+  --save_every_n_doc ${save_every_n_doc} \
+  --num_workers ${num_workers} \
+  --per_gpu_batch_size ${passage_per_gpu_batch_size} \
+  --passage_maxlength ${passage_maxlength} \
+  --query_maxlength ${query_maxlength} \
+  ${head_idx} ${extra} ${max_over_head}

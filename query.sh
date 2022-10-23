@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=nq
-#SBATCH --cpus-per-task=10
-#SBATCH --nodes=8
 #SBATCH --time=24:00:00
 #SBATCH --partition=side
 #SBATCH -o slurm/%j.out
 #SBATCH -e slurm/%j.err
+
+#SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=8
+#SBATCH --cpus-per-task=10
 #SBATCH --mem=1024GB
 
 # env
@@ -129,7 +130,7 @@ if [[ ${index_name} == 'bioasq_1m' ]]; then
   fi
 else
   if [[ ${gpu} == 'a100' ]]; then
-    files_per_run=16  # about 70G embs
+    files_per_run=8  # about 70G embs
   else
     files_per_run=4  # about 30G embs
   fi

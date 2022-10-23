@@ -320,7 +320,7 @@ def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]], logge
     batch = input_queue.get()
     if type(batch) is str and batch == 'done':
       break
-    batch_index, batch_files = batch
+    batch_indices, batch_files = batch
     # load index
     index_params = {
       'vector_sz': opt.indexing_dimension, 
@@ -343,7 +343,7 @@ def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]], logge
         (f'_{opt.augmentation}' if opt.augmentation else '') + \
         (f'_norm' if opt.normalize else '') + \
         (f'_termweights' if opt.term_weights else '') + \
-        (f'.{batch_index}' if batch_index >= 0 else '') + '.pkl')
+        (('.' + '.'.join(map(str, batch_indices))) if batch_indices is not None else '') + '.pkl')
     elif opt.model_type == 'dpr':
       rank_file = opt.output_path / f'qid2rank_{opt.doc_topk}.pkl'
     else:
@@ -362,7 +362,7 @@ def main(opt):
   is_querying = opt.queries is not None
 
   if is_querying:  # querying
-    logger = src.util.init_logger(is_main=True, is_distributed=False, filename=opt.output_path / f'index{opt.global_rank}.log')
+    logger = src.util.init_logger(is_main=True, is_distributed=False, filename=opt.output_path / f'query{opt.global_rank}.log')
     emb_file_pattern = str(args.output_path) + '/embedding_*.npz'
     emb_files = glob.glob(emb_file_pattern)
     emb_files = sorted(emb_files)
@@ -395,25 +395,32 @@ def main(opt):
     if opt.is_slurm:  # divide emb files into world_size chuncks
       emb_files = emb_files[opt.global_rank::opt.world_size]
       logger.info(f'SLURM {opt.global_rank}: num of emb files {len(emb_files)}, {emb_files}')
-      input_queue.put((opt.global_rank, emb_files))
+      if len(emb_files) <= opt.files_per_run:  # one run
+        input_queue.put(([opt.global_rank], emb_files))
+      else:  # multiple runs
+        for batch_index, file_start in enumerate(range(0, len(emb_files), opt.files_per_run)):
+          batch_files = emb_files[file_start:file_start + opt.files_per_run]
+          logger.info(f'SLURM {opt.global_rank}: batch {batch_index} {batch_files}')
+          input_queue.put(([opt.global_rank, batch_index], batch_files))
     elif len(emb_files) > opt.files_per_run:  # iterative over emb files
       for batch_index, file_start in enumerate(range(0, len(emb_files), opt.files_per_run)):
         batch_files = emb_files[file_start:file_start + opt.files_per_run]
-        input_queue.put((batch_index, batch_files))
+        input_queue.put(([batch_index], batch_files))
     else:  # use all emb files at once
-      input_queue.put((-1, emb_files))
+      input_queue.put((None, emb_files))
     
     # finish
     for _ in range(len(processes)):
       input_queue.put('done')
     for p in processes:
-      p.join()  
+      p.join()
  
   else:  # indexing
     # load model
     model, tokenizer = get_model_tokenizer(opt, is_querying=is_querying)
-    model = model.cuda()
-    logger = src.util.init_logger(opt.is_main, opt.is_distributed, opt.output_path / f'index{opt.shard_id}.log')
+    model = model.to(opt.device)
+    logger = src.util.init_logger(is_main=True, is_distributed=False, filename=opt.output_path / f'index{opt.shard_id}.log')
+    logger.info(f'SLURM {opt.global_rank}: run process on cuda {opt.local_rank}')
     # load data
     passages = next(src.util.load_passages(opt.passages))
     shard_size = len(passages) // opt.num_shards
@@ -432,8 +439,8 @@ if __name__ == '__main__':
   parser.add_argument('--queries', type=str, default=None, help='path to queries (.json file)')
   parser.add_argument('--passages', type=str, default=None, help='path to passages (.tsv file)')
   parser.add_argument('--output_path', type=str, default=None, help='prefix path to save embeddings')
-  parser.add_argument('--shard_id', type=int, default=0, help='id of the current shard')
-  parser.add_argument('--num_shards', type=int, default=1, help='total number of shards')
+  parser.add_argument('--shard_id', type=int, default=None, help='id of the current shard')
+  parser.add_argument('--num_shards', type=int, default=None, help='total number of shards')
   parser.add_argument('--per_gpu_batch_size', type=int, default=32)
   parser.add_argument('--files_per_run', type=int, default=1, help='embedding files to load for each run')
   parser.add_argument('--passage_maxlength', type=int, default=200, help='maximum number of tokens in a passage')
@@ -460,6 +467,12 @@ if __name__ == '__main__':
   parser.add_argument('--debug', action='store_true')
   args = parser.parse_args()
 
+  # setup slurm
   src.slurm.setup_multi_gpu_slurm(args)
+  if args.num_shards is None:  # use distributed arguments as sharding arguments
+    args.num_shards = args.world_size
+    args.shard_id = args.global_rank
+  
+  # run main
   src.util.global_context['opt'] = args
   main(args)
