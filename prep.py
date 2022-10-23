@@ -666,11 +666,15 @@ def eval_answer(ret_file: str,
                 shuffle: bool = False,
                 topk: int = 100,
                 key_func: Callable = lambda x: x['score'],
-                metric: str = 'ndcg'):
+                metric: str = 'ndcg',
+                max_num_examples: int = None):
   tokenizer = SimpleTokenizer()
   correlations = []
   with open(ret_file, 'r') as fin:
     data = json.load(fin)
+    if max_num_examples:
+      print('#total', len(data))
+      data = data[:max_num_examples]
     # aggregate ctx of the same query
     query2example: Dict[str, Dict] = {}
     for example in data:
@@ -1042,9 +1046,9 @@ def merge_queries(file_pattern: str, out_file: str):
   files = glob.glob(file_pattern)
   print(f'#files {len(files)}')
   if format == 'pkl':
-    datas = [pickle.load(open(pf, 'rb')) for pf in files]
+    datas = [pickle.load(open(pf, 'rb')) for pf in tqdm(files, desc='load')]
     qid2rank: Dict[str, List[Tuple[str, float]]] = {}
-    for qid in datas[0]:
+    for qid in tqdm(datas[0], desc='merge'):
       all_ctxs = [ctx for data in datas for ctx in data[qid]]
       assert len(all_ctxs) == len(set(ctx[0] for ctx in all_ctxs)), 'duplicated'
       merged_ctxs = sorted(all_ctxs, key=lambda x: -x[1])[:len(datas[0][qid])]

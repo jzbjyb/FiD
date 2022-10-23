@@ -70,9 +70,11 @@ class Indexer(object):
       logger.info(f'data indexing completed with time {time.time() - start_time_indexing:.1f} s.')
       if index_name is not None:
         self.serialize(root_dir, index_name=index_name)
+    logger.info('start building strided tensor')
     self.build_int_ids()
     self.build_strided()
-    
+    logger.info('finish building strided tensor')
+
   def serialize(
       self, 
       dir_path: Path, 
@@ -109,6 +111,14 @@ class Indexer(object):
     if type(self.cuda_device) is int and self.cuda_device == -1:
       return False
     return True
+  
+  @property
+  def num_gpu(self):
+    if not self.use_gpu:
+      return 0
+    if type(self.cuda_device) is list:
+      return len(self.cuda_device)
+    return 1
 
   @property
   def main_gpu(self):
@@ -247,7 +257,7 @@ class Indexer(object):
     self,
     query_vectors: np.array,  # (nq_flat, emb_size)
     topk: int,
-    batch_size: int = 1024,
+    batch_size: int = None,
     return_external_id: bool = True,
     term_weights: np.array = None,  # (nq_flat,)
     query_ids: List[int] = None,  # (nq_flat,)
@@ -256,6 +266,14 @@ class Indexer(object):
     rerank_topk: int = 0,
     device: torch.device = None) -> List[Tuple[List[Union[str, int]], List[float], List[str]]]:
     # TODO: directly use torch tensors with "import faiss.contrib.torch_utils"
+    
+    if batch_size is not None:  # default value
+      if self.num_gpu == 1:
+        batch_size = 256
+      elif self.num_gpu > 1:
+        batch_size = 1024  # multi-gpu
+      else:
+        batch_size = 1024
 
     if term_weights is not None:
       assert term_weights.shape[0] == query_vectors.shape[0]

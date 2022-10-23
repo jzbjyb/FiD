@@ -59,6 +59,7 @@ function get_dataset_settings() {
   elif [[ ${index_name} == 'nq' ]]; then
     passages=${data_root}/NQ/psgs_w100.tsv
     queries=${data_root}/NQ/test.json
+    #queries=${data_root}/NQ/train.json
     passage_maxlength=$( min 200 ${length_limit} )
     text_maxlength=250
     num_shards=$( nvidia-smi --query-gpu=name --format=csv,noheader | wc -l )  # use all gpus

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=nq
-#SBATCH --cpus-per-task=80
-#SBATCH --nodes=1
+#SBATCH --cpus-per-task=10
+#SBATCH --nodes=8
 #SBATCH --time=24:00:00
 #SBATCH --partition=side
 #SBATCH -o slurm/%j.out
 #SBATCH -e slurm/%j.err
 #SBATCH --gpus-per-node=8
-#SBATCH --ntasks-per-node=1
-#SBATCH --mem=512GB
+#SBATCH --ntasks-per-node=8
+#SBATCH --mem=1024GB
 
 # env
 eval "$(conda shell.bash hook)"
@@ -138,7 +138,7 @@ if [[ ${model_type} == 'colbert' ]]; then
    files_per_run=`expr $files_per_run / 2`
 fi
 
-python ${prefix} retrieval.py \
+srun python retrieval.py \
   --model_type ${model_type} \
   --queries ${queries} \
   --model_path ${model_path} \
@@ -151,3 +151,4 @@ python ${prefix} retrieval.py \
   --doc_topk ${doc_topk} \
   --files_per_run ${files_per_run} \
   ${rerank} ${head_idx} ${faiss_gpus} ${extra} ${max_over_head} ${augmentation}
+ 

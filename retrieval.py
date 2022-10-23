@@ -198,6 +198,9 @@ def encode_query_and_search(
      model,
      tokenizer,
      index: src.index.Indexer,
+     out_file: str = None,
+     save_every: int = 10000,  # save to out_file every save_every queries
+     logger = None,
      debug: bool = False) -> Dict[str, List[Tuple[str, float]]]:
   device = model.device
   batch_size = opt.per_gpu_batch_size
@@ -205,7 +208,7 @@ def encode_query_and_search(
   dataset = src.data.QuestionDataset(queries)
   dataloader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=opt.num_workers, collate_fn=collator)
   qid2rank: Dict[str, List[Tuple[str, float]]] = {}
-
+  prev_save: int = 0  # num of queries in previous save
   with torch.no_grad():
     for k, (ids, texts, input_ids, attention_mask) in tqdm(enumerate(dataloader)):
       # generate query embeddings
@@ -261,6 +264,15 @@ def encode_query_and_search(
           qid2rank[qid] = list(sorted(did2score.items(), key=lambda x: -x[1]))
       else:
         raise NotImplementedError
+      if out_file and save_every and (len(qid2rank) - prev_save) >= save_every:
+        logger.info(f'save {len(qid2rank)}')
+        with open(out_file, mode='wb') as f:
+          pickle.dump(qid2rank, f)
+        prev_save = len(qid2rank)
+  if out_file:
+    logger.info(f'save {len(qid2rank)}')
+    with open(out_file, mode='wb') as f:
+      pickle.dump(qid2rank, f)
   return qid2rank
 
 def get_model_tokenizer(opt, is_querying: bool):
@@ -288,7 +300,7 @@ def get_model_tokenizer(opt, is_querying: bool):
     model = model.half()
   return model, tokenizer
 
-def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]]):
+def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]], logger = None):
   # log
   logger = src.util.init_logger()
   src.util.global_context['opt'] = opt
@@ -324,8 +336,7 @@ def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]]):
       index = src.index.Indexer(**index_params)
     index_name = 'index' if opt.save_or_load_index else None
     index.load_from_npz(batch_files, index_name=index_name)
-    # query
-    qid2rank = encode_query_and_search(opt, queries, model, tokenizer, index)
+    # file
     if opt.model_type in {'fid', 'colbert'}:
       rank_file = opt.output_path / (f'qid2rank_{opt.token_topk}' + \
         (f'_{opt.candidate_doc_topk}' if opt.candidate_doc_topk else '') + \
@@ -337,8 +348,8 @@ def run_query(input_queue: Queue, opt, cuda_device: Union[int, List[int]]):
       rank_file = opt.output_path / f'qid2rank_{opt.doc_topk}.pkl'
     else:
       raise NotImplementedError
-    with open(rank_file, mode='wb') as f:
-      pickle.dump(qid2rank, f)
+    # query
+    qid2rank = encode_query_and_search(opt, queries, model, tokenizer, index, out_file=rank_file, logger=logger)
 
 def main(opt):
   # append head idx to the output path
@@ -351,32 +362,41 @@ def main(opt):
   is_querying = opt.queries is not None
 
   if is_querying:  # querying
+    logger = src.util.init_logger(is_main=True, is_distributed=False, filename=opt.output_path / f'index{opt.global_rank}.log')
     emb_file_pattern = str(args.output_path) + '/embedding_*.npz'
     emb_files = glob.glob(emb_file_pattern)
     emb_files = sorted(emb_files)
     if opt.max_over_head:  # TODO: we assume #files == #heads
       opt.files_per_run = len(emb_files)
-    if len(emb_files) > opt.files_per_run:
+    if len(emb_files) > opt.files_per_run or opt.is_slurm:
       opt.save_or_load_index = False
 
     # launch process
     processes: List[Process] = []
     input_queue: Queue = Queue()
-    if opt.faiss_gpus == 'all':  # use a single process and all gpu
-      p = Process(target=run_query, args=(input_queue, opt, [gpu for gpu in range(torch.cuda.device_count())]))
+    if opt.is_slurm:  # use slurm envs
+      logger.info(f'SLURM {opt.global_rank}: run process on cuda {opt.local_rank}')
+      p = Process(target=run_query, args=(input_queue, opt, opt.local_rank, logger))
+      processes.append(p)
+    elif opt.faiss_gpus == 'all':  # use a single process and all gpu
+      p = Process(target=run_query, args=(input_queue, opt, [gpu for gpu in range(torch.cuda.device_count())], logger))
       processes.append(p)
     elif opt.faiss_gpus == 'separate':  # ues multiple processes with a single gpu assigned to each of them
       for gpu in range(torch.cuda.device_count()):
-        p = Process(target=run_query, args=(input_queue, opt, gpu))
+        p = Process(target=run_query, args=(input_queue, opt, gpu, logger))
         processes.append(p)
     else:  # single process with a single gpu
-      p = Process(target=run_query, args=(input_queue, opt, int(opt.faiss_gpus)))
+      p = Process(target=run_query, args=(input_queue, opt, int(opt.faiss_gpus), logger))
       processes.append(p)
     for p in processes:
       p.daemon = True
       p.start()
-    
-    if len(emb_files) > opt.files_per_run:  # iterative over emb files
+
+    if opt.is_slurm:  # divide emb files into world_size chuncks
+      emb_files = emb_files[opt.global_rank::opt.world_size]
+      logger.info(f'SLURM {opt.global_rank}: num of emb files {len(emb_files)}, {emb_files}')
+      input_queue.put((opt.global_rank, emb_files))
+    elif len(emb_files) > opt.files_per_run:  # iterative over emb files
       for batch_index, file_start in enumerate(range(0, len(emb_files), opt.files_per_run)):
         batch_files = emb_files[file_start:file_start + opt.files_per_run]
         input_queue.put((batch_index, batch_files))
@@ -440,6 +460,6 @@ if __name__ == '__main__':
   parser.add_argument('--debug', action='store_true')
   args = parser.parse_args()
 
-  src.slurm.init_distributed_mode(args)
+  src.slurm.setup_multi_gpu_slurm(args)
   src.util.global_context['opt'] = args
   main(args)

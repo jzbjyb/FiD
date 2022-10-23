@@ -24,7 +24,8 @@ export WANDB_API_KEY=9caada2c257feff1b6e6a519ad378be3994bc06a
 #train_data=open_domain_data/NQ_bm25/train.json
 #train_data=../ColBERT/experiments/colbert-60000.dnn/indexes/nq.2bits/result_train_2probe_8192cand.json
 #train_data=../ColBERT/experiments/nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_bm25_kl1_inbatchneg64_accumulate4_ratio8_step8k/indexes/nq.8bits/result_train_4probe_16384cand_real_skiplargestview.json
-train_data=open_domain_data/result_train_4probe_16384cand_real_skiplargestview.json
+#train_data=open_domain_data/nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_bm25_kl1_inbatchneg64_accumulate4_ratio8_step8k_iterative_self_step8k/result_train_4probe_16384cand_real_skiplargestview.json
+train_data=trained_reader/nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_bm25_kl1_inbatchneg64_accumulate4_ratio8_step8k_iterative_self_step8k_step8k/checkpoint/latest.index/nq.6/train/qid2rank_2048_2048.merge.json
 eval_data=open_domain_data/NQ/dev.json
 #train_data=open_domain_data/SciQ/train.json
 #eval_data=open_domain_data/SciQ/dev.json
@@ -41,8 +42,8 @@ combine_weight=0
 
 init_model=google/t5-large-lm-adapt
 ckpt_dir=trained_reader
-name=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_bm25_kl1_inbatchneg64_accumulate4_ratio8_step8k_iterative_self_step8k_step8k
-init_from=${ckpt_dir}/nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_bm25_kl1_inbatchneg64_accumulate4_ratio8_step8k_iterative_self_step8k/checkpoint/latest
+name=nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_bm25_kl1_inbatchneg64_accumulate4_ratio8_step8k_iterative_self_step8k_step8k_step8kexact
+init_from=${ckpt_dir}/nq_reader_large_v11lm_separate_layer12_bs16_step3k_continue_bm25_kl1_inbatchneg64_accumulate4_ratio8_step8k_iterative_self_step8k_step8k/checkpoint/latest
 only_topk_n_context=0
 n_layer_two_tower=12
 layer_for_retrieval=first
@@ -59,7 +60,7 @@ query_in_decoder=no
 
 get_prefix ${num_gpu}
 
-cat ./train_reader_large.bsub &> ${ckpt_dir}/${name}.out
+cat ./train_reader_large.sh &> ${ckpt_dir}/${name}.out
 python ${prefix} train_reader.py \
   --train_data ${train_data} \
   --eval_data ${eval_data} \

@@ -11,7 +11,7 @@ import torch
 import socket
 import signal
 import subprocess
-
+from argparse import Namespace
 
 logger = getLogger()
 
@@ -39,6 +39,23 @@ def init_signal_handler():
     signal.signal(signal.SIGUSR1, sig_handler)
     signal.signal(signal.SIGTERM, term_handler)
     #logger.warning("Signal handler installed.")
+
+
+def setup_multi_gpu_slurm(args: Namespace):
+    args.is_slurm = os.getenv('SLURM_JOB_ID') is not None
+    if args.is_slurm:
+        args.world_size = int(os.getenv('SLURM_NTASKS'))
+        args.local_rank = int(os.getenv('SLURM_LOCALID'))
+        args.global_rank = int(os.getenv('SLURM_PROCID'))
+        args.device = torch.device(f'cuda:{args.local_rank}')
+        logger.info(f'SLURM job: global rank {args.global_rank}, GPU device {args.device}')
+    else:
+        args.world_size = 1
+        args.local_rank = args.global_rank = 0
+        if not hasattr(args, 'device') or not args.device:  # set device if not specified
+            args.device = torch.device(f'cuda:{args.local_rank}')
+        logger.info(f"Local job: global rank {args.global_rank}, GPU device {args.device}")
+    args.is_multi = args.world_size > 1
 
 
 def init_distributed_mode(params, is_slurm_job: bool = False):
