@@ -1,5 +1,24 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=qa
+#SBATCH --time=2:00:00
+#SBATCH --partition=side
+#SBATCH -o slurm/%j.out
+#SBATCH -e slurm/%j.err
+
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=80
+#SBATCH --mem=1024GB
+
+# env
+eval "$(conda shell.bash hook)"
+conda activate raat
+
+# utils
 source utils.sh
+
+# bioasq_1m uses 2 as per_gpu_batch_size, 800 as text_maxlength, and join_sep=', ' in EM evaluation
 
 num_gpu=$1  # use all gpus
 model=$2/checkpoint/latest  # pretrained_models/nq_reader_base

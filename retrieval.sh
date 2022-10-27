@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=nq
-#SBATCH --cpus-per-task=10
-#SBATCH --nodes=1
 #SBATCH --time=6:00:00
 #SBATCH --partition=side
 #SBATCH -o slurm/%j.out
 #SBATCH -e slurm/%j.err
+
+#SBATCH --nodes=2
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=8
+#SBATCH --cpus-per-task=10
 #SBATCH --mem=1024GB
 
 # env
